@@ -16,9 +16,11 @@ function formatUnixSeconds(ts: number): string {
 interface CollectionPageProps {
   space: Space;
   onBack: () => void;
+  /** 进入某资源集的详情页 */
+  onEnterCollection: (collection: Collection) => void;
 }
 
-export function CollectionPage({ space, onBack }: CollectionPageProps) {
+export function CollectionPage({ space, onBack, onEnterCollection }: CollectionPageProps) {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("active");
@@ -96,7 +98,11 @@ export function CollectionPage({ space, onBack }: CollectionPageProps) {
       title: "名称",
       dataIndex: "name",
       key: "name",
-      render: (_, record) => <span style={{ fontWeight: 600 }}>{record.name}</span>,
+      render: (_, record) => (
+        <a onClick={() => onEnterCollection(record)} style={{ fontWeight: 600 }}>
+          {record.name}
+        </a>
+      ),
     },
     {
       title: "简介",
@@ -137,9 +143,14 @@ export function CollectionPage({ space, onBack }: CollectionPageProps) {
     {
       title: "操作",
       key: "actions",
-      width: 160,
+      width: 220,
       render: (_, record) => (
         <AntSpace>
+          <Tooltip title="查看资源集详情">
+            <Button size="small" type="link" onClick={() => onEnterCollection(record)}>
+              详情
+            </Button>
+          </Tooltip>
           {record.status === "active" ? (
             <>
               <Tooltip title="编辑资源集">

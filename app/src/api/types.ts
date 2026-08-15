@@ -91,3 +91,75 @@ export interface CollectionListInput {
   spaceId: string;
   status?: "active" | "archived" | "all";
 }
+
+/* ---------------- 资源引用（Reference） ---------------- */
+
+/** 引用类型 — 详细设计说明书 §2.5 / §3.2 resource_reference 表 */
+export type ReferenceType = "code" | "document" | "data" | "artifact" | "tool" | "media";
+
+/** 引用健康度 — §2.4 collection_get.referencesByType.*.health */
+export type ReferenceHealth = "ok" | "missing" | "unknown";
+
+/** 引用生命周期 */
+export type ReferenceLifecycle = "active" | "staged" | "delivered" | "archived";
+
+/** 引用保密级别 */
+export type ReferenceConfidentiality =
+  | "public"
+  | "internal"
+  | "customer_restricted"
+  | "sensitive";
+
+/** 引用托管方式 */
+export type ReferenceHosting = "external" | "managed";
+
+/** 引用处置状态 */
+export type ReferenceDisposition = "none" | "archived" | "deleted";
+
+/** 引用定位（locator）— §3.2 resource_reference.locator_json */
+export type ReferenceLocator =
+  | { kind: "path"; path: string }
+  | { kind: "repo"; local: string; remote?: string; defaultBranch?: string }
+  | { kind: "cloud"; provider: string; objectId: string };
+
+/**
+ * 资源引用实体 — §2.5 / §3.2 resource_reference 表。
+ * createdAt / updatedAt 为 Unix 秒（number）。
+ */
+export interface Reference {
+  id: string;
+  collectionId: string;
+  sourceId: string;
+  name: string;
+  type: ReferenceType;
+  hosting: ReferenceHosting;
+  locator: ReferenceLocator;
+  description?: string;
+  tags?: string[];
+  lifecycle: ReferenceLifecycle;
+  confidentiality: ReferenceConfidentiality;
+  indexed: boolean;
+  disposition: ReferenceDisposition;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** collection_get.referencesByType 中每个引用条目携帯健康度 */
+export interface ReferenceWithHealth {
+  ref: Reference;
+  health: ReferenceHealth;
+}
+
+/** collection_get 出参 — §2.4 CollectionDetail */
+export interface CollectionDetail {
+  id: string;
+  spaceId: string;
+  name: string;
+  summary?: string;
+  tags?: string[];
+  status: "active" | "archived";
+  createdAt: number;
+  updatedAt: number;
+  /** 六类型分组；固定键序 code/document/data/artifact/tool/media */
+  referencesByType: Record<ReferenceType, ReferenceWithHealth[]>;
+}

@@ -5,6 +5,7 @@ import type {
   CollectionUpdateInput,
   CollectionIdInput,
   CollectionListInput,
+  CollectionDetail,
 } from "./types";
 import { mockCollectionApi } from "./mock";
 
@@ -38,4 +39,9 @@ export async function collectionArchive(input: CollectionIdInput): Promise<Colle
 export async function collectionRestore(input: CollectionIdInput): Promise<Collection> {
   if (MOCK) return mockCollectionApi.collection_restore(input);
   return invoke<Collection>("collection_restore", { ...input });
+}
+
+export async function collectionGet(input: CollectionIdInput): Promise<CollectionDetail> {
+  if (MOCK) return mockCollectionApi.collection_get(input);
+  return invoke<CollectionDetail>("collection_get", { ...input });
 }
