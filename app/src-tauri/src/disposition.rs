@@ -917,8 +917,7 @@ pub async fn disp_destroy(
 
 // ============================================================
 // disp_soft_delete：移入系统回收站（m4-4.4 · 详细设计 §2.6 / §5.1）
-// ============================================================
-//
+// =====================================================//
 // 关键约束：
 // - 顺序：**先 `trash::delete` 成功 → 再开事务 UPDATE disposition + INSERT audit**。
 //   与 M3-3.2 相反 —— 落地先，写库后；写库失败则无残留（文件已在回收站，用户可手动恢复）。
@@ -1101,6 +1100,153 @@ pub async fn disp_soft_delete(
 }
 
 
+
+// ============================================================
+// disp_audit_list：审计查询（m4-4.6 · 详细设计 §2.6 / §3.2 / §6.7）
+// ============================================================
+//
+// 契约（§2.6）：
+// - 入参：`{ refId?, action?, limit?, offset? }`（全部可选）
+//   - `action` 合法值：`archive | unarchive | soft_delete | destroy`；
+//     其他值 → `COMMON_INVALID_PARAM`。
+//   - `limit` 默认 50，最大 200；越界（>200）→ 截断为 200（二选一固化：截断，
+//     不报错；与 query_refs 的 limit 行为对齐）。
+//   - `offset` 默认 0；负值按 0 处理（防御性兜底）。
+// - 出参：`DispositionAudit[]`，字段 camelCase：
+//   `{ id, refId, refName, action, locatorSnapshot, actor, note, at }`。
+// - 排序：`at DESC`（最新在前）。
+//
+// 关键约束：
+// - `disposition_audit` 无外键（§6.7），销毁后审计独立存活，本查询不 JOIN
+//   `resource_reference`；`refName` / `locatorSnapshot` 直接来自写入时的快照。
+// - `locatorSnapshot` 在 DB 中为 TEXT（JSON 字符串）；出参反序列化为
+//   `serde_json::Value` 供前端按 `kind/path` 渲染；解析失败时退化为 `null`，
+//   不阻塞列表（best-effort，与 destroy 的 note 字段策略一致）。
+
+/// `disp_audit_list` 出参行（契约 §2.6）。
+///
+/// 序列化为 camelCase：
+/// `{ id, refId, refName, action, locatorSnapshot, actor, note, at }`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DispositionAudit {
+    pub id: String,
+    pub ref_id: String,
+    pub ref_name: String,
+    pub action: String,
+    /// 反序列化后的 locator 快照；DB 中为 TEXT（JSON），解析失败 → null。
+    pub locator_snapshot: Option<serde_json::Value>,
+    pub actor: String,
+    pub note: Option<String>,
+    pub at: i64,
+}
+
+/// `disp_audit_list` 入参（内部结构，便于单测构造）。
+#[derive(Debug, Clone, Default)]
+pub struct AuditListFilter {
+    pub ref_id: Option<String>,
+    pub action: Option<String>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+/// 合法 action 集合（与 schema CHECK 约束一致）。
+const VALID_AUDIT_ACTIONS: [&str; 4] = ["archive", "unarchive", "soft_delete", "destroy"];
+
+/// `disp_audit_list` 业务函数：按 refId / action 过滤，按 at DESC 分页。
+///
+/// 错误：
+/// - `COMMON_INVALID_PARAM`：action 不在合法值集合内
+/// - `COMMON_DB`：数据库或 JSON 解析失败
+pub async fn audit_list(
+    pool: &SqlitePool,
+    filter: AuditListFilter,
+) -> CmdResult<Vec<DispositionAudit>> {
+    // 1) action 校验：必须属于 4 个合法值之一。
+    if let Some(a) = filter.action.as_deref() {
+        if !VALID_AUDIT_ACTIONS.contains(&a) {
+            return Err(AppError::invalid_param(format!(
+                "非法 action: {}（合法值: archive|unarchive|soft_delete|destroy）",
+                a
+            )));
+        }
+    }
+
+    // 2) limit / offset 归一化：limit 默认 50，>200 截断为 200；offset 默认 0。
+    let limit: i64 = match filter.limit {
+        Some(0) => 50, // 0 视为缺省（防御）
+        Some(n) => i64::from(n.min(200)),
+        None => 50,
+    };
+    let offset: i64 = i64::from(filter.offset.unwrap_or(0));
+
+    // 3) 查询：动态参数 + IS NULL 兜底（契约 SQL 形状）。
+    let rows = sqlx::query(
+        "SELECT id, ref_id, ref_name, action, locator_snapshot, actor, note, at \
+         FROM disposition_audit \
+         WHERE (ref_id = ? OR ? IS NULL) AND (action = ? OR ? IS NULL) \
+         ORDER BY at DESC LIMIT ? OFFSET ?",
+    )
+    .bind(filter.ref_id.as_deref())
+    .bind(filter.ref_id.as_deref())
+    .bind(filter.action.as_deref())
+    .bind(filter.action.as_deref())
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::from)?;
+
+    // 4) 行 → 出参结构：locator_snapshot 反序列化为 Value，失败 → None。
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: String = row.try_get("id").map_err(AppError::from)?;
+        let ref_id: String = row.try_get("ref_id").map_err(AppError::from)?;
+        let ref_name: String = row.try_get("ref_name").map_err(AppError::from)?;
+        let action: String = row.try_get("action").map_err(AppError::from)?;
+        let locator_text: Option<String> = row.try_get("locator_snapshot").map_err(AppError::from)?;
+        let actor: String = row.try_get("actor").map_err(AppError::from)?;
+        let note: Option<String> = row.try_get("note").map_err(AppError::from)?;
+        let at: i64 = row.try_get("at").map_err(AppError::from)?;
+
+        let locator_snapshot = locator_text
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+
+        out.push(DispositionAudit {
+            id,
+            ref_id,
+            ref_name,
+            action,
+            locator_snapshot,
+            actor,
+            note,
+            at,
+        });
+    }
+    Ok(out)
+}
+
+/// `disp_audit_list` Tauri 命令。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn disp_audit_list(
+    state: tauri::State<'_, crate::AppState>,
+    ref_id: Option<String>,
+    action: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> CmdResult<Vec<DispositionAudit>> {
+    audit_list(
+        &state.pool,
+        AuditListFilter {
+            ref_id,
+            action,
+            limit,
+            offset,
+        },
+    )
+    .await
+}
 
 // ============================================================
 // 单元测试
@@ -2266,5 +2412,272 @@ mod tests {
         assert!(!dir.exists(), "目录应已移入回收站");
         assert_eq!(read_disposition(&pool, &rid).await, "deleted");
         assert_eq!(audit_count(&pool, &rid).await, 1);
+    }
+
+    // ---------- m4-4.6 · disp_audit_list ----------
+
+    /// 直接插入一条审计行（绕过 write_audit，便于控制 at 时间戳构造倒序用例）。
+    async fn insert_audit_row(
+        pool: &SqlitePool,
+        ref_id: &str,
+        ref_name: &str,
+        action: &str,
+        at: i64,
+    ) -> String {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO disposition_audit \
+             (id, ref_id, ref_name, action, locator_snapshot, actor, note, at) \
+             VALUES (?, ?, ?, ?, ?, 'local_user', NULL, ?)",
+        )
+        .bind(&id)
+        .bind(ref_id)
+        .bind(ref_name)
+        .bind(action)
+        .bind("{\"kind\":\"path\",\"path\":\"/tmp/x\"}")
+        .bind(at)
+        .execute(pool)
+        .await
+        .expect("insert audit");
+        id
+    }
+
+    fn filter_all() -> AuditListFilter {
+        AuditListFilter::default()
+    }
+
+    fn filter_by_ref(ref_id: &str) -> AuditListFilter {
+        AuditListFilter {
+            ref_id: Some(ref_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn filter_by_action(action: &str) -> AuditListFilter {
+        AuditListFilter {
+            action: Some(action.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_list_empty_db_returns_empty() {
+        let pool = setup().await;
+        let list = audit_list(&pool, filter_all()).await.expect("ok");
+        assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_list_single_row() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "none").await;
+        archive(&pool, rid.clone()).await.expect("archive");
+
+        let list = audit_list(&pool, filter_all()).await.expect("ok");
+        assert_eq!(list.len(), 1);
+        let item = &list[0];
+        assert_eq!(item.ref_id, rid);
+        assert_eq!(item.ref_name, "r");
+        assert_eq!(item.action, "archive");
+        assert_eq!(item.actor, "local_user");
+        assert!(item.note.is_none());
+        assert!(item.at > 0);
+        // locator_snapshot 反序列化为 Value，含 path 字段
+        let loc = item.locator_snapshot.as_ref().expect("locator");
+        assert_eq!(loc["kind"].as_str(), Some("path"));
+        assert_eq!(loc["path"].as_str(), Some("/tmp/x"));
+    }
+
+    #[tokio::test]
+    async fn audit_list_pagination() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "none").await;
+        // 造 5 条，at 递增
+        for i in 0..5 {
+            insert_audit_row(&pool, &rid, "r", "archive", 1000 + i).await;
+        }
+        // limit=2 offset=0 → 最新 2 条（at 倒序）
+        let page1 = audit_list(
+            &pool,
+            AuditListFilter {
+                limit: Some(2),
+                offset: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("page1");
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0].at, 1004);
+        assert_eq!(page1[1].at, 1003);
+
+        // limit=2 offset=2 → 接下来 2 条
+        let page2 = audit_list(
+            &pool,
+            AuditListFilter {
+                limit: Some(2),
+                offset: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("page2");
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2[0].at, 1002);
+        assert_eq!(page2[1].at, 1001);
+
+        // limit=2 offset=4 → 最后 1 条
+        let page3 = audit_list(
+            &pool,
+            AuditListFilter {
+                limit: Some(2),
+                offset: Some(4),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("page3");
+        assert_eq!(page3.len(), 1);
+        assert_eq!(page3[0].at, 1000);
+    }
+
+    #[tokio::test]
+    async fn audit_list_filter_by_ref_id() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid_a = make_reference(&pool, &cid, "none").await;
+        let rid_b = make_reference(&pool, &cid, "none").await;
+        insert_audit_row(&pool, &rid_a, "a", "archive", 1000).await;
+        insert_audit_row(&pool, &rid_b, "b", "archive", 1001).await;
+        insert_audit_row(&pool, &rid_a, "a", "unarchive", 1002).await;
+
+        let list = audit_list(&pool, filter_by_ref(&rid_a)).await.expect("ok");
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|i| i.ref_id == rid_a));
+        // at 倒序
+        assert_eq!(list[0].action, "unarchive");
+        assert_eq!(list[1].action, "archive");
+    }
+
+    #[tokio::test]
+    async fn audit_list_filter_by_action() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "none").await;
+        insert_audit_row(&pool, &rid, "r", "archive", 1000).await;
+        insert_audit_row(&pool, &rid, "r", "unarchive", 1001).await;
+        insert_audit_row(&pool, &rid, "r", "archive", 1002).await;
+        insert_audit_row(&pool, &rid, "r", "destroy", 1003).await;
+
+        let archives = audit_list(&pool, filter_by_action("archive"))
+            .await
+            .expect("ok");
+        assert_eq!(archives.len(), 2);
+        assert!(archives.iter().all(|i| i.action == "archive"));
+
+        let destroys = audit_list(&pool, filter_by_action("destroy"))
+            .await
+            .expect("ok");
+        assert_eq!(destroys.len(), 1);
+        assert_eq!(destroys[0].action, "destroy");
+    }
+
+    #[tokio::test]
+    async fn audit_list_filter_combined() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid_a = make_reference(&pool, &cid, "none").await;
+        let rid_b = make_reference(&pool, &cid, "none").await;
+        insert_audit_row(&pool, &rid_a, "a", "archive", 1000).await;
+        insert_audit_row(&pool, &rid_a, "a", "unarchive", 1001).await;
+        insert_audit_row(&pool, &rid_b, "b", "archive", 1002).await;
+        insert_audit_row(&pool, &rid_a, "a", "archive", 1003).await;
+
+        let list = audit_list(
+            &pool,
+            AuditListFilter {
+                ref_id: Some(rid_a.clone()),
+                action: Some("archive".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ok");
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|i| i.ref_id == rid_a && i.action == "archive"));
+        assert_eq!(list[0].at, 1003);
+        assert_eq!(list[1].at, 1000);
+    }
+
+    #[tokio::test]
+    async fn audit_list_ordered_by_at_desc() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "none").await;
+        // 乱序插入
+        insert_audit_row(&pool, &rid, "r", "archive", 500).await;
+        insert_audit_row(&pool, &rid, "r", "archive", 2000).await;
+        insert_audit_row(&pool, &rid, "r", "archive", 100).await;
+        insert_audit_row(&pool, &rid, "r", "archive", 1500).await;
+
+        let list = audit_list(&pool, filter_all()).await.expect("ok");
+        let ats: Vec<i64> = list.iter().map(|i| i.at).collect();
+        assert_eq!(ats, vec![2000, 1500, 500, 100]);
+    }
+
+    #[tokio::test]
+    async fn audit_list_err_invalid_action() {
+        let pool = setup().await;
+        let err = audit_list(&pool, filter_by_action("bogus"))
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn audit_list_limit_clamped_to_200() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "none").await;
+        // 造 5 条；请求 limit=999 → 截断为 200，但实际只有 5 条
+        for i in 0..5 {
+            insert_audit_row(&pool, &rid, "r", "archive", 1000 + i).await;
+        }
+        let list = audit_list(
+            &pool,
+            AuditListFilter {
+                limit: Some(999),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ok");
+        assert_eq!(list.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn audit_list_serializes_camel_case() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "none").await;
+        archive(&pool, rid).await.expect("archive");
+
+        let list = audit_list(&pool, filter_all()).await.expect("ok");
+        let v = serde_json::to_value(&list[0]).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert!(obj.contains_key("id"));
+        assert!(obj.contains_key("refId"));
+        assert!(obj.contains_key("refName"));
+        assert!(obj.contains_key("action"));
+        assert!(obj.contains_key("locatorSnapshot"));
+        assert!(obj.contains_key("actor"));
+        assert!(obj.contains_key("note"));
+        assert!(obj.contains_key("at"));
+        // 不出现 snake_case
+        assert!(!obj.contains_key("ref_id"));
+        assert!(!obj.contains_key("ref_name"));
+        assert!(!obj.contains_key("locator_snapshot"));
     }
 }

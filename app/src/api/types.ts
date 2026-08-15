@@ -298,3 +298,34 @@ export interface InitRootDirResult {
   rootDir: string;
   created: string[];
 }
+
+/* ---------------- 处置审计（§2.6 disp_audit_list） ---------------- */
+
+/** 审计 action 合法值 — 与 disposition_audit.action CHECK 约束一致 */
+export type DispositionAuditAction = "archive" | "unarchive" | "soft_delete" | "destroy";
+
+/**
+ * 处置审计条目 — 详细设计说明书 §2.6 disp_audit_list 出参 / §3.2 disposition_audit 表。
+ * `at` 为 Unix 秒（number）。
+ * `locatorSnapshot` 为反序列化后的 JSON 对象；写入时若 locator_json 解析失败可能为 null。
+ */
+export interface DispositionAudit {
+  id: string;
+  refId: string;
+  refName: string;
+  action: DispositionAuditAction;
+  locatorSnapshot: ReferenceLocator | null;
+  actor: string;
+  note?: string | null;
+  at: number;
+}
+
+/** disp_audit_list 入参 — 全部可选 */
+export interface DispAuditListInput {
+  refId?: string;
+  action?: DispositionAuditAction;
+  /** 默认 50，最大 200（越界后端截断） */
+  limit?: number;
+  /** 默认 0 */
+  offset?: number;
+}

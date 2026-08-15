@@ -3,6 +3,7 @@ import { ConfigProvider, App as AntApp, Spin } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import {
   AppstoreOutlined,
+  AuditOutlined,
   FilterOutlined,
   InboxOutlined,
   SettingOutlined,
@@ -15,6 +16,7 @@ import { CollectionPage } from "./pages/CollectionPage";
 import { CollectionDetailPage } from "./pages/CollectionDetailPage";
 import { FilterPage } from "./pages/FilterPage";
 import { InitWizardPage } from "./pages/InitWizardPage";
+import { AuditPage } from "./pages/AuditPage";
 import { settingsGetRootDir, toApiError } from "./api";
 import type { Collection, Space } from "./api";
 import "./styles/theme.css";
@@ -22,6 +24,7 @@ import "./styles/theme.css";
 const navItems: NavItem[] = [
   { key: "spaces", label: "空间", icon: <AppstoreOutlined />, enabled: true },
   { key: "filter", label: "筛选", icon: <FilterOutlined />, enabled: true },
+  { key: "audit", label: "审计", icon: <AuditOutlined />, enabled: true },
   { key: "collections", label: "资源集", icon: <FolderOutlined />, enabled: false },
   { key: "inbox", label: "收件箱", icon: <InboxOutlined />, enabled: false },
   { key: "settings", label: "设置", icon: <SettingOutlined />, enabled: false },
@@ -154,6 +157,7 @@ function App() {
                 <SpacePage onEnterSpace={handleEnterSpace} />
               ))}
             {activeNav === "filter" && <FilterPage />}
+            {activeNav === "audit" && <AuditPage />}
           </AppShell>
         )}
       </AntApp>
