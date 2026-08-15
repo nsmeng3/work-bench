@@ -16,6 +16,10 @@
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{AppError, CmdResult};
 
@@ -264,6 +268,267 @@ pub async fn disp_get_capabilities(
     ref_id: String,
 ) -> CmdResult<DispCapabilities> {
     get_capabilities(&state.pool, ref_id).await
+}
+
+// ============================================================
+// disp_preview：删除/销毁确认框的统计数据（契约 §2.6）
+// ============================================================
+//
+// 设计要点（详细设计 §6 性能）：
+// - 目录递归统计在 `tokio::task::spawn_blocking` 阻塞线程池执行，不阻塞 async runtime。
+// - 取消机制：协作式 `Arc<AtomicBool>`。每次 `disp_preview` 生成 UUID 作为 `previewId`，
+//   并把取消标志注册到进程级 `PREVIEW_REGISTRY`；前端调 `disp_preview_cancel { previewId }`
+//   把标志位置 true，walker 每个条目检查一次，发现取消立即终止并返回 `COMMON_CANCELLED`。
+// - 命令完成（成功/失败/取消）后从注册表移除自身条目，避免泄漏。
+// - 符号链接不跟随出根（与 M3-3.2 `reference::walk_dir` 一致）：用 `symlink_metadata`
+//   判断，symlink 自身按文件计入 fileCount 与 totalBytes，但不递归进入。
+
+/// `disp_preview` 出参（契约 §2.6）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DispPreview {
+    pub preview_id: String,
+    pub target: String,
+    pub is_dir: bool,
+    pub file_count: u64,
+    pub total_bytes: u64,
+    pub capability: DispCapabilities,
+    pub warning: String,
+}
+
+/// 进程级 preview 取消注册表：previewId → 取消标志。
+///
+/// 用 `OnceLock<Mutex<HashMap>>` 而非 `lazy_static`/`once_cell` 外部 crate，
+/// 避免引入新依赖（任务约束 #8）。
+static PREVIEW_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+
+fn preview_registry() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    PREVIEW_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 注册新 preview，返回 `(previewId, cancel_flag)`。
+fn register_preview() -> (String, Arc<AtomicBool>) {
+    let id = uuid::Uuid::new_v4().to_string();
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut map = preview_registry()
+        .lock()
+        .expect("preview registry poisoned");
+    map.insert(id.clone(), Arc::clone(&flag));
+    (id, flag)
+}
+
+/// 从注册表移除 preview（命令结束时调用）。
+fn unregister_preview(preview_id: &str) {
+    let mut map = preview_registry()
+        .lock()
+        .expect("preview registry poisoned");
+    map.remove(preview_id);
+}
+
+/// 取消指定 preview：把标志位置 true。返回是否存在该 previewId。
+fn cancel_preview(preview_id: &str) -> bool {
+    let map = preview_registry()
+        .lock()
+        .expect("preview registry poisoned");
+    if let Some(flag) = map.get(preview_id) {
+        flag.store(true, Ordering::SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
+/// 从 `resource_reference` 行解析目标绝对路径。
+///
+/// 仅支持 `locator_json.kind == "path"`；其他 kind 返回 `COMMON_INVALID_PARAM`。
+fn parse_target_path(locator_json: &str) -> CmdResult<PathBuf> {
+    let v: serde_json::Value = serde_json::from_str(locator_json).map_err(|e| {
+        AppError::db(format!("locator_json 反序列化失败: {}", e))
+    })?;
+    let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    if kind != "path" {
+        return Err(AppError::invalid_param(format!(
+            "暂不支持的 locator kind: {}",
+            kind
+        )));
+    }
+    let path = v
+        .get("path")
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| AppError::db("locator_json 缺少 path 字段".to_string()))?;
+    Ok(PathBuf::from(path))
+}
+
+/// 递归统计目标路径：返回 `(is_dir, file_count, total_bytes)`。
+///
+/// - 单文件 / 符号链接：`file_count = 1`，`total_bytes = metadata.len()`。
+/// - 目录：深度优先递归 walk；符号链接不跟随出根（与 M3-3.2 一致）。
+/// - `cancel_flag` 每个条目检查一次；为 true 时返回 `COMMON_CANCELLED`。
+/// - 路径不存在 → `COMMON_NOT_FOUND`（契约 §2.6 错误语义）。
+fn stat_target(path: &Path, cancel_flag: &AtomicBool) -> CmdResult<(bool, u64, u64)> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| map_preview_fs_err("读取目标元数据失败", path, e))?;
+    if meta.is_dir() {
+        let mut file_count: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        walk_preview_dir(path, cancel_flag, &mut |entry_meta| {
+            if entry_meta.is_file() || entry_meta.file_type().is_symlink() {
+                file_count += 1;
+                total_bytes = total_bytes.saturating_add(entry_meta.len());
+            }
+            Ok(())
+        })?;
+        Ok((true, file_count, total_bytes))
+    } else {
+        // 单文件 / 符号链接：直接读 metadata
+        Ok((false, 1, meta.len()))
+    }
+}
+
+/// 深度优先递归遍历；每个条目调用 `f`，并在每个条目检查 `cancel_flag`。
+fn walk_preview_dir<F>(root: &Path, cancel_flag: &AtomicBool, f: &mut F) -> CmdResult<()>
+where
+    F: FnMut(std::fs::Metadata) -> CmdResult<()>,
+{
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Err(AppError::new("COMMON_CANCELLED", "preview 已取消"));
+    }
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| map_preview_fs_err("读取目录失败", root, e))?;
+    for entry in entries {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return Err(AppError::new("COMMON_CANCELLED", "preview 已取消"));
+        }
+        let entry = entry.map_err(|e| map_preview_fs_err("读取目录条目失败", root, e))?;
+        let entry_path = entry.path();
+        // symlink_metadata 不跟随符号链接，避免越出根
+        let meta = std::fs::symlink_metadata(&entry_path)
+            .map_err(|e| map_preview_fs_err("读取条目元数据失败", &entry_path, e))?;
+        f(meta.clone())?;
+        if meta.is_dir() {
+            walk_preview_dir(&entry_path, cancel_flag, f)?;
+        }
+    }
+    Ok(())
+}
+
+/// preview 专用 FS 错误映射：路径不存在 → `COMMON_NOT_FOUND`（契约 §2.6）。
+fn map_preview_fs_err(context: &str, path: &Path, err: std::io::Error) -> AppError {
+    let msg = format!("{} {}: {}", context, path.display(), err);
+    match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            AppError::not_found(format!("目标路径不存在: {}", path.display()))
+        }
+        std::io::ErrorKind::PermissionDenied => AppError::new("FS_PERMISSION_DENIED", msg),
+        _ => AppError::io(msg),
+    }
+}
+
+/// 生成中文警告文案：包含 fileCount / totalBytes / 「销毁后不可恢复」。
+fn build_warning(is_dir: bool, file_count: u64, total_bytes: u64) -> String {
+    let size_human = human_size(total_bytes);
+    if is_dir {
+        format!(
+            "目录包含 {} 个文件，共 {}；销毁后不可恢复",
+            file_count, size_human
+        )
+    } else {
+        format!("文件大小 {}；销毁后不可恢复", size_human)
+    }
+}
+
+/// 字节数人性化展示（B / KB / MB / GB / TB）。
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+    if bytes >= TB {
+        format!("{:.2} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// `disp_preview` 业务函数：查 reference → 后台线程统计 → 计算能力 → 组装出参。
+///
+/// 错误：
+/// - `COMMON_NOT_FOUND`：refId 不存在 / 目标路径已被外部删除
+/// - `COMMON_CANCELLED`：前端调用 `disp_preview_cancel` 取消
+/// - `COMMON_DB`：数据库或 JSON 解析失败
+pub async fn preview(pool: &SqlitePool, ref_id: String) -> CmdResult<DispPreview> {
+    // 1) 查 reference + storage_source.caps_json
+    let row = sqlx::query(
+        "SELECT r.disposition AS disposition, r.locator_json AS locator_json, \
+                s.caps_json AS caps_json \
+         FROM resource_reference r \
+         JOIN storage_source s ON s.id = r.source_id \
+         WHERE r.id = ?",
+    )
+    .bind(&ref_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from)?
+    .ok_or_else(|| AppError::not_found(format!("资源引用不存在: {}", ref_id)))?;
+
+    let disposition: String = row.try_get("disposition").map_err(AppError::from)?;
+    let locator_json: String = row.try_get("locator_json").map_err(AppError::from)?;
+    let caps_json: Option<String> = row.try_get("caps_json").map_err(AppError::from)?;
+
+    let target_path = parse_target_path(&locator_json)?;
+
+    // 2) 注册 preview，准备取消标志
+    let (preview_id, cancel_flag) = register_preview();
+    let cancel_flag_for_worker = Arc::clone(&cancel_flag);
+    let target_for_worker = target_path.clone();
+
+    // 3) 阻塞线程池执行递归统计；结束（无论成败）后从注册表移除
+    let stat_result = tokio::task::spawn_blocking(move || {
+        stat_target(&target_for_worker, &cancel_flag_for_worker)
+    })
+    .await
+    .map_err(|e| AppError::io(format!("preview worker join 失败: {}", e)));
+    unregister_preview(&preview_id);
+    let (is_dir, file_count, total_bytes) = stat_result??;
+
+    // 4) 能力计算（复用 4.1 纯函数）
+    let soft_delete_supported = parse_soft_delete_cap(caps_json.as_deref())?;
+    let capability = compute_capabilities(&disposition, soft_delete_supported);
+
+    // 5) 警告文案
+    let warning = build_warning(is_dir, file_count, total_bytes);
+
+    Ok(DispPreview {
+        preview_id,
+        target: target_path.to_string_lossy().into_owned(),
+        is_dir,
+        file_count,
+        total_bytes,
+        capability,
+        warning,
+    })
+}
+
+/// `disp_preview` Tauri 命令。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn disp_preview(
+    state: tauri::State<'_, crate::AppState>,
+    ref_id: String,
+) -> CmdResult<DispPreview> {
+    preview(&state.pool, ref_id).await
+}
+
+/// `disp_preview_cancel` Tauri 命令：协作式取消正在进行的 preview。
+///
+/// 若 previewId 不存在（已结束或从未注册），返回 Ok(false)；存在则置标志位并返回 Ok(true)。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn disp_preview_cancel(preview_id: String) -> CmdResult<bool> {
+    Ok(cancel_preview(&preview_id))
 }
 
 // ============================================================
@@ -603,5 +868,245 @@ mod tests {
         assert!(v);
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = v;
+    }
+
+    // ---------- disp_preview ----------
+
+    /// 插入一个 reference，locator 指向给定路径；返回 id。
+    async fn make_reference_with_path(
+        pool: &SqlitePool,
+        collection_id: &str,
+        disposition: &str,
+        path: &std::path::Path,
+    ) -> String {
+        let id = Uuid::new_v4().to_string();
+        let now = now_unix();
+        let locator_json = serde_json::json!({
+            "kind": "path",
+            "path": path.to_string_lossy(),
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO resource_reference \
+             (id, collection_id, source_id, name, type, hosting, locator_json, \
+              description, lifecycle, confidentiality, indexed, disposition, created_at, updated_at) \
+             VALUES (?, ?, ?, 'r', 'code', 'external', ?, \
+              NULL, 'active', 'internal', 1, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(collection_id)
+        .bind(DEFAULT_SOURCE_ID)
+        .bind(&locator_json)
+        .bind(disposition)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert reference with path");
+        id
+    }
+
+    #[tokio::test]
+    async fn preview_err_ref_not_found() {
+        let pool = setup().await;
+        let err = preview(&pool, "no-such-id".into())
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn preview_single_file() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("hello.txt");
+        std::fs::write(&file, b"hello world").expect("write");
+        let rid = make_reference_with_path(&pool, &cid, "none", &file).await;
+
+        let p = preview(&pool, rid).await.expect("preview ok");
+        assert!(!p.is_dir);
+        assert_eq!(p.file_count, 1);
+        assert_eq!(p.total_bytes, 11);
+        assert_eq!(p.target, file.to_string_lossy());
+        assert!(!p.preview_id.is_empty());
+        assert!(p.capability.archive);
+        assert!(p.warning.contains("销毁后不可恢复"));
+    }
+
+    #[tokio::test]
+    async fn preview_directory_nested() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().join("proj");
+        std::fs::create_dir(&root).expect("mkdir");
+        std::fs::write(root.join("a.txt"), b"aaa").expect("a");
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).expect("mkdir sub");
+        std::fs::write(sub.join("b.txt"), b"bbbbb").expect("b");
+        std::fs::write(sub.join("c.txt"), b"c").expect("c");
+        let rid = make_reference_with_path(&pool, &cid, "none", &root).await;
+
+        let p = preview(&pool, rid).await.expect("preview ok");
+        assert!(p.is_dir);
+        assert_eq!(p.file_count, 3);
+        assert_eq!(p.total_bytes, 3 + 5 + 1);
+        assert!(p.warning.contains("3 个文件"));
+        assert!(p.warning.contains("销毁后不可恢复"));
+    }
+
+    #[tokio::test]
+    async fn preview_empty_directory() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().join("empty");
+        std::fs::create_dir(&root).expect("mkdir");
+        let rid = make_reference_with_path(&pool, &cid, "none", &root).await;
+
+        let p = preview(&pool, rid).await.expect("preview ok");
+        assert!(p.is_dir);
+        assert_eq!(p.file_count, 0);
+        assert_eq!(p.total_bytes, 0);
+        assert!(p.warning.contains("0 个文件"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_symlink_not_followed() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&root).expect("mkdir root");
+        std::fs::create_dir(&outside).expect("mkdir outside");
+        std::fs::write(outside.join("secret.txt"), b"secret-data").expect("write");
+        std::fs::write(root.join("real.txt"), b"real").expect("write real");
+        std::os::unix::fs::symlink(&outside, root.join("link_out")).expect("symlink");
+
+        let rid = make_reference_with_path(&pool, &cid, "none", &root).await;
+        let p = preview(&pool, rid).await.expect("preview ok");
+        assert!(p.is_dir);
+        // 2 个条目：real.txt + link_out（symlink 自身按文件计入，但不递归进入 outside）
+        assert_eq!(p.file_count, 2);
+        // total_bytes = real.txt 大小 + symlink 自身大小（不跟随到 secret.txt）
+        assert!(p.total_bytes >= 4);
+        // 关键断言：没有把 outside/secret.txt 的 11 字节计入
+        assert!(p.total_bytes < 4 + 11 + 4096);
+    }
+
+    #[tokio::test]
+    async fn preview_large_directory_1000_files() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().join("big");
+        std::fs::create_dir(&root).expect("mkdir");
+        for i in 0..1000 {
+            std::fs::write(root.join(format!("f{:04}.txt", i)), b"").expect("write");
+        }
+        let rid = make_reference_with_path(&pool, &cid, "none", &root).await;
+
+        let start = std::time::Instant::now();
+        let p = preview(&pool, rid).await.expect("preview ok");
+        let elapsed = start.elapsed();
+        assert!(p.is_dir);
+        assert_eq!(p.file_count, 1000);
+        assert_eq!(p.total_bytes, 0);
+        // 1000 空文件统计应在 10 秒内完成（非常宽松的上限）
+        assert!(elapsed.as_secs() < 10, "统计耗时 {:?}", elapsed);
+    }
+
+    #[tokio::test]
+    async fn preview_cancel_terminates_early() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().join("big");
+        std::fs::create_dir(&root).expect("mkdir");
+        // 建一个较多文件的目录，让统计有时间被中断
+        for i in 0..2000 {
+            std::fs::write(root.join(format!("f{:04}.txt", i)), b"x").expect("write");
+        }
+        let rid = make_reference_with_path(&pool, &cid, "none", &root).await;
+
+        // 先注册一个 preview 拿到 previewId，然后立即取消
+        let (preview_id, flag) = register_preview();
+        assert!(!flag.load(Ordering::SeqCst));
+        let cancelled = cancel_preview(&preview_id);
+        assert!(cancelled);
+        assert!(flag.load(Ordering::SeqCst));
+
+        // 直接调 stat_target 验证：取消标志为 true 时立即返回 COMMON_CANCELLED
+        let err = stat_target(&root, &flag).expect_err("should be cancelled");
+        assert_eq!(err.code, "COMMON_CANCELLED");
+
+        unregister_preview(&preview_id);
+        // 取消不存在的 previewId 返回 false
+        assert!(!cancel_preview(&preview_id));
+
+        // rid 仍然能正常 preview（独立流程）
+        let p = preview(&pool, rid).await.expect("preview ok");
+        assert_eq!(p.file_count, 2000);
+    }
+
+    #[tokio::test]
+    async fn preview_err_target_externally_deleted() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("gone.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let rid = make_reference_with_path(&pool, &cid, "none", &file).await;
+        // 外部删除文件
+        std::fs::remove_file(&file).expect("remove");
+
+        let err = preview(&pool, rid).await.expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn preview_serializes_camel_case() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, b"a").expect("write");
+        let rid = make_reference_with_path(&pool, &cid, "none", &file).await;
+
+        let p = preview(&pool, rid).await.expect("preview ok");
+        let v = serde_json::to_value(&p).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert!(obj.contains_key("previewId"));
+        assert!(obj.contains_key("target"));
+        assert!(obj.contains_key("isDir"));
+        assert!(obj.contains_key("fileCount"));
+        assert!(obj.contains_key("totalBytes"));
+        assert!(obj.contains_key("capability"));
+        assert!(obj.contains_key("warning"));
+        assert!(!obj.contains_key("preview_id"));
+        assert!(!obj.contains_key("is_dir"));
+        assert!(!obj.contains_key("file_count"));
+        assert!(!obj.contains_key("total_bytes"));
+    }
+
+    #[test]
+    fn human_size_formats() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.00 KB");
+        assert_eq!(human_size(1024 * 1024), "1.00 MB");
+        assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.00 GB");
+    }
+
+    #[test]
+    fn build_warning_messages() {
+        let w = build_warning(true, 42, 1024);
+        assert!(w.contains("42 个文件"));
+        assert!(w.contains("销毁后不可恢复"));
+        let w2 = build_warning(false, 1, 100);
+        assert!(w2.contains("销毁后不可恢复"));
     }
 }

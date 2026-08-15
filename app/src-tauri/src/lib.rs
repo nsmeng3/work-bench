@@ -80,6 +80,8 @@ pub fn run() {
             settings::settings_get_root_dir,
             settings::settings_init_root_dir,
             disposition::disp_get_capabilities,
+            disposition::disp_preview,
+            disposition::disp_preview_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
