@@ -163,3 +163,45 @@ export interface CollectionDetail {
   /** 六类型分组；固定键序 code/document/data/artifact/tool/media */
   referencesByType: Record<ReferenceType, ReferenceWithHealth[]>;
 }
+
+/* ---------------- 查询筛选（§2.9） ---------------- */
+
+/** query_refs 入参 — 全部可选；tags 为 AND 语义 */
+export interface QueryRefsInput {
+  spaceId?: string;
+  collectionId?: string;
+  type?: ReferenceType;
+  tags?: string[];
+  lifecycle?: ReferenceLifecycle;
+  confidentiality?: ReferenceConfidentiality;
+  disposition?: ReferenceDisposition;
+  sourceId?: string;
+  keyword?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** query_refs 出参 */
+export interface QueryRefsOutput {
+  total: number;
+  items: Reference[];
+}
+
+/** query_facets 入参 */
+export interface QueryFacetsInput {
+  spaceId?: string;
+}
+
+/** 单个 facet 可选值与计数 */
+export interface FacetValue {
+  value: string;
+  count: number;
+}
+
+/** query_facets 出参 — 四个维度的可用筛选值与计数 */
+export interface QueryFacetsOutput {
+  type: FacetValue[];
+  lifecycle: FacetValue[];
+  confidentiality: FacetValue[];
+  tags: FacetValue[];
+}

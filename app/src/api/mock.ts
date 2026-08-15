@@ -13,6 +13,11 @@ import type {
   Reference,
   ReferenceType,
   ReferenceWithHealth,
+  QueryRefsInput,
+  QueryRefsOutput,
+  QueryFacetsInput,
+  QueryFacetsOutput,
+  FacetValue,
 } from "./types";
 
 /**
@@ -307,6 +312,116 @@ const seedReferences: ReferenceWithHealth[] = [
     health: "unknown",
   },
 ];
+
+/**
+ * 筛选页 mock 引用池 — 覆盖六类型 / 多标签 / 多生命周期 / 多保密级别，
+ * 用于 query_refs / query_facets 的 mock 数据源。
+ * 与 collection_get 共用的 seedReferences 解耦，避免影响既有用例。
+ */
+const filterSeedReferences: Reference[] = (() => {
+  const base = 1754039000;
+  const list: Reference[] = [];
+  const types: ReferenceType[] = ["code", "document", "data", "artifact", "tool", "media"];
+  const lifecycles: Reference["lifecycle"][] = ["active", "staged", "delivered", "archived"];
+  const confs: Reference["confidentiality"][] = [
+    "public",
+    "internal",
+    "customer_restricted",
+    "sensitive",
+  ];
+  const tagPool = ["frontend", "backend", "tauri", "design", "docs", "research", "ops"];
+  const collections = ["mock-collection-1", "mock-collection-2"];
+
+  for (let i = 0; i < 42; i++) {
+    const type = types[i % types.length];
+    const lifecycle = lifecycles[i % lifecycles.length];
+    const confidentiality = confs[i % confs.length];
+    const tags = [tagPool[i % tagPool.length]];
+    if (i % 3 === 0) tags.push(tagPool[(i + 2) % tagPool.length]);
+    if (i % 7 === 0) tags.push("hot");
+    list.push(
+      makeRef({
+        id: `mock-filter-ref-${i + 1}`,
+        collectionId: collections[i % collections.length],
+        name: `${type}-示例-${i + 1}`,
+        type,
+        lifecycle,
+        confidentiality,
+        tags,
+        description: `筛选 mock 第 ${i + 1} 条`,
+        createdAt: base + i * 60,
+        updatedAt: base + i * 60,
+      }),
+    );
+  }
+  return list;
+})();
+
+function matchKeyword(ref: Reference, keyword: string): boolean {
+  const k = keyword.trim().toLowerCase();
+  if (!k) return true;
+  return (
+    ref.name.toLowerCase().includes(k) ||
+    (ref.description ?? "").toLowerCase().includes(k) ||
+    (ref.tags ?? []).some((t) => t.toLowerCase().includes(k))
+  );
+}
+
+export const mockQueryApi = {
+  query_refs(input: QueryRefsInput): QueryRefsOutput {
+    let items = filterSeedReferences.slice();
+    if (input.collectionId) items = items.filter((r) => r.collectionId === input.collectionId);
+    if (input.type) items = items.filter((r) => r.type === input.type);
+    if (input.lifecycle) items = items.filter((r) => r.lifecycle === input.lifecycle);
+    if (input.confidentiality)
+      items = items.filter((r) => r.confidentiality === input.confidentiality);
+    if (input.disposition) items = items.filter((r) => r.disposition === input.disposition);
+    if (input.sourceId) items = items.filter((r) => r.sourceId === input.sourceId);
+    if (input.tags && input.tags.length > 0) {
+      // AND 语义：必须同时包含所有选中标签
+      items = items.filter((r) => {
+        const have = new Set(r.tags ?? []);
+        return input.tags!.every((t) => have.has(t));
+      });
+    }
+    if (input.keyword) items = items.filter((r) => matchKeyword(r, input.keyword!));
+
+    const total = items.length;
+    const offset = Math.max(0, input.offset ?? 0);
+    const limit = Math.max(1, input.limit ?? 50);
+    return { total, items: items.slice(offset, offset + limit) };
+  },
+
+  query_facets(_input: QueryFacetsInput): QueryFacetsOutput {
+    // 注：mock 仅支持全量计数，不按 spaceId 过滤（mock 数据未挂 space 维度）。
+    const count = <K extends keyof Reference>(
+      key: K,
+      pick: (v: Reference[K]) => string | undefined,
+    ): FacetValue[] => {
+      const m = new Map<string, number>();
+      for (const r of filterSeedReferences) {
+        const v = pick(r[key]);
+        if (!v) continue;
+        m.set(v, (m.get(v) ?? 0) + 1);
+      }
+      return Array.from(m.entries())
+        .map(([value, count]) => ({ value, count }))
+        .sort((a, b) => b.count - a.count);
+    };
+    const tagMap = new Map<string, number>();
+    for (const r of filterSeedReferences) {
+      for (const t of r.tags ?? []) tagMap.set(t, (tagMap.get(t) ?? 0) + 1);
+    }
+    return {
+      type: count("type", (v) => v),
+      lifecycle: count("lifecycle", (v) => v),
+      confidentiality: count("confidentiality", (v) => v),
+      tags: Array.from(tagMap.entries())
+        .map(([value, count]) => ({ value, count }))
+        .sort((a, b) => b.count - a.count),
+    };
+  },
+};
 
 function buildReferencesByType(collectionId: string): Record<ReferenceType, ReferenceWithHealth[]> {
   const grouped = {} as Record<ReferenceType, ReferenceWithHealth[]>;
