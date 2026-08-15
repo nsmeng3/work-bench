@@ -21,7 +21,7 @@ import type {
   ReferenceLifecycle,
   ReferenceType,
 } from "../api";
-import { queryFacets, queryRefs, toApiError } from "../api";
+import { collectionList, queryFacets, queryRefs, spaceList, toApiError } from "../api";
 
 /**
  * 筛选页 — 任务包 m2-2.12。
@@ -133,6 +133,9 @@ export function FilterPage() {
   const [facets, setFacets] = useState<QueryFacetsOutput | null>(null);
   const [facetsLoading, setFacetsLoading] = useState(true);
 
+  // 资源集 id -> name 映射（用于所属资源集列展示）
+  const [collectionNameMap, setCollectionNameMap] = useState<Record<string, string>>({});
+
   // 筛选状态（受控）
   const [typeSel, setTypeSel] = useState<string[]>([]);
   const [lifecycleSel, setLifecycleSel] = useState<string[]>([]);
@@ -147,14 +150,26 @@ export function FilterPage() {
 
   const [messageApi, messageContextHolder] = message.useMessage();
 
-  // 挂载时拉一次 facets（全量计数）
+  // 挂载时拉一次 facets（全量计数），并加载所有空间下的资源集以构建 id->name 映射
   useEffect(() => {
     let cancelled = false;
     (async () => {
       setFacetsLoading(true);
       try {
-        const f = await queryFacets({});
-        if (!cancelled) setFacets(f);
+        const [f, spaces] = await Promise.all([queryFacets({}), spaceList({ status: "active" })]);
+        const collections = await Promise.all(
+          spaces.map((s) => collectionList({ spaceId: s.id, status: "active" })),
+        );
+        const nameMap: Record<string, string> = {};
+        for (const list of collections) {
+          for (const c of list) {
+            nameMap[c.id] = c.name;
+          }
+        }
+        if (!cancelled) {
+          setFacets(f);
+          setCollectionNameMap(nameMap);
+        }
       } catch (err) {
         if (!cancelled) {
           const apiErr = toApiError(err);
@@ -230,7 +245,11 @@ export function FilterPage() {
         dataIndex: "collectionId",
         key: "collectionId",
         width: 160,
-        render: (id: string) => <Typography.Text code>{id}</Typography.Text>,
+        render: (id: string) => (
+          <Typography.Text title={id}>
+            {collectionNameMap[id] ?? id}
+          </Typography.Text>
+        ),
       },
       {
         title: "生命周期",
@@ -273,7 +292,7 @@ export function FilterPage() {
         render: (ts: number) => formatUnixSeconds(ts),
       },
     ],
-    [],
+    [collectionNameMap],
   );
 
   return (
