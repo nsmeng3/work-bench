@@ -3,12 +3,13 @@ import type { Space, SpaceCreateInput, SpaceUpdateInput, SpaceIdInput, SpaceList
 /**
  * Mock 数据 — 形状与契约逐字段一致（§2.3 / §3.2 space 表）。
  * 仅在 VITE_MOCK_API 开启时使用，默认关闭。
+ * createdAt / updatedAt 使用 Unix 秒。
  */
 
 let mockSeq = 100;
 
-function isoNow(): string {
-  return new Date().toISOString();
+function unixNow(): number {
+  return Math.floor(Date.now() / 1000);
 }
 
 function makeId(): string {
@@ -23,8 +24,8 @@ const seedSpaces: Space[] = [
     color: "#4A90D9",
     icon: "briefcase",
     status: "active",
-    createdAt: "2026-08-01T09:00:00Z",
-    updatedAt: "2026-08-01T09:00:00Z",
+    createdAt: 1754038800, // 2026-08-01T09:00:00Z
+    updatedAt: 1754038800,
   },
   {
     id: "mock-space-2",
@@ -33,8 +34,8 @@ const seedSpaces: Space[] = [
     color: "#7BC47F",
     icon: "home",
     status: "active",
-    createdAt: "2026-08-01T09:01:00Z",
-    updatedAt: "2026-08-01T09:01:00Z",
+    createdAt: 1754038860, // 2026-08-01T09:01:00Z
+    updatedAt: 1754038860,
   },
 ];
 
@@ -48,7 +49,7 @@ export const mockSpaceApi = {
   },
 
   space_create(input: SpaceCreateInput): Space {
-    const now = isoNow();
+    const now = unixNow();
     const space: Space = {
       id: makeId(),
       name: input.name,
@@ -74,7 +75,7 @@ export const mockSpaceApi = {
       description: input.description ?? s.description,
       color: input.color ?? s.color,
       icon: input.icon ?? s.icon,
-      updatedAt: isoNow(),
+      updatedAt: unixNow(),
     };
     store[idx] = updated;
     return updated;
@@ -85,7 +86,7 @@ export const mockSpaceApi = {
     if (idx === -1) throw { code: "COMMON_NOT_FOUND", message: "空间不存在", retryable: false };
     const s = store[idx];
     if (s.status === "archived") throw { code: "COMMON_CONFLICT", message: "空间已归档", retryable: false };
-    const updated: Space = { ...s, status: "archived", updatedAt: isoNow() };
+    const updated: Space = { ...s, status: "archived", updatedAt: unixNow() };
     store[idx] = updated;
     return updated;
   },
@@ -93,7 +94,7 @@ export const mockSpaceApi = {
   space_restore(input: SpaceIdInput): Space {
     const idx = store.findIndex((s) => s.id === input.id);
     if (idx === -1) throw { code: "COMMON_NOT_FOUND", message: "空间不存在", retryable: false };
-    const updated: Space = { ...store[idx], status: "active", updatedAt: isoNow() };
+    const updated: Space = { ...store[idx], status: "active", updatedAt: unixNow() };
     store[idx] = updated;
     return updated;
   },

@@ -1,7 +1,8 @@
-import { useState, useEffect } from "react";
-import type { Space, SpaceCreateInput, SpaceUpdateInput, ApiError } from "../api";
+import { useEffect } from "react";
+import { Modal, Form, Input } from "antd";
+import type { Space, SpaceCreateInput, SpaceUpdateInput } from "../api";
 import { spaceCreate, spaceUpdate, toApiError } from "../api";
-import "./SpaceDialog.css";
+import { message } from "antd";
 
 const NAME_MAX_LENGTH = 64;
 
@@ -13,139 +14,106 @@ interface SpaceDialogProps {
   onSaved: () => void;
 }
 
+interface SpaceFormValues {
+  name: string;
+  description?: string;
+  color?: string;
+  icon?: string;
+}
+
 export function SpaceDialog({ open, space, onClose, onSaved }: SpaceDialogProps) {
   const isEdit = !!space;
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [color, setColor] = useState("");
-  const [icon, setIcon] = useState("");
-  const [error, setError] = useState<ApiError | null>(null);
-  const [submitting, setSubmitting] = useState(false);
+  const [form] = Form.useForm<SpaceFormValues>();
+  const [messageApi, contextHolder] = message.useMessage();
 
   useEffect(() => {
     if (open) {
-      setName(space?.name ?? "");
-      setDescription(space?.description ?? "");
-      setColor(space?.color ?? "");
-      setIcon(space?.icon ?? "");
-      setError(null);
-      setSubmitting(false);
+      form.setFieldsValue({
+        name: space?.name ?? "",
+        description: space?.description ?? "",
+        color: space?.color ?? "",
+        icon: space?.icon ?? "",
+      });
+    } else {
+      form.resetFields();
     }
-  }, [open, space]);
+  }, [open, space, form]);
 
-  if (!open) return null;
-
-  const nameTrimmed = name.trim();
-  const nameTooLong = nameTrimmed.length > NAME_MAX_LENGTH;
-  const nameValid = nameTrimmed.length > 0 && !nameTooLong;
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!nameValid || submitting) return;
-
-    setSubmitting(true);
-    setError(null);
+  async function handleOk() {
+    const values = await form.validateFields();
+    const nameTrimmed = values.name.trim();
+    const payload = {
+      name: nameTrimmed,
+      description: values.description?.trim() || undefined,
+      color: values.color || undefined,
+      icon: values.icon || undefined,
+    };
 
     try {
       if (isEdit) {
-        const input: SpaceUpdateInput = {
-          id: space.id,
-          name: nameTrimmed,
-          description: description.trim() || undefined,
-          color: color || undefined,
-          icon: icon || undefined,
-        };
+        const input: SpaceUpdateInput = { id: space.id, ...payload };
         await spaceUpdate(input);
+        messageApi.success("空间已更新");
       } else {
-        const input: SpaceCreateInput = {
-          name: nameTrimmed,
-          description: description.trim() || undefined,
-          color: color || undefined,
-          icon: icon || undefined,
-        };
+        const input: SpaceCreateInput = payload;
         await spaceCreate(input);
+        messageApi.success("空间已创建");
       }
       onSaved();
       onClose();
     } catch (err) {
-      setError(toApiError(err));
-    } finally {
-      setSubmitting(false);
+      const apiErr = toApiError(err);
+      messageApi.error(apiErr.message);
+      // 不关闭弹窗，允许用户修正后重试
+      throw err;
     }
   }
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
-      <div className="dialog" onClick={(e) => e.stopPropagation()}>
-        <h2 className="dialog-title">{isEdit ? "编辑空间" : "创建空间"}</h2>
+    <>
+      {contextHolder}
+      <Modal
+        title={isEdit ? "编辑空间" : "创建空间"}
+        open={open}
+        onCancel={onClose}
+        onOk={handleOk}
+        okText={isEdit ? "保存" : "创建"}
+        cancelText="取消"
+        destroyOnHidden
+        maskClosable={false}
+      >
+        <Form form={form} layout="vertical" preserve={false}>
+          <Form.Item
+            name="name"
+            label="名称"
+            rules={[
+              {
+                required: true,
+                whitespace: true,
+                message: "名称不能为空",
+              },
+              {
+                max: NAME_MAX_LENGTH,
+                message: `名称超长（最大 ${NAME_MAX_LENGTH} 字符）`,
+              },
+            ]}
+          >
+            <Input placeholder="空间名称" autoFocus maxLength={NAME_MAX_LENGTH + 10} />
+          </Form.Item>
 
-        <form onSubmit={handleSubmit} className="dialog-form">
-          <label className="dialog-field">
-            <span className="dialog-label">名称 *</span>
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="空间名称"
-              maxLength={NAME_MAX_LENGTH + 10}
-              autoFocus
-            />
-            {nameTooLong && (
-              <span className="dialog-field-error">名称超长（最大 {NAME_MAX_LENGTH} 字符）</span>
-            )}
-            {nameTrimmed.length === 0 && name.length > 0 && (
-              <span className="dialog-field-error">名称不能为空</span>
-            )}
-          </label>
+          <Form.Item name="description" label="描述">
+            <Input.TextArea placeholder="可选描述" rows={3} />
+          </Form.Item>
 
-          <label className="dialog-field">
-            <span className="dialog-label">描述</span>
-            <textarea
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="可选描述"
-              rows={3}
-            />
-          </label>
+          <Form.Item name="color" label="颜色">
+            <Input placeholder="如 #4A90D9" />
+          </Form.Item>
 
-          <label className="dialog-field">
-            <span className="dialog-label">颜色</span>
-            <input
-              value={color}
-              onChange={(e) => setColor(e.target.value)}
-              placeholder="如 #4A90D9"
-            />
-          </label>
-
-          <label className="dialog-field">
-            <span className="dialog-label">图标</span>
-            <input
-              value={icon}
-              onChange={(e) => setIcon(e.target.value)}
-              placeholder="图标 key"
-            />
-          </label>
-
-          {error && (
-            <div className="dialog-error">
-              <span>{error.message}</span>
-              {error.retryable && (
-                <button type="button" className="dialog-retry-btn" onClick={handleSubmit}>
-                  重试
-                </button>
-              )}
-            </div>
-          )}
-
-          <div className="dialog-actions">
-            <button type="button" className="dialog-btn-cancel" onClick={onClose}>
-              取消
-            </button>
-            <button type="submit" className="dialog-btn-primary" disabled={!nameValid || submitting}>
-              {submitting ? "保存中..." : isEdit ? "保存" : "创建"}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
+          <Form.Item name="icon" label="图标">
+            <Input placeholder="图标 key" />
+          </Form.Item>
+        </Form>
+      </Modal>
+    </>
   );
 }

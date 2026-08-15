@@ -1,10 +1,11 @@
 import type { ReactNode } from "react";
-import "./AppShell.css";
+import { Layout, Menu } from "antd";
+import type { MenuProps } from "antd";
 
 export interface NavItem {
   key: string;
   label: string;
-  icon?: string;
+  icon?: ReactNode;
   enabled: boolean;
 }
 
@@ -16,25 +17,41 @@ interface AppShellProps {
 }
 
 export function AppShell({ navItems, activeNav, onNavChange, children }: AppShellProps) {
+  const menuItems: MenuProps["items"] = navItems.map((item) => ({
+    key: item.key,
+    label: item.label,
+    icon: item.icon,
+    disabled: !item.enabled,
+  }));
+
   return (
-    <div className="app-shell">
-      <aside className="app-sidebar">
-        <div className="app-sidebar-header">资源管理工作台</div>
-        <nav className="app-nav">
-          {navItems.map((item) => (
-            <button
-              key={item.key}
-              className={`app-nav-item ${item.key === activeNav ? "active" : ""} ${!item.enabled ? "disabled" : ""}`}
-              disabled={!item.enabled}
-              onClick={() => item.enabled && onNavChange(item.key)}
-            >
-              {item.icon && <span className="app-nav-icon">{item.icon}</span>}
-              <span className="app-nav-label">{item.label}</span>
-            </button>
-          ))}
-        </nav>
-      </aside>
-      <main className="app-main">{children}</main>
-    </div>
+    <Layout style={{ height: "100vh" }}>
+      <Layout.Sider width={200} theme="dark">
+        <div
+          style={{
+            color: "#fff",
+            fontSize: 16,
+            fontWeight: 600,
+            padding: "16px",
+            borderBottom: "1px solid rgba(255,255,255,0.1)",
+            marginBottom: 8,
+          }}
+        >
+          资源管理工作台
+        </div>
+        <Menu
+          theme="dark"
+          mode="inline"
+          selectedKeys={[activeNav]}
+          items={menuItems}
+          onClick={({ key }) => onNavChange(key)}
+        />
+      </Layout.Sider>
+      <Layout>
+        <Layout.Content style={{ padding: 24, overflowY: "auto" }}>
+          {children}
+        </Layout.Content>
+      </Layout>
+    </Layout>
   );
 }

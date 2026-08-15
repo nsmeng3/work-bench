@@ -10,6 +10,7 @@ export interface ApiError {
 
 /**
  * 空间实体 — 详细设计说明书 §2.3 / §3.2 space 表
+ * createdAt / updatedAt 为 Unix 秒（number）。
  */
 export interface Space {
   id: string;
@@ -18,8 +19,8 @@ export interface Space {
   color?: string;
   icon?: string;
   status: "active" | "archived";
-  createdAt: string;
-  updatedAt: string;
+  createdAt: number;
+  updatedAt: number;
 }
 
 /** space_create 入参 */
