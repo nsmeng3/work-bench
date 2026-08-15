@@ -4,6 +4,7 @@ import {
   Button,
   Collapse,
   Descriptions,
+  Dropdown,
   Empty,
   Form,
   Input,
@@ -17,7 +18,13 @@ import {
   Typography,
   message,
 } from "antd";
-import { ArrowLeftOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from "@ant-design/icons";
+import {
+  ArrowLeftOutlined,
+  DownOutlined,
+  EditOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+} from "@ant-design/icons";
 import type {
   Collection,
   CollectionDetail,
@@ -31,6 +38,7 @@ import type {
 } from "../api";
 import { collectionGet, refUpdate, toApiError } from "../api";
 import { ReferenceCreateDialog } from "../components/ReferenceCreateDialog";
+import { ReferenceManagedDialog } from "../components/ReferenceManagedDialog";
 
 const { Text, Paragraph } = Typography;
 
@@ -106,6 +114,7 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
   const [detail, setDetail] = useState<CollectionDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
+  const [managedOpen, setManagedOpen] = useState(false);
   const [editingRef, setEditingRef] = useState<Reference | null>(null);
   const [saving, setSaving] = useState(false);
   const [form] = Form.useForm<RefEditFormValues>();
@@ -275,14 +284,26 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
           </h1>
         </AntSpace>
         <AntSpace>
-          <Button
-            type="primary"
-            icon={<PlusOutlined />}
-            onClick={() => setCreateOpen(true)}
+          <Dropdown
+            menu={{
+              items: [
+                { key: "external", label: "仅关联（不改动原文件）" },
+                { key: "managed", label: "导入并托管（复制 / 移动到根目录）" },
+              ],
+              onClick: ({ key }) => {
+                if (key === "external") setCreateOpen(true);
+                if (key === "managed") setManagedOpen(true);
+              },
+            }}
             disabled={detail?.status === "archived"}
           >
-            添加引用
-          </Button>
+            <Button type="primary" icon={<PlusOutlined />}>
+              <AntSpace size={4}>
+                添加引用
+                <DownOutlined style={{ fontSize: 10 }} />
+              </AntSpace>
+            </Button>
+          </Dropdown>
           <Button icon={<ReloadOutlined />} onClick={fetchDetail} loading={loading}>
             刷新
           </Button>
@@ -369,6 +390,12 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
         open={createOpen}
         collectionId={collection.id}
         onClose={() => setCreateOpen(false)}
+        onCreated={fetchDetail}
+      />
+      <ReferenceManagedDialog
+        open={managedOpen}
+        collectionId={collection.id}
+        onClose={() => setManagedOpen(false)}
         onCreated={fetchDetail}
       />
       <Modal
