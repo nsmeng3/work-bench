@@ -1,5 +1,6 @@
 //! 应用入口：注册命令、初始化数据库连接池。
 
+mod collection;
 mod db;
 mod error;
 mod space;
@@ -37,6 +38,11 @@ pub fn run() {
             space::space_archive,
             space::space_restore,
             space::space_list,
+            collection::collection_create,
+            collection::collection_update,
+            collection::collection_archive,
+            collection::collection_restore,
+            collection::collection_get,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
