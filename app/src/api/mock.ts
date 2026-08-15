@@ -25,6 +25,8 @@ import type {
   RootDirStatus,
   InitRootDirInput,
   InitRootDirResult,
+  DispositionAudit,
+  DispAuditListInput,
 } from "./types";
 
 /**
@@ -743,5 +745,81 @@ export const mockReferenceApi = {
     };
     seedReferences = [...seedReferences, { ref, health: "ok" }];
     return ref;
+  },
+};
+
+/* ---------------- 处置审计 mock（§2.6 disp_audit_list） ---------------- */
+
+/**
+ * 审计 mock 数据：覆盖 4 种 action，含已销毁（refId 不在 seedReferences 中）与未销毁条目。
+ * `at` 使用固定基准 + 递偏移，保证按时间倒序时次序稳定。
+ */
+const seedDispositionAudits: DispositionAudit[] = (() => {
+  const base = 1754039000;
+  const list: DispositionAudit[] = [];
+  const actions: Array<DispositionAudit["action"]> = [
+    "archive",
+    "unarchive",
+    "soft_delete",
+    "destroy",
+  ];
+  // 已销毁的引用（模拟 refId 已不在 resource_reference 中，但审计仍存活 §6.7）
+  const destroyedRefs = [
+    { id: "mock-destroyed-ref-1", name: "旧报告.pdf" },
+    { id: "mock-destroyed-ref-2", name: "临时数据集" },
+  ];
+  // 未销毁的引用（来自 filterSeedReferences 前几条，便于联调「点击跳详情」）
+  const liveRefs = filterSeedReferences.slice(0, 4).map((r) => ({ id: r.id, name: r.name }));
+
+  let seq = 0;
+  // 每种 action 各造 3 条；前 2 条用 liveRefs，最后 1 条用 destroyedRefs
+  for (const action of actions) {
+    for (let i = 0; i < 3; i++) {
+      const ref = i < 2 ? liveRefs[(seq + i) % liveRefs.length] : destroyedRefs[seq % destroyedRefs.length];
+      list.push({
+        id: `mock-audit-${action}-${i + 1}`,
+        refId: ref.id,
+        refName: ref.name,
+        action,
+        locatorSnapshot: { kind: "path", path: `/mock/path/${ref.name}` },
+        actor: "local_user",
+        note:
+          action === "destroy"
+            ? JSON.stringify({ isDir: false, fileCount: 1, totalBytes: 1024 * (seq + 1) })
+            : null,
+        at: base + seq * 60,
+      });
+      seq += 1;
+    }
+  }
+  return list;
+})();
+
+export const mockDispositionApi = {
+  /**
+   * §2.6 disp_audit_list mock：按 refId / action 过滤，按 at DESC 排序，支持分页。
+   * action 非法值 → COMMON_INVALID_PARAM（与后端行为对齐）。
+   */
+  disp_audit_list(input: DispAuditListInput): DispositionAudit[] {
+    const VALID: DispositionAudit["action"][] = [
+      "archive",
+      "unarchive",
+      "soft_delete",
+      "destroy",
+    ];
+    if (input.action && !VALID.includes(input.action)) {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: `非法 action: ${input.action}`,
+        retryable: false,
+      };
+    }
+    let items = seedDispositionAudits.slice();
+    if (input.refId) items = items.filter((a) => a.refId === input.refId);
+    if (input.action) items = items.filter((a) => a.action === input.action);
+    items.sort((a, b) => b.at - a.at);
+    const offset = Math.max(0, input.offset ?? 0);
+    const limit = Math.min(200, Math.max(1, input.limit ?? 50));
+    return items.slice(offset, offset + limit);
   },
 };
