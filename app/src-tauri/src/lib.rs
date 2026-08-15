@@ -83,6 +83,8 @@ pub fn run() {
             settings::settings_change_root_dir,
             disposition::disp_archive,
             disposition::disp_unarchive,
+            disposition::disp_preview,
+            disposition::disp_preview_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
