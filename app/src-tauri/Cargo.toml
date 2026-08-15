@@ -35,6 +35,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 thiserror = "2"
+# m4-4.4 · disp_soft_delete：跨平台系统回收站（macOS Finder / Windows Recycle Bin / freedesktop Trash）
+# 版本：5.2.6（cargo add trash 当前稳定版；语义化版本约束 "5.2.6" 兼容 5.x 后续 patch）
+trash = "5.2.6"
 
 [dev-dependencies]
 tempfile = "3"

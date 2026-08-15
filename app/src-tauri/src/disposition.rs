@@ -916,6 +916,193 @@ pub async fn disp_destroy(
 }
 
 // ============================================================
+// disp_soft_delete：移入系统回收站（m4-4.4 · 详细设计 §2.6 / §5.1）
+// ============================================================
+//
+// 关键约束：
+// - 顺序：**先 `trash::delete` 成功 → 再开事务 UPDATE disposition + INSERT audit**。
+//   与 M3-3.2 相反 —— 落地先，写库后；写库失败则无残留（文件已在回收站，用户可手动恢复）。
+// - 能力预检：执行 `trash::delete` 前调用 4.1 的能力计算；`softDelete=false` 直接
+//   返回 `COMMON_FORBIDDEN`，**不尝试移动**。
+// - confirmed 强制：`confirmed != true` 返回 `COMMON_CONFIRM_REQUIRED`。
+// - 失败补偿：`trash::delete` 成功但写库失败时，**不回滚回收站**；返回 `COMMON_DB`，
+//   并 best-effort 写一条 action='soft_delete' + note='db_failed' 的审计记录。
+// - 错误映射：
+//   - 路径不存在（已被外部删除） → `COMMON_NOT_FOUND`
+//   - 权限不足 → `FS_PERMISSION_DENIED`
+//   - 平台/回收站不可用 → `FS_RECYCLE_UNSUPPORTED`
+//   - 其他 IO → `COMMON_IO`
+
+/// 把 `trash::Error` 映射为统一错误模型。
+///
+/// - `CouldNotAccess`：目标不存在或权限不足 → `COMMON_NOT_FOUND`（与契约 §2.6 对齐；
+///   无法区分时按 not_found 处理，避免泄露文件系统细节）。
+/// - `TargetedRoot`：试图删除根目录 → `COMMON_INVALID_PARAM`。
+/// - `CanonicalizePath`：路径 canonicalize 失败 → `COMMON_NOT_FOUND`。
+/// - Linux `FileSystem`：按内部 `std::io::Error` 的 kind 细分。
+/// - 其他（`Unknown` / `Os` / `ConvertOsString` / `RestoreCollision` / `RestoreTwins`）：
+///   统一 `COMMON_IO`。
+fn map_trash_err(path: &Path, err: trash::Error) -> AppError {
+    let msg = format!("移入回收站失败 {}: {:?}", path.display(), err);
+    match err {
+        trash::Error::CouldNotAccess { .. } => {
+            AppError::not_found(format!("目标路径不存在或不可访问: {}", path.display()))
+        }
+        trash::Error::TargetedRoot => {
+            AppError::invalid_param(format!("不允许删除根目录: {}", path.display()))
+        }
+        trash::Error::CanonicalizePath { .. } => {
+            AppError::not_found(format!("目标路径无法解析: {}", path.display()))
+        }
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        trash::Error::FileSystem { source, .. } => match source.kind() {
+            std::io::ErrorKind::NotFound => {
+                AppError::not_found(format!("目标路径不存在: {}", path.display()))
+            }
+            std::io::ErrorKind::PermissionDenied => AppError::new("FS_PERMISSION_DENIED", msg),
+            _ => AppError::io(msg),
+        },
+        _ => AppError::io(msg),
+    }
+}
+
+/// `disp_soft_delete` 业务函数：移入系统回收站 + 事务写库 + 审计。
+///
+/// 流程：
+/// 1. 校验 `confirmed == true`，否则 `COMMON_CONFIRM_REQUIRED`。
+/// 2. 读 reference + storage_source.caps_json；refId 不存在 → `COMMON_NOT_FOUND`。
+/// 3. 解析 `locator_json` 得到目标路径；目标不存在 → `COMMON_NOT_FOUND`。
+/// 4. 调用 4.1 的 `compute_capabilities` 做能力预检；`softDelete=false` → `COMMON_FORBIDDEN`。
+/// 5. `trash::delete` 移入回收站；失败按 `map_trash_err` 映射。
+/// 6. 开事务：UPDATE disposition='deleted' + INSERT audit(action='soft_delete')。
+/// 7. 事务失败：best-effort 写一条 note='db_failed' 的审计（独立连接，不再开事务），
+///    返回 `COMMON_DB`。
+pub async fn soft_delete(
+    pool: &SqlitePool,
+    ref_id: String,
+    confirmed: bool,
+) -> CmdResult<crate::reference::Reference> {
+    // 1) confirmed 强制
+    if !confirmed {
+        return Err(AppError::new(
+            "COMMON_CONFIRM_REQUIRED",
+            "软删除需要 confirmed=true 确认",
+        ));
+    }
+
+    // 2) 读 reference + caps_json
+    let row = sqlx::query(
+        "SELECT r.name AS name, r.disposition AS disposition, r.locator_json AS locator_json, \
+                s.caps_json AS caps_json \
+         FROM resource_reference r \
+         JOIN storage_source s ON s.id = r.source_id \
+         WHERE r.id = ?",
+    )
+    .bind(&ref_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from)?
+    .ok_or_else(|| AppError::not_found(format!("资源引用不存在: {}", ref_id)))?;
+
+    let name: String = row.try_get("name").map_err(AppError::from)?;
+    let disposition: String = row.try_get("disposition").map_err(AppError::from)?;
+    let locator_json: String = row.try_get("locator_json").map_err(AppError::from)?;
+    let caps_json: Option<String> = row.try_get("caps_json").map_err(AppError::from)?;
+
+    // 3) 解析目标路径 + 存在性预检（提前返回 NOT_FOUND，避免 trash 内部歧义）
+    let target_path = parse_target_path(&locator_json)?;
+    if !target_path.exists() {
+        return Err(AppError::not_found(format!(
+            "目标路径不存在: {}",
+            target_path.display()
+        )));
+    }
+
+    // 4) 能力预检（复用 4.1 纯函数）
+    let soft_delete_supported = parse_soft_delete_cap(caps_json.as_deref())?;
+    let caps = compute_capabilities(&disposition, soft_delete_supported);
+    if !caps.soft_delete {
+        return Err(AppError::new(
+            "COMMON_FORBIDDEN",
+            caps.reason
+                .soft_delete
+                .unwrap_or_else(|| "当前存储源不支持系统回收站".to_string()),
+        ));
+    }
+
+    // 5) 移入系统回收站（先落地，后写库）
+    let target_for_trash = target_path.clone();
+    tokio::task::spawn_blocking(move || trash::delete(&target_for_trash))
+        .await
+        .map_err(|e| AppError::io(format!("trash worker join 失败: {}", e)))?
+        .map_err(|e| map_trash_err(&target_path, e))?;
+
+    // 6) 事务：UPDATE disposition + INSERT audit
+    let tx_result: CmdResult<()> = async {
+        let mut tx = pool.begin().await.map_err(AppError::from)?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        sqlx::query(
+            "UPDATE resource_reference SET disposition = 'deleted', updated_at = ? WHERE id = ?",
+        )
+        .bind(now)
+        .bind(&ref_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from)?;
+        write_audit(
+            &mut tx,
+            &ref_id,
+            &name,
+            "soft_delete",
+            Some(locator_json.as_str()),
+            None,
+        )
+        .await?;
+        tx.commit().await.map_err(AppError::from)?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(db_err) = tx_result {
+        // 7) 失败补偿：文件已在回收站，不回滚；best-effort 写一条 db_failed 审计。
+        let best_effort: CmdResult<()> = async {
+            let mut tx2 = pool.begin().await.map_err(AppError::from)?;
+            write_audit(
+                &mut tx2,
+                &ref_id,
+                &name,
+                "soft_delete",
+                Some(locator_json.as_str()),
+                Some("db_failed"),
+            )
+            .await?;
+            tx2.commit().await.map_err(AppError::from)?;
+            Ok(())
+        }
+        .await;
+        if let Err(e2) = best_effort {
+            eprintln!("[disp_soft_delete] best-effort 审计写入也失败: {}", e2);
+        }
+        return Err(db_err);
+    }
+
+    // 提交后重新读取完整 Reference（与 ref_get 出参一致）
+    crate::reference::get(pool, ref_id).await
+}
+
+/// `disp_soft_delete` Tauri 命令。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn disp_soft_delete(
+    state: tauri::State<'_, crate::AppState>,
+    ref_id: String,
+    confirmed: bool,
+) -> CmdResult<crate::reference::Reference> {
+    soft_delete(&state.pool, ref_id, confirmed).await
+}
+
+
+
+// ============================================================
 // 单元测试
 // ============================================================
 
@@ -1933,5 +2120,151 @@ mod tests {
         let obj = v.as_object().expect("object");
         assert!(obj.contains_key("deletedRefId"));
         assert!(!obj.contains_key("deleted_ref_id"));
+    }
+
+    // ---------- m4-4.4 · disp_soft_delete ----------
+
+    #[tokio::test]
+    async fn soft_delete_err_confirm_required() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "none").await;
+
+        let err = soft_delete(&pool, rid.clone(), false)
+            .await
+            .expect_err("should require confirm");
+        assert_eq!(err.code, "COMMON_CONFIRM_REQUIRED");
+        // 状态未被破坏
+        assert_eq!(read_disposition(&pool, &rid).await, "none");
+        // 无审计写入
+        assert_eq!(audit_count(&pool, &rid).await, 0);
+    }
+
+    #[tokio::test]
+    async fn soft_delete_err_ref_not_found() {
+        let pool = setup().await;
+        let err = soft_delete(&pool, "no-such-id".into(), true)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn soft_delete_err_capability_forbidden() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        // 关闭 softDelete 能力
+        set_caps_json(
+            &pool,
+            DEFAULT_SOURCE_ID,
+            "{\"archive\":true,\"softDelete\":false,\"destroy\":true}",
+        )
+        .await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("x.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let rid = make_reference_with_path(&pool, &cid, "none", &file).await;
+
+        let err = soft_delete(&pool, rid.clone(), true)
+            .await
+            .expect_err("should be forbidden");
+        assert_eq!(err.code, "COMMON_FORBIDDEN");
+        // 文件未被移动
+        assert!(file.exists());
+        // 状态未被破坏
+        assert_eq!(read_disposition(&pool, &rid).await, "none");
+        assert_eq!(audit_count(&pool, &rid).await, 0);
+    }
+
+    #[tokio::test]
+    async fn soft_delete_err_target_externally_deleted() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("gone.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let rid = make_reference_with_path(&pool, &cid, "none", &file).await;
+        // 外部删除文件
+        std::fs::remove_file(&file).expect("remove");
+
+        let err = soft_delete(&pool, rid.clone(), true)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+        // 状态未被破坏
+        assert_eq!(read_disposition(&pool, &rid).await, "none");
+        assert_eq!(audit_count(&pool, &rid).await, 0);
+    }
+
+    /// 成功路径：真实调用 trash::delete 把文件移入系统回收站。
+    ///
+    /// 平台相关性：macOS 上 trash crate 通过 AppleScript 调 Finder；在**无 GUI
+    /// 会话 / SSH / CI agent** 环境会触发 `AppleEvent 超时 (-1712)`，导致失败。
+    /// 任务包 #6 允许用 `#[ignore]` + 注释标注，由用户在 review 阶段人工点验。
+    ///
+    /// 人工点验：在 macOS 桌面会话中执行
+    /// `cargo test --lib disposition::tests::soft_delete_ok -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "需在 macOS GUI 会话运行；CI/SSH 环境 AppleEvent 超时"]
+    async fn soft_delete_ok_moves_to_trash() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("to_trash.txt");
+        std::fs::write(&file, b"trash me").expect("write");
+        let rid = make_reference_with_path(&pool, &cid, "none", &file).await;
+
+        let r = soft_delete(&pool, rid.clone(), true)
+            .await
+            .expect("soft_delete ok");
+        // 出参 Reference.disposition = 'deleted'
+        assert_eq!(r.id, rid);
+        assert_eq!(r.disposition, "deleted");
+        // 文件已不在原位置（已进系统回收站）
+        assert!(!file.exists(), "文件应已移入回收站");
+        // 数据库 disposition 已落库
+        assert_eq!(read_disposition(&pool, &rid).await, "deleted");
+        // 审计记录正确：1 条 action='soft_delete'，note 为 NULL（非 db_failed）
+        assert_eq!(audit_count(&pool, &rid).await, 1);
+        let row = sqlx::query(
+            "SELECT action, note, locator_snapshot, actor FROM disposition_audit WHERE ref_id = ?",
+        )
+        .bind(&rid)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch audit");
+        let action: String = row.try_get("action").expect("action");
+        let note: Option<String> = row.try_get("note").expect("note");
+        let locator: String = row.try_get("locator_snapshot").expect("locator");
+        let actor: String = row.try_get("actor").expect("actor");
+        assert_eq!(action, "soft_delete");
+        assert!(note.is_none(), "成功路径 note 应为 NULL");
+        assert!(locator.contains("to_trash.txt"));
+        assert_eq!(actor, "local_user");
+    }
+
+    /// 成功路径（目录）：回收站移动整个目录。
+    ///
+    /// 同 `soft_delete_ok_moves_to_trash`：macOS GUI 会话人工点验。
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "需在 macOS GUI 会话运行；CI/SSH 环境 AppleEvent 超时"]
+    async fn soft_delete_ok_directory() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path().join("dir_to_trash");
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::write(dir.join("a.txt"), b"a").expect("write a");
+        let rid = make_reference_with_path(&pool, &cid, "none", &dir).await;
+
+        let r = soft_delete(&pool, rid.clone(), true)
+            .await
+            .expect("soft_delete dir ok");
+        assert_eq!(r.disposition, "deleted");
+        assert!(!dir.exists(), "目录应已移入回收站");
+        assert_eq!(read_disposition(&pool, &rid).await, "deleted");
+        assert_eq!(audit_count(&pool, &rid).await, 1);
     }
 }

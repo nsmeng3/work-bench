@@ -86,6 +86,7 @@ pub fn run() {
             disposition::disp_preview,
             disposition::disp_preview_cancel,
             disposition::disp_destroy,
+            disposition::disp_soft_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
