@@ -30,6 +30,7 @@ import type {
   DispCapabilities,
   DispPreview,
   DispDestroyResult,
+  UndoPlan,
 } from "./types";
 
 /**
@@ -354,6 +355,78 @@ let seedReferences: ReferenceWithHealth[] = [
       type: "code",
       description: "用于演示大目录 preview 加载",
       locator: { kind: "path", path: "/Users/demo/code/big-repo" },
+    }),
+    health: "ok",
+  },
+  // m4-4.9 撤销导入 mock：4 种场景
+  {
+    ref: makeRef({
+      id: "mock-ref-undo-copy-ok",
+      collectionId: "mock-collection-1",
+      name: "可撤销的copy导入.pdf",
+      type: "document",
+      hosting: "managed",
+      locator: {
+        kind: "path",
+        path: "/mock-root/Documents/可撤销的copy导入.pdf",
+        originalSource: "/Users/demo/Downloads/可撤销的copy导入.pdf",
+        managedAction: "copy",
+      },
+      createdAt: Math.floor(Date.now() / 1000) - 3600, // 1 小时前
+      updatedAt: Math.floor(Date.now() / 1000) - 3600,
+    }),
+    health: "ok",
+  },
+  {
+    ref: makeRef({
+      id: "mock-ref-undo-expired",
+      collectionId: "mock-collection-1",
+      name: "超过24h的导入.pdf",
+      type: "document",
+      hosting: "managed",
+      locator: {
+        kind: "path",
+        path: "/mock-root/Documents/超过24h的导入.pdf",
+        originalSource: "/Users/demo/Downloads/超过24h的导入.pdf",
+        managedAction: "copy",
+      },
+      createdAt: Math.floor(Date.now() / 1000) - 25 * 3600, // 25 小时前
+      updatedAt: Math.floor(Date.now() / 1000) - 25 * 3600,
+    }),
+    health: "ok",
+  },
+  {
+    ref: makeRef({
+      id: "mock-ref-undo-no-source",
+      collectionId: "mock-collection-1",
+      name: "M3老数据无originalSource.pdf",
+      type: "document",
+      hosting: "managed",
+      locator: {
+        kind: "path",
+        path: "/mock-root/Documents/M3老数据无originalSource.pdf",
+        // 无 originalSource / managedAction（M3 期间创建）
+      },
+      createdAt: Math.floor(Date.now() / 1000) - 3600,
+      updatedAt: Math.floor(Date.now() / 1000) - 3600,
+    }),
+    health: "ok",
+  },
+  {
+    ref: makeRef({
+      id: "mock-ref-undo-move-occupied",
+      collectionId: "mock-collection-1",
+      name: "move撤销源被占.pdf",
+      type: "document",
+      hosting: "managed",
+      locator: {
+        kind: "path",
+        path: "/mock-root/Documents/move撤销源被占.pdf",
+        originalSource: "/mock-occupied/move撤销源被占.pdf",
+        managedAction: "move",
+      },
+      createdAt: Math.floor(Date.now() / 1000) - 3600,
+      updatedAt: Math.floor(Date.now() / 1000) - 3600,
     }),
     health: "ok",
   },
@@ -990,6 +1063,7 @@ export const mockDispositionApi = {
       "unarchive",
       "soft_delete",
       "destroy",
+      "undo_import",
     ];
     if (input.action && !VALID.includes(input.action)) {
       throw {
@@ -1005,5 +1079,72 @@ export const mockDispositionApi = {
     const offset = Math.max(0, input.offset ?? 0);
     const limit = Math.min(200, Math.max(1, input.limit ?? 50));
     return items.slice(offset, offset + limit);
+  },
+
+  /**
+   * m4-4.9 · ref_undo_import mock。
+   *
+   * 覆盖 4 种场景（按 refId 匹配）：
+   * - `mock-ref-undo-copy-ok`：可撤销（copy，24h 内，有 originalSource）
+   * - `mock-ref-undo-expired`：超 24h 窗口 → canUndo=false
+   * - `mock-ref-undo-no-source`：无 originalSource（M3 老数据）→ canUndo=false
+   * - `mock-ref-undo-move-occupied`：move 且 originalSource 被占 → canUndo=false
+   *
+   * 其他 managed 引用：按通用规则计算 blockers。
+   * confirmed=true 时模拟执行：从 seedReferences 中移除引用，返回 null。
+   */
+  ref_undo_import(refId: string, confirmed: boolean): UndoPlan | null {
+    const ref = findMockRef(refId);
+    const now = Math.floor(Date.now() / 1000);
+    const UNDO_WINDOW_SECS = 24 * 3600;
+
+    const blockers: string[] = [];
+    const locator = ref.locator;
+    const currentPath = locator.kind === "path" ? locator.path : `/mock/${ref.id}`;
+    const originalSource =
+      locator.kind === "path" ? (locator.originalSource ?? null) : null;
+    const managedAction =
+      locator.kind === "path" ? (locator.managedAction ?? "copy") : "copy";
+
+    // 1. hosting 检查
+    if (ref.hosting !== "managed") {
+      blockers.push("仅 managed 导入的引用可撤销");
+    }
+    // 2. originalSource 缺失
+    if (!originalSource) {
+      blockers.push("该引用创建时未记录原始源，无法撤销");
+    }
+    // 3. 24h 窗口
+    if (now - ref.createdAt > UNDO_WINDOW_SECS) {
+      blockers.push(`引用创建已超过 24 小时撤销窗口（创建于 ${ref.createdAt}）`);
+    }
+    // 4. move 场景：originalSource 被占（mock 规则：路径含 "mock-occupied"）
+    if (managedAction === "move" && originalSource?.includes("mock-occupied")) {
+      blockers.push(`原始源路径已被其他文件占用: ${originalSource}`);
+    }
+
+    const plan: UndoPlan = {
+      refId: ref.id,
+      refName: ref.name,
+      managedAction,
+      currentPath,
+      originalSource,
+      canUndo: blockers.length === 0,
+      blockers,
+    };
+
+    if (!confirmed) return plan;
+
+    // confirmed=true
+    if (!plan.canUndo) {
+      throw {
+        code: "COMMON_FORBIDDEN",
+        message: `撤销被阻止: ${blockers.join("；")}`,
+        retryable: false,
+      };
+    }
+    // 模拟执行：从 seedReferences 中移除引用
+    seedReferences = seedReferences.filter((r) => r.ref.id !== refId);
+    return null;
   },
 };

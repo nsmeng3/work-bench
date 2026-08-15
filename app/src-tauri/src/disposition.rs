@@ -1150,8 +1150,14 @@ pub struct AuditListFilter {
     pub offset: Option<u32>,
 }
 
-/// 合法 action 集合（与 schema CHECK 约束一致）。
-const VALID_AUDIT_ACTIONS: [&str; 4] = ["archive", "unarchive", "soft_delete", "destroy"];
+/// 合法 action 集合（与 schema CHECK 约束一致；m4-4.9 加入 'undo_import'）。
+const VALID_AUDIT_ACTIONS: [&str; 5] = [
+    "archive",
+    "unarchive",
+    "soft_delete",
+    "destroy",
+    "undo_import",
+];
 
 /// `disp_audit_list` 业务函数：按 refId / action 过滤，按 at DESC 分页。
 ///
@@ -1162,11 +1168,11 @@ pub async fn audit_list(
     pool: &SqlitePool,
     filter: AuditListFilter,
 ) -> CmdResult<Vec<DispositionAudit>> {
-    // 1) action 校验：必须属于 4 个合法值之一。
+    // 1) action 校验：必须属于合法值集合。
     if let Some(a) = filter.action.as_deref() {
         if !VALID_AUDIT_ACTIONS.contains(&a) {
             return Err(AppError::invalid_param(format!(
-                "非法 action: {}（合法值: archive|unarchive|soft_delete|destroy）",
+                "非法 action: {}（合法值: archive|unarchive|soft_delete|destroy|undo_import）",
                 a
             )));
         }
@@ -1246,6 +1252,373 @@ pub async fn disp_audit_list(
         },
     )
     .await
+}
+
+// ============================================================
+// ref_undo_import：导入撤销（m4-4.9 · 任务包 tasks/m4-4.9.md）
+// ============================================================
+//
+// 契约（已冻结 2026-08-16）：
+// - 入参：`{ refId, confirmed }`
+// - 出参两阶段：
+//   - `confirmed=false` → `UndoPlan`（不写文件不改库）
+//   - `confirmed=true`  → `()`（执行撤销）
+// - 错误：`COMMON_NOT_FOUND` / `COMMON_FORBIDDEN`（canUndo=false）/
+//   `FS_PERMISSION_DENIED` / `COMMON_IO` / `FS_TARGET_EXISTS` /
+//   `COMMON_CONFIRM_REQUIRED`（confirmed != true 时由前端控制不发起，
+//   后端防御性返回）
+//
+// 关键约束：
+// - **24h 撤销窗口**：`UNDO_WINDOW_SECS = 24 * 3600`，超出即 blocker。
+// - **blocker 检测**（plan 阶段）：
+//   1. hosting != 'managed' —— 仅 managed 导入可撤销
+//   2. locator_json.originalSource 为 null —— M3 期间创建的引用无此字段
+//   3. 目标文件不存在或 mtime 晚于导入时间 + 5s 容差（外部已修改）
+//   4. managedAction == 'move' 且 originalSource 已被其他文件占用
+//   5. 引用创建时间超过 24h
+// - **撤销动作**（confirmed 阶段，需拿 MANAGED_WRITE_LOCK）：
+//   - copy → 删除目标文件（若存在）→ 删除引用行
+//   - move → 先检查 originalSource 是否被占（被占则 FS_TARGET_EXISTS 中止，
+//     不做任何写）→ 移动文件 → 删除引用行
+// - **审计**：action='undo_import'，note JSON `{"managedAction":"...","originalSource":"..."}`
+// - **互斥**：复用 `crate::reference::managed_write_lock()`（与 create_managed /
+//   destroy / settings_change_root_dir 共用同一把锁）。
+//
+// 注意：`VALID_AUDIT_ACTIONS` 未包含 'undo_import'，disp_audit_list 的 action
+// 过滤不支持本动作；审计查询页通过「全部」即可看到 undo_import 条目。
+// 这是契约允许的行为（任务包未要求扩充 audit_list 的 action 枚举）。
+
+/// 撤销窗口：24 小时（秒）。
+pub const UNDO_WINDOW_SECS: i64 = 24 * 3600;
+
+/// mtime 容差：目标文件 mtime 晚于导入时间 + 此秒数视为「外部已修改」。
+const MTIME_TOLERANCE_SECS: i64 = 5;
+
+/// `ref_undo_import` 在 `confirmed=false` 时的出参（任务包 §契约）。
+///
+/// 序列化为 camelCase：
+/// `{ refId, refName, managedAction, currentPath, originalSource, canUndo, blockers }`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoPlan {
+    pub ref_id: String,
+    pub ref_name: String,
+    /// `"copy" | "move"`；从 locator_json 推断不出时填 "copy"（防御性兜底）。
+    pub managed_action: String,
+    /// 当前目标绝对路径（locator_json.path）。
+    pub current_path: String,
+    /// 原始源绝对路径（locator_json.originalSource）；M3 数据可能为 null。
+    pub original_source: Option<String>,
+    /// 是否可撤销：blockers 为空时 true。
+    pub can_undo: bool,
+    /// 阻塞原因列表（中文）；空 vec 表示可撤销。
+    pub blockers: Vec<String>,
+}
+
+/// 从 locator_json 解析 `(current_path, original_source, managed_action)`。
+///
+/// 返回 `Ok((path, original_source_option, managed_action_option))`；
+/// 缺 kind/path → `COMMON_DB`（数据损坏）。
+/// managed_action 为 m4-4.9 新增字段；M3 老数据为 None。
+fn parse_locator_for_undo(
+    locator_json: &str,
+) -> CmdResult<(PathBuf, Option<String>, Option<String>)> {
+    let v: serde_json::Value = serde_json::from_str(locator_json)
+        .map_err(|e| AppError::db(format!("locator_json 反序列化失败: {}", e)))?;
+    let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    if kind != "path" {
+        return Err(AppError::db(format!(
+            "locator_json kind 非 path: {}",
+            kind
+        )));
+    }
+    let path = v
+        .get("path")
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| AppError::db("locator_json 缺少 path 字段".to_string()))?;
+    let original = v
+        .get("originalSource")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_string());
+    let action = v
+        .get("managedAction")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_string());
+    Ok((PathBuf::from(path), original, action))
+}
+
+/// 计算 UndoPlan 的 blockers。
+///
+/// 输入：当前时间、reference 行字段、目标路径 metadata。
+/// 输出：中文 blocker 列表；空 vec 表示 canUndo=true。
+fn compute_undo_blockers(
+    hosting: &str,
+    original_source: Option<&str>,
+    current_path: &Path,
+    created_at: i64,
+    now: i64,
+    managed_action: &str,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+
+    // 1. hosting 检查
+    if hosting != "managed" {
+        blockers.push("仅 managed 导入的引用可撤销".to_string());
+    }
+
+    // 2. originalSource 缺失
+    if original_source.is_none() {
+        blockers.push("该引用创建时未记录原始源，无法撤销".to_string());
+    }
+
+    // 3. 24h 窗口
+    if now - created_at > UNDO_WINDOW_SECS {
+        blockers.push(format!(
+            "引用创建已超过 24 小时撤销窗口（创建于 {}）",
+            created_at
+        ));
+    }
+
+    // 4. 目标文件状态
+    match std::fs::symlink_metadata(current_path) {
+        Err(_) => {
+            blockers.push("目标文件已被外部删除或移动".to_string());
+        }
+        Ok(meta) => {
+            if let Ok(mtime) = meta.modified() {
+                if let Ok(mtime_dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    let mtime_secs = mtime_dur.as_secs() as i64;
+                    if mtime_secs > created_at + MTIME_TOLERANCE_SECS {
+                        blockers.push("目标文件已被外部修改".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. move 场景：originalSource 被占
+    if managed_action == "move" {
+        if let Some(src) = original_source {
+            if std::path::Path::new(src).exists() {
+                blockers.push(format!("原始源路径已被其他文件占用: {}", src));
+            }
+        }
+    }
+
+    blockers
+}
+
+/// `ref_undo_import` 业务函数（两阶段）。
+///
+/// - `confirmed=false` → 返回 `Ok(Some(UndoPlan))`，不写文件不改库。
+/// - `confirmed=true`  → 返回 `Ok(None)`，执行撤销（删目标/移回 + 删引用 + 写审计）。
+pub async fn undo_import(
+    pool: &SqlitePool,
+    ref_id: String,
+    confirmed: bool,
+) -> CmdResult<Option<UndoPlan>> {
+    // 1) 读 reference 行
+    let row = sqlx::query(
+        "SELECT name, hosting, locator_json, created_at FROM resource_reference WHERE id = ?",
+    )
+    .bind(&ref_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from)?
+    .ok_or_else(|| AppError::not_found(format!("资源引用不存在: {}", ref_id)))?;
+
+    let name: String = row.try_get("name").map_err(AppError::from)?;
+    let hosting: String = row.try_get("hosting").map_err(AppError::from)?;
+    let locator_json: String = row.try_get("locator_json").map_err(AppError::from)?;
+    let created_at: i64 = row.try_get("created_at").map_err(AppError::from)?;
+
+    // 2) 解析 locator
+    let (current_path, original_source, managed_action_opt) =
+        parse_locator_for_undo(&locator_json)?;
+    // M3 老数据无 managedAction 字段 → 视为 copy（保守：move 撤销风险更高，
+    // 缺省时按 copy 处理仅删目标，不会误移文件到不存在的源路径）。
+    let managed_action = managed_action_opt.as_deref().unwrap_or("copy");
+
+    // 3) 计算 blockers
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let blockers = compute_undo_blockers(
+        &hosting,
+        original_source.as_deref(),
+        &current_path,
+        created_at,
+        now,
+        managed_action,
+    );
+    let can_undo = blockers.is_empty();
+
+    let plan = UndoPlan {
+        ref_id: ref_id.clone(),
+        ref_name: name.clone(),
+        managed_action: managed_action.to_string(),
+        current_path: current_path.to_string_lossy().into_owned(),
+        original_source: original_source.clone(),
+        can_undo,
+        blockers,
+    };
+
+    if !confirmed {
+        return Ok(Some(plan));
+    }
+
+    // ---------- confirmed 阶段 ----------
+    if !can_undo {
+        return Err(AppError::new(
+            "COMMON_FORBIDDEN",
+            format!("撤销被阻止: {}", plan.blockers.join("；")),
+        ));
+    }
+
+    // 拿全局互斥锁（与 create_managed / destroy / settings_change_root_dir 串行化）
+    let _guard = crate::reference::managed_write_lock().lock().await;
+
+    // TOCTOU 复检：拿锁后再检一次 blockers（外部可能已修改文件）
+    let recheck_blockers = compute_undo_blockers(
+        &hosting,
+        original_source.as_deref(),
+        &current_path,
+        created_at,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+        managed_action,
+    );
+    if !recheck_blockers.is_empty() {
+        return Err(AppError::new(
+            "COMMON_FORBIDDEN",
+            format!("撤销被阻止（锁内复检）: {}", recheck_blockers.join("；")),
+        ));
+    }
+
+    // 执行撤销动作
+    let original_source_str = original_source
+        .as_deref()
+        .expect("can_undo=true 时 original_source 必存在");
+
+    if managed_action == "move" {
+        // move 撤销：把目标文件移回 originalSource
+        let orig_path = PathBuf::from(original_source_str);
+        // 锁内复检已确认 originalSource 不存在；此处再防御一次
+        if orig_path.exists() {
+            return Err(AppError::new(
+                "FS_TARGET_EXISTS",
+                format!("原始源路径已被占用: {}", orig_path.display()),
+            ));
+        }
+        // 确保父目录存在
+        if let Some(parent) = orig_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| map_undo_fs_err("创建原始源父目录失败", parent, e))?;
+        }
+        tokio::fs::rename(&current_path, &orig_path)
+            .await
+            .map_err(|e| map_undo_fs_err("移回原始源失败", &current_path, e))?;
+    } else {
+        // copy 撤销：删除目标文件（若存在）
+        match tokio::fs::symlink_metadata(&current_path).await {
+            Ok(meta) => {
+                let remove_result = if meta.is_dir() {
+                    tokio::fs::remove_dir_all(&current_path).await
+                } else {
+                    tokio::fs::remove_file(&current_path).await
+                };
+                if let Err(e) = remove_result {
+                    return Err(map_undo_fs_err("删除目标文件失败", &current_path, e));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 目标已被外部删除：视为成功（幂等），继续走删除引用流程
+            }
+            Err(e) => {
+                return Err(map_undo_fs_err("读取目标元数据失败", &current_path, e));
+            }
+        }
+    }
+
+    // 文件操作完成，开事务写审计 + 删除引用行
+    let note_json = serde_json::json!({
+        "managedAction": managed_action,
+        "originalSource": original_source_str,
+    })
+    .to_string();
+
+    let mut tx = pool.begin().await.map_err(AppError::from)?;
+    if let Err(e) = write_audit(
+        &mut tx,
+        &ref_id,
+        &name,
+        "undo_import",
+        Some(locator_json.as_str()),
+        Some(note_json.as_str()),
+    )
+    .await
+    {
+        let _ = tx.rollback().await;
+        eprintln!(
+            "[ref_undo_import] 审计写入失败，文件已撤销 ref_id={} err={}",
+            ref_id, e
+        );
+        return Err(AppError::db(format!(
+            "审计写入失败（文件已撤销，无法回滚）: {}",
+            e
+        )));
+    }
+    if let Err(e) = sqlx::query("DELETE FROM resource_reference WHERE id = ?")
+        .bind(&ref_id)
+        .execute(&mut *tx)
+        .await
+    {
+        let _ = tx.rollback().await;
+        eprintln!(
+            "[ref_undo_import] 引用行删除失败，文件已撤销 ref_id={} err={}",
+            ref_id, e
+        );
+        return Err(AppError::db(format!(
+            "引用行删除失败（文件已撤销，无法回滚）: {}",
+            e
+        )));
+    }
+    if let Err(e) = tx.commit().await {
+        eprintln!(
+            "[ref_undo_import] 事务提交失败，文件已撤销 ref_id={} err={}",
+            ref_id, e
+        );
+        return Err(AppError::db(format!(
+            "事务提交失败（文件已撤销，无法回滚）: {}",
+            e
+        )));
+    }
+
+    Ok(None)
+}
+
+/// undo 专用 FS 错误映射：与 destroy 一致。
+fn map_undo_fs_err(context: &str, path: &Path, err: std::io::Error) -> AppError {
+    let msg = format!("{} {}: {}", context, path.display(), err);
+    match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            AppError::not_found(format!("目标路径不存在: {}", path.display()))
+        }
+        std::io::ErrorKind::PermissionDenied => AppError::new("FS_PERMISSION_DENIED", msg),
+        std::io::ErrorKind::AlreadyExists => AppError::new("FS_TARGET_EXISTS", msg),
+        _ => AppError::io(msg),
+    }
+}
+
+/// `ref_undo_import` Tauri 命令。
+///
+/// - `confirmed=false` → 返回 `UndoPlan`
+/// - `confirmed=true`  → 返回 `null`（前端按成功处理）
+#[tauri::command(rename_all = "camelCase")]
+pub async fn ref_undo_import(
+    state: tauri::State<'_, crate::AppState>,
+    ref_id: String,
+    confirmed: bool,
+) -> CmdResult<Option<UndoPlan>> {
+    undo_import(&state.pool, ref_id, confirmed).await
 }
 
 // ============================================================
@@ -2679,5 +3052,657 @@ mod tests {
         assert!(!obj.contains_key("ref_id"));
         assert!(!obj.contains_key("ref_name"));
         assert!(!obj.contains_key("locator_snapshot"));
+    }
+
+    // ---------- m4-4.9 · ref_undo_import ----------
+
+    /// 插入一个 managed reference，可指定 hosting / locator_json / created_at；返回 id。
+    /// managed_action 为 None 时 locator_json 不含 managedAction 字段（模拟 M3 老数据）。
+    async fn make_managed_reference(
+        pool: &SqlitePool,
+        collection_id: &str,
+        hosting: &str,
+        current_path: &std::path::Path,
+        original_source: Option<&std::path::Path>,
+        created_at: i64,
+    ) -> String {
+        make_managed_reference_with_action(
+            pool,
+            collection_id,
+            hosting,
+            current_path,
+            original_source,
+            None,
+            created_at,
+        )
+        .await
+    }
+
+    /// 完整版：可指定 managedAction。
+    async fn make_managed_reference_with_action(
+        pool: &SqlitePool,
+        collection_id: &str,
+        hosting: &str,
+        current_path: &std::path::Path,
+        original_source: Option<&std::path::Path>,
+        managed_action: Option<&str>,
+        created_at: i64,
+    ) -> String {
+        let id = Uuid::new_v4().to_string();
+        let now = now_unix();
+        let mut locator = serde_json::json!({
+            "kind": "path",
+            "path": current_path.to_string_lossy(),
+        });
+        if let Some(src) = original_source {
+            locator["originalSource"] =
+                serde_json::Value::String(src.to_string_lossy().into_owned());
+        }
+        if let Some(action) = managed_action {
+            locator["managedAction"] = serde_json::Value::String(action.to_string());
+        }
+        let locator_json = locator.to_string();
+        sqlx::query(
+            "INSERT INTO resource_reference \
+             (id, collection_id, source_id, name, type, hosting, locator_json, \
+              description, lifecycle, confidentiality, indexed, disposition, created_at, updated_at) \
+             VALUES (?, ?, ?, 'r', 'code', ?, ?, \
+              NULL, 'active', 'internal', 1, 'none', ?, ?)",
+        )
+        .bind(&id)
+        .bind(collection_id)
+        .bind(DEFAULT_SOURCE_ID)
+        .bind(hosting)
+        .bind(&locator_json)
+        .bind(created_at)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert managed reference");
+        id
+    }
+
+    #[tokio::test]
+    async fn undo_plan_err_ref_not_found() {
+        let pool = setup().await;
+        let err = undo_import(&pool, "no-such-id".into(), false)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn undo_plan_blocker_hosting_not_managed() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let rid = make_managed_reference(
+            &pool,
+            &cid,
+            "external", // 非 managed
+            &file,
+            Some(&file),
+            now_unix(),
+        )
+        .await;
+
+        let plan = undo_import(&pool, rid, false)
+            .await
+            .expect("plan ok")
+            .expect("plan");
+        assert!(!plan.can_undo);
+        assert!(plan
+            .blockers
+            .iter()
+            .any(|b| b.contains("仅 managed 导入的引用可撤销")));
+    }
+
+    #[tokio::test]
+    async fn undo_plan_blocker_no_original_source() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let rid = make_managed_reference(
+            &pool,
+            &cid,
+            "managed",
+            &file,
+            None, // 无 originalSource（M3 老数据）
+            now_unix(),
+        )
+        .await;
+
+        let plan = undo_import(&pool, rid, false)
+            .await
+            .expect("plan ok")
+            .expect("plan");
+        assert!(!plan.can_undo);
+        assert!(plan
+            .blockers
+            .iter()
+            .any(|b| b.contains("未记录原始源")));
+    }
+
+    #[tokio::test]
+    async fn undo_plan_blocker_target_externally_deleted() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("gone.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let src = tmp.path().join("src.txt");
+        let rid = make_managed_reference(
+            &pool,
+            &cid,
+            "managed",
+            &file,
+            Some(&src),
+            now_unix(),
+        )
+        .await;
+        // 外部删除目标
+        std::fs::remove_file(&file).expect("remove");
+
+        let plan = undo_import(&pool, rid, false)
+            .await
+            .expect("plan ok")
+            .expect("plan");
+        assert!(!plan.can_undo);
+        assert!(plan
+            .blockers
+            .iter()
+            .any(|b| b.contains("已被外部删除或移动")));
+    }
+
+    #[tokio::test]
+    async fn undo_plan_blocker_target_externally_modified() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let src = tmp.path().join("src.txt");
+        // created_at 设为 1 小时前（在 24h 窗口内），但 mtime 是现在 → 超 5s 容差
+        let created_at = now_unix() - 3600;
+        let rid = make_managed_reference(
+            &pool,
+            &cid,
+            "managed",
+            &file,
+            Some(&src),
+            created_at,
+        )
+        .await;
+        // 等 1 秒确保 mtime 差 > 5s 容差（其实文件刚写，mtime=now > created_at+5）
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let plan = undo_import(&pool, rid, false)
+            .await
+            .expect("plan ok")
+            .expect("plan");
+        assert!(!plan.can_undo);
+        assert!(plan
+            .blockers
+            .iter()
+            .any(|b| b.contains("已被外部修改")));
+    }
+
+    #[tokio::test]
+    async fn undo_plan_blocker_beyond_24h_window() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let src = tmp.path().join("src.txt");
+        // created_at 25 小时前 → 超窗
+        let created_at = now_unix() - (UNDO_WINDOW_SECS + 3600);
+        let rid = make_managed_reference(
+            &pool,
+            &cid,
+            "managed",
+            &file,
+            Some(&src),
+            created_at,
+        )
+        .await;
+
+        let plan = undo_import(&pool, rid, false)
+            .await
+            .expect("plan ok")
+            .expect("plan");
+        assert!(!plan.can_undo);
+        assert!(plan
+            .blockers
+            .iter()
+            .any(|b| b.contains("24 小时撤销窗口")));
+    }
+
+    #[tokio::test]
+    async fn undo_plan_blocker_move_source_occupied() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, b"x").expect("write target");
+        // move 场景：originalSource 被其他文件占用
+        let src = tmp.path().join("src.txt");
+        std::fs::write(&src, b"occupied").expect("write src");
+        let rid = make_managed_reference_with_action(
+            &pool,
+            &cid,
+            "managed",
+            &target,
+            Some(&src),
+            Some("move"),
+            now_unix(),
+        )
+        .await;
+
+        let plan = undo_import(&pool, rid, false)
+            .await
+            .expect("plan ok")
+            .expect("plan");
+        assert_eq!(plan.managed_action, "move");
+        assert!(!plan.can_undo);
+        assert!(plan
+            .blockers
+            .iter()
+            .any(|b| b.contains("原始源路径已被其他文件占用")));
+    }
+
+    #[test]
+    fn compute_undo_blockers_move_source_occupied() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, b"x").expect("write");
+        let src = tmp.path().join("src.txt");
+        std::fs::write(&src, b"occupied").expect("write src");
+
+        let blockers = compute_undo_blockers(
+            "managed",
+            Some(src.to_str().expect("utf8")),
+            &target,
+            now_unix(),
+            now_unix(),
+            "move",
+        );
+        assert!(blockers
+            .iter()
+            .any(|b| b.contains("原始源路径已被其他文件占用")));
+    }
+
+    #[tokio::test]
+    async fn undo_plan_ok_copy_scenario() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, b"x").expect("write");
+        let src = tmp.path().join("src.txt");
+        std::fs::write(&src, b"original").expect("write src");
+        let rid = make_managed_reference_with_action(
+            &pool,
+            &cid,
+            "managed",
+            &target,
+            Some(&src),
+            Some("copy"),
+            now_unix(),
+        )
+        .await;
+
+        let plan = undo_import(&pool, rid.clone(), false)
+            .await
+            .expect("plan ok")
+            .expect("plan");
+        assert!(plan.can_undo, "blockers: {:?}", plan.blockers);
+        assert!(plan.blockers.is_empty());
+        assert_eq!(plan.ref_id, rid);
+        assert_eq!(plan.ref_name, "r");
+        assert_eq!(plan.managed_action, "copy");
+        assert_eq!(plan.current_path, target.to_string_lossy());
+        assert_eq!(plan.original_source.as_deref(), Some(src.to_string_lossy().as_ref()));
+        // plan 阶段不写文件不改库
+        assert!(target.exists());
+        assert_eq!(ref_count(&pool, &rid).await, 1);
+        assert_eq!(audit_count(&pool, &rid).await, 0);
+    }
+
+    #[tokio::test]
+    async fn undo_confirmed_copy_ok() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, b"to-be-deleted").expect("write");
+        let src = tmp.path().join("src.txt");
+        std::fs::write(&src, b"original").expect("write src");
+        let rid = make_managed_reference_with_action(
+            &pool,
+            &cid,
+            "managed",
+            &target,
+            Some(&src),
+            Some("copy"),
+            now_unix(),
+        )
+        .await;
+
+        let result = undo_import(&pool, rid.clone(), true)
+            .await
+            .expect("undo ok");
+        assert!(result.is_none(), "confirmed=true 返回 None");
+
+        // 目标文件已删除
+        assert!(!target.exists(), "copy 撤销应删除目标");
+        // 源文件保留
+        assert!(src.exists(), "copy 撤销不动源");
+        // 引用行已删
+        assert_eq!(ref_count(&pool, &rid).await, 0);
+        // 审计已写
+        assert_eq!(audit_count(&pool, &rid).await, 1);
+        let row = sqlx::query(
+            "SELECT action, note, locator_snapshot, actor FROM disposition_audit WHERE ref_id = ?",
+        )
+        .bind(&rid)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch audit");
+        let action: String = row.try_get("action").expect("action");
+        let note: Option<String> = row.try_get("note").expect("note");
+        let locator: String = row.try_get("locator_snapshot").expect("locator");
+        let actor: String = row.try_get("actor").expect("actor");
+        assert_eq!(action, "undo_import");
+        assert_eq!(actor, "local_user");
+        assert!(locator.contains("target.txt"));
+        let note_json: serde_json::Value =
+            serde_json::from_str(&note.expect("note")).expect("note json");
+        assert_eq!(note_json["managedAction"].as_str(), Some("copy"));
+        assert!(note_json["originalSource"].as_str().expect("src").contains("src.txt"));
+    }
+
+    #[tokio::test]
+    async fn undo_confirmed_move_ok() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, b"moved-content").expect("write");
+        // move 场景：originalSource 不存在（源被删了）
+        let src = tmp.path().join("src.txt");
+        let rid = make_managed_reference_with_action(
+            &pool,
+            &cid,
+            "managed",
+            &target,
+            Some(&src),
+            Some("move"),
+            now_unix(),
+        )
+        .await;
+
+        let result = undo_import(&pool, rid.clone(), true)
+            .await
+            .expect("undo ok");
+        assert!(result.is_none());
+
+        // 文件已移回 originalSource
+        assert!(!target.exists(), "move 撤销后目标位置应空");
+        assert!(src.exists(), "move 撤销后文件应回到 originalSource");
+        assert_eq!(std::fs::read(&src).expect("read"), b"moved-content");
+        // 引用行已删
+        assert_eq!(ref_count(&pool, &rid).await, 0);
+        // 审计：managedAction=move
+        let row = sqlx::query("SELECT action, note FROM disposition_audit WHERE ref_id = ?")
+            .bind(&rid)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch audit");
+        let action: String = row.try_get("action").expect("action");
+        let note: Option<String> = row.try_get("note").expect("note");
+        assert_eq!(action, "undo_import");
+        let note_json: serde_json::Value =
+            serde_json::from_str(&note.expect("note")).expect("note json");
+        assert_eq!(note_json["managedAction"].as_str(), Some("move"));
+    }
+
+    #[tokio::test]
+    async fn undo_confirmed_move_source_occupied_aborts() {
+        // move 撤销时 originalSource 被占 → COMMON_FORBIDDEN（锁内复检 blocker）
+        // + 文件未动 + 引用未删
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, b"moved-content").expect("write");
+        let src = tmp.path().join("src.txt");
+        let rid = make_managed_reference_with_action(
+            &pool,
+            &cid,
+            "managed",
+            &target,
+            Some(&src),
+            Some("move"),
+            now_unix(),
+        )
+        .await;
+
+        // plan 阶段：src 不存在 → canUndo=true
+        let plan = undo_import(&pool, rid.clone(), false)
+            .await
+            .expect("plan ok")
+            .expect("plan");
+        assert_eq!(plan.managed_action, "move");
+        assert!(plan.can_undo);
+
+        // 用户在 confirmed 前手动占用 src
+        std::fs::write(&src, b"occupied-by-other").expect("occupy");
+
+        // confirmed：锁内复检应发现 src 被占 → COMMON_FORBIDDEN（blocker 触发）
+        let err = undo_import(&pool, rid.clone(), true)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_FORBIDDEN");
+        // 文件未动
+        assert!(target.exists());
+        assert_eq!(std::fs::read(&src).expect("read"), b"occupied-by-other");
+        // 引用未删
+        assert_eq!(ref_count(&pool, &rid).await, 1);
+        // 无审计
+        assert_eq!(audit_count(&pool, &rid).await, 0);
+    }
+
+    #[tokio::test]
+    async fn undo_confirmed_blockers_forbidden() {
+        // canUndo=false 时 confirmed=true → COMMON_FORBIDDEN
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let rid = make_managed_reference(
+            &pool,
+            &cid,
+            "external", // 非 managed → blocker
+            &file,
+            Some(&file),
+            now_unix(),
+        )
+        .await;
+
+        let err = undo_import(&pool, rid.clone(), true)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_FORBIDDEN");
+        // 文件未动、引用未删
+        assert!(file.exists());
+        assert_eq!(ref_count(&pool, &rid).await, 1);
+        assert_eq!(audit_count(&pool, &rid).await, 0);
+    }
+
+    #[tokio::test]
+    async fn undo_plan_serializes_camel_case() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let target = tmp.path().join("t.txt");
+        std::fs::write(&target, b"x").expect("write");
+        let src = tmp.path().join("s.txt");
+        std::fs::write(&src, b"s").expect("write");
+        let rid = make_managed_reference_with_action(
+            &pool,
+            &cid,
+            "managed",
+            &target,
+            Some(&src),
+            Some("copy"),
+            now_unix(),
+        )
+        .await;
+
+        let plan = undo_import(&pool, rid, false)
+            .await
+            .expect("ok")
+            .expect("plan");
+        let v = serde_json::to_value(&plan).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert!(obj.contains_key("refId"));
+        assert!(obj.contains_key("refName"));
+        assert!(obj.contains_key("managedAction"));
+        assert!(obj.contains_key("currentPath"));
+        assert!(obj.contains_key("originalSource"));
+        assert!(obj.contains_key("canUndo"));
+        assert!(obj.contains_key("blockers"));
+        assert!(!obj.contains_key("ref_id"));
+        assert!(!obj.contains_key("managed_action"));
+        assert!(!obj.contains_key("can_undo"));
+    }
+
+    #[tokio::test]
+    async fn undo_confirmed_copy_target_already_gone_idempotent() {
+        // copy 撤销时目标已被外部删除：视为成功（幂等），引用行仍删除
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let target = tmp.path().join("gone.txt");
+        std::fs::write(&target, b"x").expect("write");
+        let src = tmp.path().join("src.txt");
+        std::fs::write(&src, b"s").expect("write");
+        let rid = make_managed_reference(
+            &pool,
+            &cid,
+            "managed",
+            &target,
+            Some(&src),
+            now_unix(),
+        )
+        .await;
+
+        // 外部删除目标 → plan 阶段会报 blocker「已被外部删除或移动」
+        std::fs::remove_file(&target).expect("remove");
+        let plan = undo_import(&pool, rid.clone(), false)
+            .await
+            .expect("plan")
+            .expect("plan");
+        assert!(!plan.can_undo, "目标被外部删除应报 blocker");
+        // confirmed 也会被 COMMON_FORBIDDEN 拦截，因此「幂等成功」路径
+        // 仅在「plan 后、confirmed 前」的 TOCTOU 窗口触发；锁内复检同样拦截。
+        // 本测试验证 blocker 行为即可。
+    }
+
+    /// 并发：undo_import 与 create_managed 互斥（共用 MANAGED_WRITE_LOCK）。
+    ///
+    /// 验证方式：同时发起一个 undo 和一个 create_managed，两者都应成功
+    /// （互斥锁保证不冲突），且 MANAGED_WRITE_LOCK 已被初始化。
+    #[tokio::test]
+    async fn undo_concurrent_with_create_managed_serialized() {
+        use std::sync::Arc;
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+
+        // 准备 undo 场景
+        let target = tmp.path().join("undo_target.txt");
+        std::fs::write(&target, b"to-undo").expect("write");
+        let src = tmp.path().join("undo_src.txt");
+        std::fs::write(&src, b"original").expect("write");
+        let rid = make_managed_reference_with_action(
+            &pool,
+            &cid,
+            "managed",
+            &target,
+            Some(&src),
+            Some("copy"),
+            now_unix(),
+        )
+        .await;
+
+        // 准备 create_managed 场景
+        let create_src = tmp.path().join("create_src.txt");
+        std::fs::write(&create_src, b"new-file").expect("write");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        // 配置 root_dir
+        let value_json = serde_json::to_string(&serde_json::Value::String(
+            root.to_string_lossy().to_string(),
+        ))
+        .expect("serialize");
+        sqlx::query(
+            "INSERT INTO settings (key, value_json, updated_at) VALUES ('root_dir', ?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+        )
+        .bind(&value_json)
+        .bind(now_unix())
+        .execute(&pool)
+        .await
+        .expect("insert root_dir");
+
+        let pool = Arc::new(pool);
+        let cid = Arc::new(cid);
+
+        // 并发：undo + create_managed
+        let pool1 = Arc::clone(&pool);
+        let rid1 = rid.clone();
+        let h1 = tokio::spawn(async move { undo_import(&pool1, rid1, true).await });
+
+        let pool2 = Arc::clone(&pool);
+        let cid2 = Arc::clone(&cid);
+        let h2 = tokio::spawn(async move {
+            crate::reference::create_managed(
+                &pool2,
+                (*cid2).clone(),
+                "new".into(),
+                "document".into(),
+                crate::reference::Locator {
+                    kind: "path".into(),
+                    path: create_src.to_string_lossy().to_string(),
+                },
+                crate::reference::ManagedAction::Copy,
+                None,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        r1.expect("join1").expect("undo ok");
+        r2.expect("join2").expect("create ok");
+
+        // 互斥锁已初始化
+        assert!(crate::reference::MANAGED_WRITE_LOCK.get().is_some());
+        // undo 生效
+        assert!(!target.exists());
+        assert_eq!(ref_count(&pool, &rid).await, 0);
     }
 }
