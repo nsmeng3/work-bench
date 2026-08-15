@@ -24,6 +24,7 @@ import {
   EditOutlined,
   PlusOutlined,
   ReloadOutlined,
+  RollbackOutlined,
 } from "@ant-design/icons";
 import type {
   Collection,
@@ -42,6 +43,7 @@ import { ReferenceManagedDialog } from "../components/ReferenceManagedDialog";
 import { DispositionButtons } from "../components/DispositionButtons";
 import type { DispositionAction } from "../components/DispositionButtons";
 import { DispositionConfirmDialog } from "../components/DispositionConfirmDialog";
+import { UndoImportDialog } from "../components/UndoImportDialog";
 
 const { Text, Paragraph } = Typography;
 
@@ -97,6 +99,14 @@ function locatorText(ref: ReferenceWithHealth["ref"]): string {
   return `${loc.provider}:${loc.objectId}`;
 }
 
+/** m4-4.9：判断引用是否可显示「撤销导入」按钮（hosting=managed + 24h 窗口内） */
+function canShowUndoButton(ref: Reference): boolean {
+  if (ref.hosting !== "managed") return false;
+  const UNDO_WINDOW_SECS = 24 * 3600;
+  const now = Math.floor(Date.now() / 1000);
+  return now - ref.createdAt <= UNDO_WINDOW_SECS;
+}
+
 interface CollectionDetailPageProps {
   space: Space;
   collection: Collection;
@@ -122,6 +132,7 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
   const [saving, setSaving] = useState(false);
   const [dispositionAction, setDispositionAction] = useState<DispositionAction | null>(null);
   const [dispositionRef, setDispositionRef] = useState<Reference | null>(null);
+  const [undoRef, setUndoRef] = useState<Reference | null>(null);
   const [form] = Form.useForm<RefEditFormValues>();
   const [messageApi, messageContextHolder] = message.useMessage();
 
@@ -171,6 +182,14 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
   const closeDispositionDialog = () => {
     setDispositionAction(null);
     setDispositionRef(null);
+  };
+
+  const openUndoDialog = (ref: Reference) => {
+    setUndoRef(ref);
+  };
+
+  const closeUndoDialog = () => {
+    setUndoRef(null);
   };
 
   const handleSave = async () => {
@@ -246,6 +265,19 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
                     >
                       编辑
                     </Button>,
+                    ...(canShowUndoButton(ref)
+                      ? [
+                          <Button
+                            key="undo"
+                            type="text"
+                            size="small"
+                            icon={<RollbackOutlined />}
+                            onClick={() => openUndoDialog(ref)}
+                          >
+                            撤销导入
+                          </Button>,
+                        ]
+                      : []),
                     <DispositionButtons
                       key="disposition"
                       reference={ref}
@@ -423,6 +455,11 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
         action={dispositionAction}
         reference={dispositionRef}
         onClose={closeDispositionDialog}
+        onSuccess={fetchDetail}
+      />
+      <UndoImportDialog
+        reference={undoRef}
+        onClose={closeUndoDialog}
         onSuccess={fetchDetail}
       />
       <Modal

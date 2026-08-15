@@ -24,6 +24,7 @@ const ACTION_LABELS: Record<DispositionAuditAction, string> = {
   unarchive: "恢复",
   soft_delete: "删除",
   destroy: "销毁",
+  undo_import: "撤销导入",
 };
 
 const ACTION_COLORS: Record<DispositionAuditAction, string> = {
@@ -31,6 +32,7 @@ const ACTION_COLORS: Record<DispositionAuditAction, string> = {
   unarchive: "green",
   soft_delete: "gold",
   destroy: "red",
+  undo_import: "purple",
 };
 
 function formatUnixSeconds(ts: number): string {

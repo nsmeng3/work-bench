@@ -5,6 +5,7 @@ import type {
   DispDestroyResult,
   DispPreview,
   Reference,
+  UndoPlan,
 } from "./types";
 import { mockDispositionApi } from "./mock";
 
@@ -68,4 +69,17 @@ export async function dispPreview(refId: string): Promise<DispPreview> {
 export async function dispAuditList(input: DispAuditListInput): Promise<DispositionAudit[]> {
   if (MOCK) return mockDispositionApi.disp_audit_list(input);
   return invoke<DispositionAudit[]>("disp_audit_list", { ...input });
+}
+
+/**
+ * `ref_undo_import { refId, confirmed }` → `UndoPlan | null`（m4-4.9）。
+ *
+ * - `confirmed=false` → 返回 `UndoPlan`（不写文件不改库）
+ * - `confirmed=true`  → 返回 `null`（执行撤销：删目标/移回 + 删引用 + 写审计）
+ *
+ * 前端使用模式：先调 plan 拿 UndoPlan 渲染确认框，用户确认后再调 confirmed=true。
+ */
+export async function refUndoImport(refId: string, confirmed: boolean): Promise<UndoPlan | null> {
+  if (MOCK) return mockDispositionApi.ref_undo_import(refId, confirmed);
+  return invoke<UndoPlan | null>("ref_undo_import", { refId, confirmed });
 }

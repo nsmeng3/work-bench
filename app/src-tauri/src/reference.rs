@@ -841,6 +841,10 @@ fn resolve_target_name(source: &Path, target_name: Option<&str>) -> CmdResult<St
 ///
 /// 与 `create_external` 的差异：`hosting='managed'`、`locator.path` 为落地后的绝对路径。
 /// 其他字段（type/collectionId/lifecycle/confidentiality/indexed/description/tags）沿用相同校验。
+///
+/// m4-4.9：`locator_json` 追加 `originalSource` 与 `managedAction` 字段，
+/// 供 `ref_undo_import` 在撤销时区分 copy/move 并定位原始源。
+/// 向后兼容：M3 期间创建的引用无此字段，撤销时按 blocker 处理。
 #[allow(clippy::too_many_arguments)]
 async fn insert_managed_reference_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -848,6 +852,8 @@ async fn insert_managed_reference_tx(
     name: &str,
     ref_type: &str,
     landed_abs_path: &Path,
+    original_source: &Path,
+    managed_action: &str,
     description: Option<&str>,
     tags: Option<&[String]>,
     lifecycle: Option<&str>,
@@ -862,6 +868,8 @@ async fn insert_managed_reference_tx(
     let locator_json = serde_json::to_string(&serde_json::json!({
         "kind": "path",
         "path": landed_abs_path.to_string_lossy(),
+        "originalSource": original_source.to_string_lossy(),
+        "managedAction": managed_action,
     }))
     .map_err(|e| AppError::invalid_param(format!("locator 序列化失败: {}", e)))?;
 
@@ -1048,6 +1056,8 @@ pub async fn create_managed(
         name.trim(),
         &ref_type,
         &proposed_target,
+        &source_path,
+        managed_action.as_str(),
         description.as_deref(),
         tags.as_deref(),
         lifecycle.as_deref(),
@@ -2546,6 +2556,12 @@ mod tests {
                 loc["path"].as_str(),
                 Some(landed.to_string_lossy().as_ref())
             );
+            // m4-4.9：locator_json 必须含 originalSource 字段，值为用户提供的源路径
+            assert_eq!(
+                loc["originalSource"].as_str(),
+                Some(source.to_string_lossy().as_ref()),
+                "locator_json 应含 originalSource 字段（供撤销导入使用）"
+            );
         }
 
         #[tokio::test]
@@ -2569,12 +2585,19 @@ mod tests {
             )
             .await
             .expect("move ok");
-            let _reference = match r {
+            let reference = match r {
                 ManagedCreateResult::Created(r) => r,
                 _ => panic!("expected Created"),
             };
             assert!(!source.exists(), "move 应删除源");
             assert!(root.join("Documents").join("report.pdf").exists());
+            // m4-4.9：move 场景 locator_json 也应含 originalSource（供撤销时移回）
+            let loc = reference.locator.as_object().expect("locator obj");
+            assert_eq!(
+                loc["originalSource"].as_str(),
+                Some(source.to_string_lossy().as_ref()),
+                "move 场景 locator_json 应含 originalSource"
+            );
         }
 
         #[tokio::test]
@@ -2657,6 +2680,7 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tempdir");
             let landed = tmp.path().join("landed.txt");
             std::fs::write(&landed, b"x").expect("w");
+            let source = tmp.path().join("source.txt");
 
             let mut tx = pool.begin().await.expect("begin");
             let err = insert_managed_reference_tx(
@@ -2665,6 +2689,8 @@ mod tests {
                 "n",
                 "document",
                 &landed,
+                &source,
+                "copy",
                 None,
                 None,
                 None,

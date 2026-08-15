@@ -118,7 +118,7 @@ export type ReferenceDisposition = "none" | "archived" | "deleted";
 
 /** 引用定位（locator）— §3.2 resource_reference.locator_json */
 export type ReferenceLocator =
-  | { kind: "path"; path: string }
+  | { kind: "path"; path: string; originalSource?: string; managedAction?: ManagedAction }
   | { kind: "repo"; local: string; remote?: string; defaultBranch?: string }
   | { kind: "cloud"; provider: string; objectId: string };
 
@@ -301,8 +301,8 @@ export interface InitRootDirResult {
 
 /* ---------------- 处置审计（§2.6 disp_audit_list） ---------------- */
 
-/** 审计 action 合法值 — 与 disposition_audit.action CHECK 约束一致 */
-export type DispositionAuditAction = "archive" | "unarchive" | "soft_delete" | "destroy";
+/** 审计 action 合法值 — 与 disposition_audit.action CHECK 约束一致（m4-4.9 加入 undo_import） */
+export type DispositionAuditAction = "archive" | "unarchive" | "soft_delete" | "destroy" | "undo_import";
 
 /**
  * 处置审计条目 — 详细设计说明书 §2.6 disp_audit_list 出参 / §3.2 disposition_audit 表。
@@ -369,4 +369,26 @@ export interface DispPreview {
 /** `disp_destroy` 出参 — §2.6 二选一固化：返回被删除的 refId */
 export interface DispDestroyResult {
   deletedRefId: string;
+}
+
+/* ---------------- 导入撤销（m4-4.9 · ref_undo_import） ---------------- */
+
+/**
+ * `ref_undo_import(confirmed=false)` 出参 — UndoPlan。
+ * 不写文件不改库；前端据此渲染确认框。
+ * blockers 非空时 canUndo=false，确认按钮应禁用。
+ */
+export interface UndoPlan {
+  refId: string;
+  refName: string;
+  /** "copy" | "move" */
+  managedAction: ManagedAction;
+  /** 当前目标绝对路径（locator_json.path） */
+  currentPath: string;
+  /** 原始源绝对路径；M3 老数据为 null */
+  originalSource: string | null;
+  /** 是否可撤销：blockers 为空时 true */
+  canUndo: boolean;
+  /** 阻塞原因列表（中文）；空数组表示可撤销 */
+  blockers: string[];
 }
