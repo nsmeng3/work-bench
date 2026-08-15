@@ -3,6 +3,7 @@
 mod collection;
 mod db;
 mod error;
+mod reference;
 mod space;
 
 use sqlx::sqlite::SqlitePool;
@@ -43,6 +44,10 @@ pub fn run() {
             collection::collection_archive,
             collection::collection_restore,
             collection::collection_get,
+            reference::ref_create_external,
+            reference::ref_update,
+            reference::ref_get,
+            reference::ref_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
