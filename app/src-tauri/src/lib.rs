@@ -3,6 +3,7 @@
 mod collection;
 mod db;
 mod error;
+mod query;
 mod reference;
 mod space;
 mod tag;
@@ -54,6 +55,8 @@ pub fn run() {
             tag::tag_remove,
             tag::tag_list,
             tag::tag_query,
+            query::query_refs_cmd,
+            query::query_facets_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
