@@ -267,6 +267,155 @@ pub async fn disp_get_capabilities(
 }
 
 // ============================================================
+// 归档 / 恢复（m4-4.2 · 详细设计 §2.6 / §6.7）
+// ============================================================
+//
+// 关键约束：
+// - 仅改 `resource_reference.disposition`，**不动文件系统**。
+// - 状态机：
+//   - `disp_archive`   : none     → archived；当前 archived/deleted → COMMON_CONFLICT
+//   - `disp_unarchive` : archived → none；    当前 none/deleted     → COMMON_CONFLICT
+// - 审计：UPDATE disposition + INSERT disposition_audit 在同一 sqlx 事务中。
+//   `actor` 固定 `'local_user'`，`locator_snapshot` 存当前 `locator_json` 完整快照。
+// - refId 不存在 → `COMMON_NOT_FOUND`。
+
+/// 审计写入辅助（供 4.4 / 4.5 复用）。
+///
+/// 在调用方持有的事务 `tx` 中插入一条 `disposition_audit` 记录。
+/// 调用方负责事务的开启与提交；本函数失败仅回滚事务，不做额外补偿。
+///
+/// 参数：
+/// - `tx`               : 当前事务
+/// - `ref_id`           : 被操作的 reference id
+/// - `ref_name`         : 当前 reference.name 快照
+/// - `action`           : 'archive' | 'unarchive' | 'soft_delete' | 'destroy'
+/// - `locator_snapshot` : 当前 `locator_json` 完整快照（TEXT）
+/// - `note`             : 可选备注
+pub(crate) async fn write_audit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ref_id: &str,
+    ref_name: &str,
+    action: &str,
+    locator_snapshot: Option<&str>,
+    note: Option<&str>,
+) -> CmdResult<()> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let at = time::OffsetDateTime::now_utc().unix_timestamp();
+    sqlx::query(
+        "INSERT INTO disposition_audit \
+         (id, ref_id, ref_name, action, locator_snapshot, actor, note, at) \
+         VALUES (?, ?, ?, ?, ?, 'local_user', ?, ?)",
+    )
+    .bind(&id)
+    .bind(ref_id)
+    .bind(ref_name)
+    .bind(action)
+    .bind(locator_snapshot)
+    .bind(note)
+    .bind(at)
+    .execute(&mut **tx)
+    .await
+    .map_err(AppError::from)?;
+    Ok(())
+}
+
+/// 归档 / 恢复共用核心：在事务内校验当前 disposition、执行迁移、写审计。
+///
+/// - `expect_from`：当前 disposition 必须等于此值，否则 `COMMON_CONFLICT`。
+/// - `to`         : 目标 disposition。
+/// - `action`     : 写入审计的 action 字符串。
+///
+/// 返回更新后的 `Reference`（事务提交后再读，保证标签等关联数据一致）。
+async fn transition_disposition(
+    pool: &SqlitePool,
+    ref_id: &str,
+    expect_from: &str,
+    to: &str,
+    action: &str,
+) -> CmdResult<crate::reference::Reference> {
+    // 1. 读出当前行（含 name / locator_json 快照），不存在 → NOT_FOUND。
+    let row = sqlx::query(
+        "SELECT name, disposition, locator_json FROM resource_reference WHERE id = ?",
+    )
+    .bind(ref_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from)?
+    .ok_or_else(|| AppError::not_found(format!("资源引用不存在: {}", ref_id)))?;
+
+    let name: String = row.try_get("name").map_err(AppError::from)?;
+    let current: String = row.try_get("disposition").map_err(AppError::from)?;
+    let locator_json: Option<String> = row.try_get("locator_json").map_err(AppError::from)?;
+
+    // 2. 状态机校验：当前必须等于 expect_from，否则 CONFLICT。
+    if current != expect_from {
+        return Err(AppError::conflict(format!(
+            "当前 disposition={}，无法执行 {}（要求 {}）",
+            current, action, expect_from
+        )));
+    }
+
+    // 3. 事务：UPDATE disposition + INSERT audit。
+    let mut tx = pool.begin().await.map_err(AppError::from)?;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    sqlx::query("UPDATE resource_reference SET disposition = ?, updated_at = ? WHERE id = ?")
+        .bind(to)
+        .bind(now)
+        .bind(ref_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from)?;
+    write_audit(
+        &mut tx,
+        ref_id,
+        &name,
+        action,
+        locator_json.as_deref(),
+        None,
+    )
+    .await?;
+    tx.commit().await.map_err(AppError::from)?;
+
+    // 4. 提交后重新读取完整 Reference（含 tags），保持与 ref_get 出参一致。
+    crate::reference::get(pool, ref_id.to_string()).await
+}
+
+/// `disp_archive { refId }` → `Reference`。
+///
+/// `disposition` 从 `none` → `archived`；已 archived / deleted → `COMMON_CONFLICT`。
+/// 不动文件系统。
+pub async fn archive(pool: &SqlitePool, ref_id: String) -> CmdResult<crate::reference::Reference> {
+    transition_disposition(pool, &ref_id, "none", "archived", "archive").await
+}
+
+/// `disp_unarchive { refId }` → `Reference`。
+///
+/// `disposition` 从 `archived` → `none`；未归档（none / deleted）→ `COMMON_CONFLICT`。
+/// 不动文件系统。
+pub async fn unarchive(
+    pool: &SqlitePool,
+    ref_id: String,
+) -> CmdResult<crate::reference::Reference> {
+    transition_disposition(pool, &ref_id, "archived", "none", "unarchive").await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn disp_archive(
+    state: tauri::State<'_, crate::AppState>,
+    ref_id: String,
+) -> CmdResult<crate::reference::Reference> {
+    archive(&state.pool, ref_id).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn disp_unarchive(
+    state: tauri::State<'_, crate::AppState>,
+    ref_id: String,
+) -> CmdResult<crate::reference::Reference> {
+    unarchive(&state.pool, ref_id).await
+}
+
+// ============================================================
 // 单元测试
 // ============================================================
 
@@ -603,5 +752,172 @@ mod tests {
         assert!(v);
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = v;
+    }
+
+    // ---------- m4-4.2 · disp_archive / disp_unarchive ----------
+
+    /// 读取当前 reference 的 disposition 字段。
+    async fn read_disposition(pool: &SqlitePool, id: &str) -> String {
+        let (d,): (String,) = sqlx::query_as("SELECT disposition FROM resource_reference WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read disposition");
+        d
+    }
+
+    /// 统计审计表中指定 ref 的记录数。
+    async fn audit_count(pool: &SqlitePool, ref_id: &str) -> i64 {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM disposition_audit WHERE ref_id = ?")
+            .bind(ref_id)
+            .fetch_one(pool)
+            .await
+            .expect("count audit");
+        n
+    }
+
+    /// 取指定 ref 的审计动作序列（按 SQLite rowid 升序 = 插入顺序）。
+    async fn audit_actions(pool: &SqlitePool, ref_id: &str) -> Vec<String> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT action FROM disposition_audit WHERE ref_id = ? ORDER BY rowid ASC",
+        )
+        .bind(ref_id)
+        .fetch_all(pool)
+        .await
+        .expect("list audit");
+        rows.into_iter().map(|(a,)| a).collect()
+    }
+
+    #[tokio::test]
+    async fn archive_none_to_archived_ok() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "none").await;
+
+        let r = archive(&pool, rid.clone()).await.expect("archive ok");
+        assert_eq!(r.id, rid);
+        assert_eq!(r.disposition, "archived");
+        // 数据库层也已落库
+        assert_eq!(read_disposition(&pool, &rid).await, "archived");
+    }
+
+    #[tokio::test]
+    async fn archive_twice_conflict() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "none").await;
+        archive(&pool, rid.clone()).await.expect("first archive ok");
+
+        let err = archive(&pool, rid.clone()).await.expect_err("should conflict");
+        assert_eq!(err.code, "COMMON_CONFLICT");
+        // 状态未被破坏
+        assert_eq!(read_disposition(&pool, &rid).await, "archived");
+    }
+
+    #[tokio::test]
+    async fn archive_deleted_conflict() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "deleted").await;
+        let err = archive(&pool, rid.clone()).await.expect_err("should conflict");
+        assert_eq!(err.code, "COMMON_CONFLICT");
+        assert_eq!(read_disposition(&pool, &rid).await, "deleted");
+    }
+
+    #[tokio::test]
+    async fn unarchive_archived_to_none_ok() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "archived").await;
+
+        let r = unarchive(&pool, rid.clone()).await.expect("unarchive ok");
+        assert_eq!(r.disposition, "none");
+        assert_eq!(read_disposition(&pool, &rid).await, "none");
+    }
+
+    #[tokio::test]
+    async fn unarchive_none_conflict() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "none").await;
+        let err = unarchive(&pool, rid.clone()).await.expect_err("should conflict");
+        assert_eq!(err.code, "COMMON_CONFLICT");
+        assert_eq!(read_disposition(&pool, &rid).await, "none");
+    }
+
+    #[tokio::test]
+    async fn unarchive_deleted_conflict() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "deleted").await;
+        let err = unarchive(&pool, rid.clone()).await.expect_err("should conflict");
+        assert_eq!(err.code, "COMMON_CONFLICT");
+        assert_eq!(read_disposition(&pool, &rid).await, "deleted");
+    }
+
+    #[tokio::test]
+    async fn archive_writes_audit_with_snapshot() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "none").await;
+
+        archive(&pool, rid.clone()).await.expect("archive ok");
+
+        assert_eq!(audit_count(&pool, &rid).await, 1);
+        let row = sqlx::query(
+            "SELECT ref_name, action, locator_snapshot, actor, note, at \
+             FROM disposition_audit WHERE ref_id = ?",
+        )
+        .bind(&rid)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch audit");
+        let ref_name: String = row.try_get("ref_name").expect("ref_name");
+        let action: String = row.try_get("action").expect("action");
+        let locator: String = row.try_get("locator_snapshot").expect("locator");
+        let actor: String = row.try_get("actor").expect("actor");
+        let note: Option<String> = row.try_get("note").expect("note");
+        let at: i64 = row.try_get("at").expect("at");
+
+        assert_eq!(ref_name, "r");
+        assert_eq!(action, "archive");
+        // locator_snapshot 与 make_reference 写入的 locator_json 完全一致
+        assert_eq!(locator, "{\"kind\":\"path\",\"path\":\"/tmp/x\"}");
+        assert_eq!(actor, "local_user");
+        assert!(note.is_none());
+        assert!(at > 0);
+    }
+
+    #[tokio::test]
+    async fn archive_unarchive_archive_audit_three_rows() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference(&pool, &cid, "none").await;
+
+        archive(&pool, rid.clone()).await.expect("a1");
+        unarchive(&pool, rid.clone()).await.expect("u");
+        archive(&pool, rid.clone()).await.expect("a2");
+
+        assert_eq!(audit_count(&pool, &rid).await, 3);
+        let actions = audit_actions(&pool, &rid).await;
+        assert_eq!(actions, vec!["archive", "unarchive", "archive"]);
+    }
+
+    #[tokio::test]
+    async fn archive_err_not_found() {
+        let pool = setup().await;
+        let err = archive(&pool, "no-such-id".into())
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn unarchive_err_not_found() {
+        let pool = setup().await;
+        let err = unarchive(&pool, "no-such-id".into())
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
     }
 }
