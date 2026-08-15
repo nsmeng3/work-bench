@@ -14,6 +14,7 @@ import type {
   ReferenceType,
   ReferenceWithHealth,
   RefCreateExternalInput,
+  RefUpdateInput,
 } from "./types";
 
 /**
@@ -387,5 +388,34 @@ export const mockReferenceApi = {
     };
     seedReferences = [...seedReferences, { ref, health: "unknown" }];
     return ref;
+  },
+
+  /**
+   * §2.5 ref_update：仅允许修改管理属性；type/locator/hosting 不可改。
+   * tags 为全量替换语义。
+   */
+  ref_update(input: RefUpdateInput): Reference {
+    const idx = seedReferences.findIndex((r) => r.ref.id === input.id);
+    if (idx === -1)
+      throw { code: "COMMON_NOT_FOUND", message: "引用不存在", retryable: false };
+    const item = seedReferences[idx];
+    if (input.name !== undefined && input.name.trim() === "")
+      throw { code: "COMMON_INVALID_PARAM", message: "名称不能为空", retryable: false };
+    const updated: Reference = {
+      ...item.ref,
+      name: input.name ?? item.ref.name,
+      description: input.description ?? item.ref.description,
+      tags: input.tags ?? item.ref.tags,
+      lifecycle: input.lifecycle ?? item.ref.lifecycle,
+      confidentiality: input.confidentiality ?? item.ref.confidentiality,
+      indexed: input.indexed ?? item.ref.indexed,
+      updatedAt: unixNow(),
+    };
+    seedReferences = [
+      ...seedReferences.slice(0, idx),
+      { ...item, ref: updated },
+      ...seedReferences.slice(idx + 1),
+    ];
+    return updated;
   },
 };
