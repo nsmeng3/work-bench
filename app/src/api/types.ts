@@ -298,3 +298,44 @@ export interface InitRootDirResult {
   rootDir: string;
   created: string[];
 }
+
+/* ---------------- 处置（§2.6） ---------------- */
+
+/**
+ * 单项能力 reason 集合 — 仅 false 项填说明，true 项省略。
+ * 序列化为 camelCase。
+ */
+export interface DispReasons {
+  archive?: string;
+  softDelete?: string;
+  destroy?: string;
+  restoreFromBin?: string;
+}
+
+/**
+ * `disp_get_capabilities` 出参 — §2.6。
+ * UI 据此渲染三档按钮可用态；false 项必须给出 reason。
+ */
+export interface DispCapabilities {
+  archive: boolean;
+  softDelete: boolean;
+  destroy: boolean;
+  restoreFromBin: boolean;
+  reason: DispReasons;
+}
+
+/** `disp_preview` 出参 — §2.6 */
+export interface DispPreview {
+  previewId: string;
+  target: string;
+  isDir: boolean;
+  fileCount: number;
+  totalBytes: number;
+  capability: DispCapabilities;
+  warning: string;
+}
+
+/** `disp_destroy` 出参 — §2.6 二选一固化：返回被删除的 refId */
+export interface DispDestroyResult {
+  deletedRefId: string;
+}

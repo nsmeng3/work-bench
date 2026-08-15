@@ -39,6 +39,9 @@ import type {
 import { collectionGet, refUpdate, toApiError } from "../api";
 import { ReferenceCreateDialog } from "../components/ReferenceCreateDialog";
 import { ReferenceManagedDialog } from "../components/ReferenceManagedDialog";
+import { DispositionButtons } from "../components/DispositionButtons";
+import type { DispositionAction } from "../components/DispositionButtons";
+import { DispositionConfirmDialog } from "../components/DispositionConfirmDialog";
 
 const { Text, Paragraph } = Typography;
 
@@ -117,6 +120,8 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
   const [managedOpen, setManagedOpen] = useState(false);
   const [editingRef, setEditingRef] = useState<Reference | null>(null);
   const [saving, setSaving] = useState(false);
+  const [dispositionAction, setDispositionAction] = useState<DispositionAction | null>(null);
+  const [dispositionRef, setDispositionRef] = useState<Reference | null>(null);
   const [form] = Form.useForm<RefEditFormValues>();
   const [messageApi, messageContextHolder] = message.useMessage();
 
@@ -156,6 +161,16 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
     if (saving) return;
     setEditingRef(null);
     form.resetFields();
+  };
+
+  const openDispositionDialog = (ref: Reference, action: DispositionAction) => {
+    setDispositionRef(ref);
+    setDispositionAction(action);
+  };
+
+  const closeDispositionDialog = () => {
+    setDispositionAction(null);
+    setDispositionRef(null);
   };
 
   const handleSave = async () => {
@@ -231,6 +246,12 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
                     >
                       编辑
                     </Button>,
+                    <DispositionButtons
+                      key="disposition"
+                      reference={ref}
+                      size="small"
+                      onAction={(action) => openDispositionDialog(ref, action)}
+                    />,
                   ]}
                 >
                   <List.Item.Meta
@@ -397,6 +418,12 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
         collectionId={collection.id}
         onClose={() => setManagedOpen(false)}
         onCreated={fetchDetail}
+      />
+      <DispositionConfirmDialog
+        action={dispositionAction}
+        reference={dispositionRef}
+        onClose={closeDispositionDialog}
+        onSuccess={fetchDetail}
       />
       <Modal
         title="编辑引用"
