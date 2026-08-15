@@ -1184,8 +1184,10 @@ mod tests {
 
         let all = list(&pool, cid, None, None, None).await.expect("list ok");
         assert_eq!(all.len(), 2);
-        assert_eq!(all[0].name, "r1");
-        assert_eq!(all[1].name, "r2");
+        // created_at 同秒 + id 为随机 UUID 时顺序不确定，按名称排序后断言内容
+        let mut names: Vec<_> = all.iter().map(|r| r.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["r1", "r2"]);
     }
 
     #[tokio::test]
