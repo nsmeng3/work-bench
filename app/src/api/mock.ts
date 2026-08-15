@@ -10,10 +10,12 @@ import type {
   CollectionIdInput,
   CollectionListInput,
   CollectionDetail,
+  ManagedPlan,
   Reference,
   ReferenceType,
   ReferenceWithHealth,
   RefCreateExternalInput,
+  RefCreateManagedInput,
   RefUpdateInput,
   QueryRefsInput,
   QueryRefsOutput,
@@ -589,5 +591,157 @@ export const mockReferenceApi = {
       ...seedReferences.slice(idx + 1),
     ];
     return updated;
+  },
+
+  /**
+   * §2.5 ref_create_managed confirmed=false — 返回 ManagedPlan，不做写操作。
+   * mock 形状与契约逐字段一致：
+   * - source 来自入参 locator.path
+   * - proposedTarget 拼成 `<rootDir|/mock-root>/<Type 子目录>/<源名>`
+   * - sizeBytes / fileCount 用确定性伪随机（按路径 hash），便于联调
+   * - 路径含 "missing" → FS_PATH_NOT_FOUND
+   * - 路径含 "conflict" → 返回非空 conflicts，便于联调冲突分支
+   */
+  ref_create_managed_plan(input: RefCreateManagedInput): ManagedPlan {
+    const collection = collectionStore.find((c) => c.id === input.collectionId);
+    if (!collection) {
+      throw { code: "COMMON_NOT_FOUND", message: "资源集不存在", retryable: false };
+    }
+    if (input.locator.kind !== "path") {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: "仅支持 path 类型 locator",
+        retryable: false,
+      };
+    }
+    const source = input.locator.path;
+    if (!source || !source.startsWith("/")) {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: "路径必须为绝对路径",
+        retryable: false,
+      };
+    }
+    if (source.includes("missing")) {
+      throw {
+        code: "FS_PATH_NOT_FOUND",
+        message: `路径不存在：${source}`,
+        details: { path: source },
+        retryable: false,
+      };
+    }
+    // 类型 → 子目录名（与 settings_init_root_dir 的 MOCK_TYPE_SUBDIRS 对齐）
+    const TYPE_DIR: Record<ReferenceType, string> = {
+      code: "Code",
+      document: "Documents",
+      data: "Data",
+      artifact: "Artifacts",
+      tool: "Tools",
+      media: "Media",
+    };
+    const baseName = source.split("/").filter(Boolean).pop() ?? "unnamed";
+    const root = mockRootDir ?? "/mock-root";
+    const proposedTarget = `${root}/${TYPE_DIR[input.type]}/${baseName}`;
+
+    // 确定性伪随机 size/fileCount（按路径字符串 hash）
+    let hash = 0;
+    for (let i = 0; i < source.length; i++) hash = (hash * 31 + source.charCodeAt(i)) >>> 0;
+    const isDir = !/\.[a-z0-9]{1,5}$/i.test(baseName);
+    const fileCount = isDir ? (hash % 200) + 3 : 1;
+    const sizeBytes = isDir ? 1024 * 1024 * ((hash % 500) + 10) : 1024 * ((hash % 2048) + 1);
+
+    const conflicts: string[] = [];
+    if (source.includes("conflict")) {
+      conflicts.push(`目标已存在同名项：${proposedTarget}`);
+    }
+
+    return {
+      kind: "managed_plan",
+      source,
+      proposedTarget,
+      action: input.managedAction,
+      sizeBytes,
+      fileCount,
+      conflicts,
+    };
+  },
+
+  /**
+   * §2.5 ref_create_managed confirmed=true — 执行 copy/move 并落库。
+   * mock 不做真实文件操作，仅生成 hosting=managed 的 Reference，
+   * locator.path 指向最终目标路径（含 targetName 覆盖）。
+   * 路径含 "io-error" → COMMON_IO，便于联调错误分支。
+   */
+  ref_create_managed_confirmed(input: RefCreateManagedInput): Reference {
+    const collection = collectionStore.find((c) => c.id === input.collectionId);
+    if (!collection) {
+      throw { code: "COMMON_NOT_FOUND", message: "资源集不存在", retryable: false };
+    }
+    if (input.locator.kind !== "path") {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: "仅支持 path 类型 locator",
+        retryable: false,
+      };
+    }
+    const source = input.locator.path;
+    if (source.includes("missing")) {
+      throw {
+        code: "FS_PATH_NOT_FOUND",
+        message: `路径不存在：${source}`,
+        details: { path: source },
+        retryable: false,
+      };
+    }
+    if (source.includes("io-error")) {
+      throw {
+        code: "COMMON_IO",
+        message: `IO 异常：${source}`,
+        details: { path: source },
+        retryable: true,
+      };
+    }
+    if (input.targetName && input.targetName.includes("exists")) {
+      throw {
+        code: "FS_TARGET_EXISTS",
+        message: `目标已存在：${input.targetName}`,
+        details: { targetName: input.targetName },
+        retryable: false,
+      };
+    }
+
+    const TYPE_DIR: Record<ReferenceType, string> = {
+      code: "Code",
+      document: "Documents",
+      data: "Data",
+      artifact: "Artifacts",
+      tool: "Tools",
+      media: "Media",
+    };
+    const baseName = source.split("/").filter(Boolean).pop() ?? "unnamed";
+    const finalName = input.targetName?.trim() || baseName;
+    const root = mockRootDir ?? "/mock-root";
+    const finalTarget = `${root}/${TYPE_DIR[input.type]}/${finalName}`;
+
+    const now = unixNow();
+    const ref: Reference = {
+      id: makeRefId(),
+      collectionId: input.collectionId,
+      sourceId: "mock-source-local",
+      name: input.name.trim(),
+      type: input.type,
+      hosting: "managed",
+      locator: { kind: "path", path: finalTarget },
+      description: input.description,
+      tags: input.tags,
+      lifecycle: input.lifecycle ?? "active",
+      confidentiality: input.confidentiality ?? "internal",
+      indexed: input.indexed ?? true,
+      disposition: "none",
+      createdAt: now,
+      updatedAt: now,
+    };
+    seedReferences = [...seedReferences, { ref, health: "ok" }];
+    return ref;
   },
 };

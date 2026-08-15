@@ -192,6 +192,52 @@ export interface RefCreateExternalInput {
   indexed?: boolean;
 }
 
+/* ---------------- 导入并托管（§2.5 ref_create_managed） ---------------- */
+
+/** 托管动作：copy 保留源 / move 移动（源将被删除） */
+export type ManagedAction = "copy" | "move";
+
+/**
+ * ref_create_managed 入参 — 详细设计说明书 §2.5。
+ * 基础字段与 ref_create_external 相同，额外加 managedAction / targetName / confirmed。
+ * confirmed=false 拿 ManagedPlan；confirmed=true 执行落地返回 Reference。
+ */
+export interface RefCreateManagedInput {
+  collectionId: string;
+  name: string;
+  type: ReferenceType;
+  locator: ReferenceLocator;
+  description?: string;
+  tags?: string[];
+  lifecycle?: ReferenceLifecycle;
+  confidentiality?: ReferenceConfidentiality;
+  indexed?: boolean;
+  managedAction: ManagedAction;
+  /** 自定义目标名（缺省用源名）；仅在 confirmed=true 阶段生效 */
+  targetName?: string;
+  confirmed: boolean;
+}
+
+/**
+ * ManagedPlan — ref_create_managed(confirmed=false) 出参。
+ * 不执行任何写操作；前端据此渲染确认框。
+ */
+export interface ManagedPlan {
+  kind: "managed_plan";
+  /** 源绝对路径 */
+  source: string;
+  /** 后端建议的目标绝对路径（rootDir/类型子目录/源名） */
+  proposedTarget: string;
+  /** 当前请求的托管动作（回显） */
+  action: ManagedAction;
+  /** 总字节数 */
+  sizeBytes: number;
+  /** 文件数；单文件通常为 1，目录为递归文件总数 */
+  fileCount: number;
+  /** 冲突描述列表；非空时前端禁用「确认」直至用户改 targetName */
+  conflicts: string[];
+}
+
 /* ---------------- 查询筛选（§2.9） ---------------- */
 
 /** query_refs 入参 — 全部可选；tags 为 AND 语义 */
