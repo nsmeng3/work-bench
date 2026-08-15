@@ -27,6 +27,9 @@ import type {
   InitRootDirResult,
   DispositionAudit,
   DispAuditListInput,
+  DispCapabilities,
+  DispPreview,
+  DispDestroyResult,
 } from "./types";
 
 /**
@@ -319,6 +322,40 @@ let seedReferences: ReferenceWithHealth[] = [
       locator: { kind: "path", path: "/Users/demo/data/sample.parquet" },
     }),
     health: "unknown",
+  },
+  // m4-4.7 三档按钮 mock：archived / deleted / 大目录
+  {
+    ref: makeRef({
+      id: "mock-ref-archived-1",
+      collectionId: "mock-collection-1",
+      name: "已归档的旧文档",
+      type: "document",
+      disposition: "archived",
+      locator: { kind: "path", path: "/Users/demo/docs/old-archived.md" },
+    }),
+    health: "ok",
+  },
+  {
+    ref: makeRef({
+      id: "mock-ref-deleted-1",
+      collectionId: "mock-collection-1",
+      name: "已删除到回收站",
+      type: "media",
+      disposition: "deleted",
+      locator: { kind: "path", path: "/Users/demo/media/deleted.mov" },
+    }),
+    health: "missing",
+  },
+  {
+    ref: makeRef({
+      id: "mock-ref-bigdir-1",
+      collectionId: "mock-collection-1",
+      name: "大型代码仓",
+      type: "code",
+      description: "用于演示大目录 preview 加载",
+      locator: { kind: "path", path: "/Users/demo/code/big-repo" },
+    }),
+    health: "ok",
   },
 ];
 
@@ -795,7 +832,154 @@ const seedDispositionAudits: DispositionAudit[] = (() => {
   return list;
 })();
 
+
+/* ---------------- 处置 mock（§2.6 · m4-4.7） ---------------- */
+
+/**
+ * 计算引用的处置能力 — 与后端 `compute_capabilities` 纯函数规则一致。
+ * mock 默认 softDelete 支持（macOS）；路径含 "no-recycle" 时模拟不支持。
+ */
+function computeMockCapabilities(ref: Reference): DispCapabilities {
+  const reason: DispCapabilities["reason"] = {};
+  const disposition = ref.disposition;
+  const softDeleteSupported = !(
+    ref.locator.kind === "path" && ref.locator.path.includes("no-recycle")
+  );
+
+  const archive = disposition !== "archived";
+  if (!archive) reason.archive = "已归档，无需重复归档";
+
+  const softDelete = softDeleteSupported;
+  if (!softDelete) reason.softDelete = "当前存储源不支持系统回收站";
+
+  const destroy = true;
+
+  const restoreFromBin = disposition === "deleted";
+  if (!restoreFromBin) reason.restoreFromBin = "引用未处于回收站状态";
+
+  return { archive, softDelete, destroy, restoreFromBin, reason };
+}
+
+function findMockRef(refId: string): Reference {
+  const item = seedReferences.find((r) => r.ref.id === refId);
+  if (!item) throw { code: "COMMON_NOT_FOUND", message: "资源引用不存在", retryable: false };
+  return item.ref;
+}
+
+function updateMockRefDisposition(refId: string, disposition: Reference["disposition"]): Reference {
+  const idx = seedReferences.findIndex((r) => r.ref.id === refId);
+  if (idx === -1)
+    throw { code: "COMMON_NOT_FOUND", message: "资源引用不存在", retryable: false };
+  const item = seedReferences[idx];
+  const updated: Reference = { ...item.ref, disposition, updatedAt: unixNow() };
+  seedReferences = [
+    ...seedReferences.slice(0, idx),
+    { ...item, ref: updated },
+    ...seedReferences.slice(idx + 1),
+  ];
+  return updated;
+}
+
+function humanSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = bytes;
+  let u = -1;
+  do {
+    v /= 1024;
+    u += 1;
+  } while (v >= 1024 && u < units.length - 1);
+  return `${v.toFixed(2)} ${units[u]}`;
+}
+
 export const mockDispositionApi = {
+  disp_get_capabilities(refId: string): DispCapabilities {
+    const ref = findMockRef(refId);
+    return computeMockCapabilities(ref);
+  },
+
+  disp_archive(refId: string): Reference {
+    const ref = findMockRef(refId);
+    if (ref.disposition !== "none") {
+      throw {
+        code: "COMMON_CONFLICT",
+        message: `当前 disposition=${ref.disposition}，无法执行 archive（要求 none）`,
+        retryable: false,
+      };
+    }
+    return updateMockRefDisposition(refId, "archived");
+  },
+
+  disp_unarchive(refId: string): Reference {
+    const ref = findMockRef(refId);
+    if (ref.disposition !== "archived") {
+      throw {
+        code: "COMMON_CONFLICT",
+        message: `当前 disposition=${ref.disposition}，无法执行 unarchive（要求 archived）`,
+        retryable: false,
+      };
+    }
+    return updateMockRefDisposition(refId, "none");
+  },
+
+  disp_soft_delete(refId: string): Reference {
+    const ref = findMockRef(refId);
+    const caps = computeMockCapabilities(ref);
+    if (!caps.softDelete) {
+      throw {
+        code: "FS_RECYCLE_UNSUPPORTED",
+        message: "当前系统不支持回收站，只能归档或销毁",
+        retryable: false,
+      };
+    }
+    return updateMockRefDisposition(refId, "deleted");
+  },
+
+  /**
+   * mock preview：按 refId 路径 hash 生成确定性伪随机统计；
+   * 路径含 "big-repo" 模拟大目录（fileCount 较大）。
+   */
+  disp_preview(refId: string): DispPreview {
+    const ref = findMockRef(refId);
+    const target = ref.locator.kind === "path" ? ref.locator.path : `/mock/${ref.id}`;
+    let hash = 0;
+    for (let i = 0; i < target.length; i++) hash = (hash * 31 + target.charCodeAt(i)) >>> 0;
+    const isDir = !/\.[a-z0-9]{1,5}$/i.test(target);
+    const isBig = target.includes("big-repo");
+    const fileCount = isBig ? 1234 : isDir ? (hash % 200) + 3 : 1;
+    const totalBytes = isBig
+      ? 1024 * 1024 * 5678
+      : isDir
+        ? 1024 * 1024 * ((hash % 500) + 10)
+        : 1024 * ((hash % 2048) + 1);
+    const warning = isDir
+      ? `目录包含 ${fileCount} 个文件，共 ${humanSize(totalBytes)}；销毁后不可恢复`
+      : `文件大小 ${humanSize(totalBytes)}；销毁后不可恢复`;
+    return {
+      previewId: `mock-preview-${refId}`,
+      target,
+      isDir,
+      fileCount,
+      totalBytes,
+      capability: computeMockCapabilities(ref),
+      warning,
+    };
+  },
+
+  disp_destroy(refId: string, confirmText: string): DispDestroyResult {
+    const ref = findMockRef(refId);
+    if (confirmText !== ref.name) {
+      throw {
+        code: "COMMON_CONFIRM_REQUIRED",
+        message: `confirmText 与资源名称不一致（期望: ${ref.name}）`,
+        retryable: false,
+      };
+    }
+    // 物理删除引用行
+    seedReferences = seedReferences.filter((r) => r.ref.id !== refId);
+    return { deletedRefId: refId };
+  },
+
   /**
    * §2.6 disp_audit_list mock：按 refId / action 过滤，按 at DESC 排序，支持分页。
    * action 非法值 → COMMON_INVALID_PARAM（与后端行为对齐）。
