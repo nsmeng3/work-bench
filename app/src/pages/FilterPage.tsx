@@ -300,7 +300,7 @@ export function FilterPage() {
           <>
             <FacetGroup
               title="类型"
-              values={facets.type}
+              values={facets.types}
               selected={typeSel}
               onChange={setTypeSel}
               single
@@ -308,7 +308,7 @@ export function FilterPage() {
             />
             <FacetGroup
               title="生命周期"
-              values={facets.lifecycle}
+              values={facets.lifecycles}
               selected={lifecycleSel}
               onChange={setLifecycleSel}
               single
@@ -316,7 +316,7 @@ export function FilterPage() {
             />
             <FacetGroup
               title="保密级别"
-              values={facets.confidentiality}
+              values={facets.confidentialities}
               selected={confSel}
               onChange={setConfSel}
               single

@@ -415,9 +415,9 @@ export const mockQueryApi = {
       for (const t of r.tags ?? []) tagMap.set(t, (tagMap.get(t) ?? 0) + 1);
     }
     return {
-      type: count("type", (v) => v),
-      lifecycle: count("lifecycle", (v) => v),
-      confidentiality: count("confidentiality", (v) => v),
+      types: count("type", (v) => v),
+      lifecycles: count("lifecycle", (v) => v),
+      confidentialities: count("confidentiality", (v) => v),
       tags: Array.from(tagMap.entries())
         .map(([value, count]) => ({ value, count }))
         .sort((a, b) => b.count - a.count),

@@ -228,8 +228,8 @@ export interface FacetValue {
 
 /** query_facets 出参 — 四个维度的可用筛选值与计数 */
 export interface QueryFacetsOutput {
-  type: FacetValue[];
-  lifecycle: FacetValue[];
-  confidentiality: FacetValue[];
+  types: FacetValue[];
+  lifecycles: FacetValue[];
+  confidentialities: FacetValue[];
   tags: FacetValue[];
 }
