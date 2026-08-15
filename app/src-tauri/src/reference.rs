@@ -14,6 +14,7 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -514,6 +515,101 @@ fn managed_write_lock() -> &'static Mutex<()> {
     MANAGED_WRITE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+// ============================================================
+// m3-3.3 · 大文件复制进度事件（managed_progress）
+// ============================================================
+
+/// Tauri 事件名：前端用 `listen("managed_progress", ...)` 接收。
+pub const MANAGED_PROGRESS_EVENT: &str = "managed_progress";
+
+/// 节流常量：每复制满 1 MiB 发一次进度事件。
+///
+/// 与 `PROGRESS_TIME_STEP` 取先到者；调优时只改这里。
+pub const PROGRESS_BYTE_STEP: u64 = 1 << 20; // 1 MiB
+
+/// 节流常量：距上次发事件超过 200ms 也强制发一次。
+///
+/// 与 `PROGRESS_BYTE_STEP` 取先到者；调优时只改这里。
+pub const PROGRESS_TIME_STEP: Duration = Duration::from_millis(200);
+
+/// `managed_progress` 事件载荷（详细设计 §4.1）。
+///
+/// 序列化为 camelCase：`{ refId, bytes, total }`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedProgress {
+    /// 后端在 confirmed 阶段事务开始前生成的临时 UUID，
+    /// 前端据此区分并发任务；与最终写库的 `Reference.id` 不同。
+    pub ref_id: String,
+    /// 已复制字节数（累计）。
+    pub bytes: u64,
+    /// 总字节数（plan 阶段 `stat_source` 计算并透传）。
+    pub total: u64,
+}
+
+/// 进度发射节流器：按 `PROGRESS_BYTE_STEP` / `PROGRESS_TIME_STEP` 节流，
+/// 并在 `finish()` 时强制发一次 `bytes == total` 的完成事件。
+///
+/// **约定（已固化）**：完成时**发**最后一次 `bytes == total`；
+/// 失败时**不发**完成事件，由 `ref_create_managed` 的错误返回通知前端。
+struct ProgressThrottle<'a> {
+    ref_id: String,
+    total: u64,
+    /// 上次发事件时的累计字节数。
+    last_emitted_bytes: u64,
+    /// 上次发事件的墙钟时间；首次发事件前为 `None`。
+    last_emitted_at: Option<Instant>,
+    /// 下游发射器（生产：Tauri emit；测试：Vec push）。
+    sink: &'a mut (dyn FnMut(ManagedProgress) + Send),
+}
+
+impl<'a> ProgressThrottle<'a> {
+    fn new(
+        ref_id: String,
+        total: u64,
+        sink: &'a mut (dyn FnMut(ManagedProgress) + Send),
+    ) -> Self {
+        Self {
+            ref_id,
+            total,
+            last_emitted_bytes: 0,
+            last_emitted_at: None,
+            sink,
+        }
+    }
+
+    /// 复制循环每次写盘后调用；按节流规则决定是否发射。
+    fn on_bytes(&mut self, copied: u64) {
+        let byte_advanced = copied.saturating_sub(self.last_emitted_bytes);
+        let time_elapsed = self
+            .last_emitted_at
+            .map(|t| t.elapsed() >= PROGRESS_TIME_STEP)
+            // 首次调用必发（bytes 可能为 0 或首个 buffer），让前端尽快看到进度条。
+            .unwrap_or(true);
+        if byte_advanced >= PROGRESS_BYTE_STEP || time_elapsed {
+            self.emit(copied);
+        }
+    }
+
+    /// 落地全部完成后调用：强制发一次 `bytes == total` 的完成事件。
+    ///
+    /// 若 `on_bytes` 已发过 `copied == total`（例如整除 1 MiB），这里会重发一次；
+    /// 前端按 `bytes == total` 幂等处理即可。失败路径**不调用**本方法。
+    fn finish(&mut self) {
+        self.emit(self.total);
+    }
+
+    fn emit(&mut self, bytes: u64) {
+        (self.sink)(ManagedProgress {
+            ref_id: self.ref_id.clone(),
+            bytes,
+            total: self.total,
+        });
+        self.last_emitted_bytes = bytes;
+        self.last_emitted_at = Some(Instant::now());
+    }
+}
+
 /// 源路径统计结果。
 #[derive(Debug, Clone, Copy)]
 struct SourceStat {
@@ -805,6 +901,9 @@ async fn insert_managed_reference_tx(
 /// # 参数
 /// - `confirmed=false`：仅返回 `Ok(ManagedCreateResult::Plan(...))`，不写文件不写库。
 /// - `confirmed=true`：返回 `Ok(ManagedCreateResult::Created(...))`。
+/// - `progress_sink`：m3-3.3 进度事件发射器；仅 `confirmed=true` 时使用。
+///   生产环境由 Tauri 命令注入 `AppHandle::emit` 闭包；测试注入 Vec 收集闭包。
+///   传 `None` 表示不发事件（向后兼容旧调用）。
 ///
 /// # 错误码
 /// - `FS_PATH_NOT_FOUND`：源路径不存在
@@ -829,6 +928,7 @@ pub async fn create_managed(
     lifecycle: Option<String>,
     confidentiality: Option<String>,
     indexed: Option<bool>,
+    progress_sink: Option<&mut (dyn FnMut(ManagedProgress) + Send)>,
 ) -> CmdResult<ManagedCreateResult> {
     // ---------- 1. 入参校验（与 create_external 相同 + 新增字段） ----------
     validate_name(&name)?;
@@ -889,8 +989,33 @@ pub async fn create_managed(
         ));
     }
 
-    // 落地（3.3 进度事件接入点：当前传空回调，3.3 替换为 Tauri 事件发射）
-    land_source(&source_path, &proposed_target, &stat, |_bytes| {})?;
+    // m3-3.3：事务开始前生成临时 refId，作为 `managed_progress` 事件载荷的标识；
+    // 与最终写库的 Reference.id 无关（写库 id 由 insert_managed_reference_tx 内部生成）。
+    let progress_ref_id = Uuid::new_v4().to_string();
+
+    // 落地（m3-3.3：接入进度事件；throttle 内部按 1 MiB / 200ms 节流）
+    let mut throttle = progress_sink.map(|sink| {
+        ProgressThrottle::new(progress_ref_id.clone(), stat.size_bytes, sink)
+    });
+    let land_result = land_source(
+        &source_path,
+        &proposed_target,
+        &stat,
+        |bytes_copied| {
+            if let Some(t) = throttle.as_mut() {
+                t.on_bytes(bytes_copied);
+            }
+        },
+    );
+    if let Err(e) = land_result {
+        // 失败路径：不发完成事件（throttle.finish 不会被调用），
+        // 由本命令的 Err 返回通知前端。
+        return Err(e);
+    }
+    // 完成事件：发最后一次 bytes == total（约定见 ProgressThrottle 文档）。
+    if let Some(t) = throttle.as_mut() {
+        t.finish();
+    }
 
     // move 语义：复制完成后删除源；删除失败回滚（删目标、报 COMMON_IO）
     if matches!(managed_action, ManagedAction::Move) {
@@ -1037,9 +1162,13 @@ pub async fn ref_list(
 ///
 /// 出参通过 `ManagedCreateResult` 的 untagged 序列化区分；
 /// 前端按是否存在 `kind == "managed_plan"` 字段判定阶段。
+///
+/// m3-3.3：`confirmed=true` 时通过 `managed_progress` 事件周期发射
+/// `{ refId, bytes, total }`；前端 `listen("managed_progress", ...)` 接收。
 #[tauri::command(rename_all = "camelCase")]
 #[allow(clippy::too_many_arguments)]
 pub async fn ref_create_managed(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     collection_id: String,
     name: String,
@@ -1054,6 +1183,12 @@ pub async fn ref_create_managed(
     confidentiality: Option<String>,
     indexed: Option<bool>,
 ) -> CmdResult<ManagedCreateResult> {
+    use tauri::Emitter;
+    // m3-3.3：进度事件发射闭包。emit 失败（如窗口已关闭）仅忽略，
+    // 不影响落地与写库主流程 —— 进度通知是 best-effort。
+    let mut emit_progress = |p: ManagedProgress| {
+        let _ = app.emit(MANAGED_PROGRESS_EVENT, p);
+    };
     create_managed(
         &state.pool,
         collection_id,
@@ -1068,6 +1203,7 @@ pub async fn ref_create_managed(
         lifecycle,
         confidentiality,
         indexed,
+        Some(&mut emit_progress),
     )
     .await
 }
@@ -2113,6 +2249,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect_err("should fail");
@@ -2131,6 +2268,7 @@ mod tests {
                 ManagedAction::Copy,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -2188,6 +2326,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("plan ok");
@@ -2226,6 +2365,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("plan ok");
@@ -2249,6 +2389,7 @@ mod tests {
                 ManagedAction::Copy,
                 Some("自定义名.pdf".into()),
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -2287,6 +2428,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect_err("should fail");
@@ -2305,6 +2447,7 @@ mod tests {
                 ManagedAction::Copy,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -2338,6 +2481,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect_err("should fail");
@@ -2360,6 +2504,7 @@ mod tests {
                 true,
                 Some("说明".into()),
                 Some(vec!["t1".into()]),
+                None,
                 None,
                 None,
                 None,
@@ -2410,6 +2555,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("move ok");
@@ -2438,6 +2584,7 @@ mod tests {
                 ManagedAction::Copy,
                 None,
                 true,
+                None,
                 None,
                 None,
                 None,
@@ -2567,6 +2714,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await;
                     let exit = std::time::SystemTime::now()
@@ -2620,6 +2768,7 @@ mod tests {
                         ManagedAction::Copy,
                         Some("same.pdf".into()),
                         true,
+                        None,
                         None,
                         None,
                         None,
@@ -2720,6 +2869,328 @@ mod tests {
             let v2 = serde_json::to_value(&created).expect("serialize");
             assert!(v2.get("kind").is_none() || v2["kind"].is_null());
             assert_eq!(v2["hosting"].as_str(), Some("managed"));
+        }
+    }
+
+    // ============================================================
+    // managed_progress 进度事件（m3-3.3）
+    // ============================================================
+    //
+    // 测试策略：直接调用 `create_managed` 并注入 Vec 收集闭包作为 progress_sink，
+    // 避免依赖 Tauri runtime；Tauri 命令层的 `app.emit` 已在 `ref_create_managed`
+    // 内部接入，由集成/手工验收覆盖。
+
+    mod progress_tests {
+        use super::*;
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        /// 在测试池中配置资源根目录（与 create_managed_tests.set_root_dir 相同）。
+        async fn set_root_dir(pool: &SqlitePool, root: &std::path::Path) {
+            let value_json = serde_json::to_string(&serde_json::Value::String(
+                root.to_string_lossy().to_string(),
+            ))
+            .expect("serialize root_dir");
+            let now = now_unix();
+            sqlx::query(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('root_dir', ?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+            )
+            .bind(&value_json)
+            .bind(now)
+            .execute(pool)
+            .await
+            .expect("insert root_dir");
+        }
+
+        fn locator_of(p: &std::path::Path) -> Locator {
+            Locator {
+                kind: "path".into(),
+                path: p.to_string_lossy().to_string(),
+            }
+        }
+
+        /// 构造一个指定大小的临时源文件 + 根目录 + collection。
+        /// 返回 (pool, cid, source_file, root_dir, events, _tmp)。
+        async fn setup_with_size(
+            size: usize,
+        ) -> (
+            SqlitePool,
+            String,
+            PathBuf,
+            PathBuf,
+            Arc<StdMutex<Vec<ManagedProgress>>>,
+            tempfile::TempDir,
+        ) {
+            let pool = setup().await;
+            let cid = make_collection(&pool).await;
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let source_file = tmp.path().join("src.bin");
+            // 用循环写入避免一次性大内存分配
+            let chunk = vec![0xABu8; 64 * 1024];
+            let mut remaining = size;
+            {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&source_file).expect("create src");
+                while remaining > 0 {
+                    let n = remaining.min(chunk.len());
+                    f.write_all(&chunk[..n]).expect("write");
+                    remaining -= n;
+                }
+                f.flush().expect("flush");
+            }
+            let root_dir = tmp.path().join("root");
+            std::fs::create_dir_all(&root_dir).expect("mkdir root");
+            set_root_dir(&pool, &root_dir).await;
+            let events: Arc<StdMutex<Vec<ManagedProgress>>> =
+                Arc::new(StdMutex::new(Vec::new()));
+            (pool, cid, source_file, root_dir, events, tmp)
+        }
+
+        /// 小文件（< 1 MiB）：按固化约定「完成时发 bytes == total」，
+        /// 加上首次 on_bytes 触发的事件，事件次数 ≤ 2。
+        #[tokio::test]
+        async fn progress_small_file_emits_at_most_two_events() {
+            let (pool, cid, source, _root, events, _tmp) = setup_with_size(1024).await;
+            let events_clone = Arc::clone(&events);
+            let mut sink = move |p: ManagedProgress| {
+                events_clone.lock().expect("lock").push(p);
+            };
+
+            let r = create_managed(
+                &pool,
+                cid,
+                "n".into(),
+                "document".into(),
+                locator_of(&source),
+                ManagedAction::Copy,
+                None,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut sink),
+            )
+            .await
+            .expect("create ok");
+            let _ = match r {
+                ManagedCreateResult::Created(r) => r,
+                _ => panic!("expected Created"),
+            };
+
+            let evts = events.lock().expect("lock");
+            assert!(
+                !evts.is_empty(),
+                "小文件至少发一次完成事件（bytes == total）"
+            );
+            assert!(
+                evts.len() <= 2,
+                "小文件事件次数应 ≤ 2（首次 + 完成），实际 {}",
+                evts.len()
+            );
+            // 最后一次必是 bytes == total
+            let last = evts.last().expect("last");
+            assert_eq!(last.bytes, last.total);
+            assert_eq!(last.total, 1024);
+        }
+
+        /// 大文件（3 MiB）：至少 2 次事件，最后一次 bytes == total。
+        #[tokio::test]
+        async fn progress_large_file_emits_multiple_events() {
+            let size: usize = 3 * 1024 * 1024; // 3 MiB
+            let (pool, cid, source, _root, events, _tmp) = setup_with_size(size).await;
+            let events_clone = Arc::clone(&events);
+            let mut sink = move |p: ManagedProgress| {
+                events_clone.lock().expect("lock").push(p);
+            };
+
+            let r = create_managed(
+                &pool,
+                cid,
+                "n".into(),
+                "document".into(),
+                locator_of(&source),
+                ManagedAction::Copy,
+                None,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut sink),
+            )
+            .await
+            .expect("create ok");
+            let _ = match r {
+                ManagedCreateResult::Created(r) => r,
+                _ => panic!("expected Created"),
+            };
+
+            let evts = events.lock().expect("lock");
+            assert!(
+                evts.len() >= 2,
+                "3 MiB 文件至少触发 2 次事件（1 MiB 步长 + 完成），实际 {}",
+                evts.len()
+            );
+            let last = evts.last().expect("last");
+            assert_eq!(last.bytes, last.total, "最后一次事件 bytes == total");
+            assert_eq!(last.total, size as u64);
+            // 字节数单调不减
+            for w in evts.windows(2) {
+                assert!(w[1].bytes >= w[0].bytes, "事件字节数应单调不减");
+            }
+        }
+
+        /// 事件载荷字段齐全：refId / bytes / total，且 camelCase 序列化。
+        #[tokio::test]
+        async fn progress_payload_has_camel_case_fields() {
+            let (pool, cid, source, _root, events, _tmp) = setup_with_size(1024).await;
+            let events_clone = Arc::clone(&events);
+            let mut sink = move |p: ManagedProgress| {
+                events_clone.lock().expect("lock").push(p);
+            };
+
+            let _ = create_managed(
+                &pool,
+                cid,
+                "n".into(),
+                "document".into(),
+                locator_of(&source),
+                ManagedAction::Copy,
+                None,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut sink),
+            )
+            .await
+            .expect("create ok");
+
+            let evts = events.lock().expect("lock");
+            assert!(!evts.is_empty());
+            let first = &evts[0];
+            // refId 是 UUID 格式（36 字符，含 4 个连字符）
+            assert_eq!(first.ref_id.len(), 36);
+            assert_eq!(first.ref_id.chars().filter(|c| *c == '-').count(), 4);
+            // total 与文件大小一致
+            assert_eq!(first.total, 1024);
+
+            // 序列化为 JSON 时是 camelCase
+            let v = serde_json::to_value(first).expect("serialize");
+            let obj = v.as_object().expect("object");
+            assert!(obj.contains_key("refId"), "应含 refId");
+            assert!(obj.contains_key("bytes"), "应含 bytes");
+            assert!(obj.contains_key("total"), "应含 total");
+            assert!(!obj.contains_key("ref_id"), "不应含 snake_case ref_id");
+        }
+
+        /// 失败路径：源文件在落地前被删，确认不发出 bytes == total 的完成事件。
+        ///
+        /// 模拟方式：先把源文件权限设为只读，落地过程中的目标创建会失败；
+        /// 或者更简单 —— 在 create_managed 调用前删除源文件，但 plan 阶段会
+        /// 提前返回 FS_PATH_NOT_FOUND，不会进入 confirmed 落地分支。
+        /// 因此本测试构造「源存在但目标父目录不可写」场景：让 land_source 失败。
+        #[tokio::test]
+        async fn progress_failure_path_does_not_emit_completion() {
+            let pool = setup().await;
+            let cid = make_collection(&pool).await;
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let source = tmp.path().join("src.bin");
+            std::fs::write(&source, vec![0xCDu8; 1024]).expect("write src");
+            let root_dir = tmp.path().join("root");
+            std::fs::create_dir_all(&root_dir).expect("mkdir root");
+            set_root_dir(&pool, &root_dir).await;
+
+            // 把 root_dir 设为只读，让 create_dir_all / File::create 失败
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&root_dir).expect("meta").permissions();
+                perms.set_mode(0o555); // r-xr-xr-x：不可写
+                std::fs::set_permissions(&root_dir, perms).expect("chmod");
+            }
+
+            let events: Arc<StdMutex<Vec<ManagedProgress>>> =
+                Arc::new(StdMutex::new(Vec::new()));
+            let events_clone = Arc::clone(&events);
+            let mut sink = move |p: ManagedProgress| {
+                events_clone.lock().expect("lock").push(p);
+            };
+
+            let result = create_managed(
+                &pool,
+                cid,
+                "n".into(),
+                "document".into(),
+                locator_of(&source),
+                ManagedAction::Copy,
+                None,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut sink),
+            )
+            .await;
+
+            // 恢复权限以便 tempdir 清理
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&root_dir).expect("meta").permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&root_dir, perms).expect("chmod restore");
+            }
+
+            // 落地应失败（权限不足）
+            let err = result.expect_err("应失败");
+            assert!(
+                err.code == "FS_PERMISSION_DENIED" || err.code == "COMMON_IO",
+                "错误码应为 FS_PERMISSION_DENIED 或 COMMON_IO，实际 {}",
+                err.code
+            );
+
+            // 关键断言：未发出 bytes == total 的完成事件
+            let evts = events.lock().expect("lock");
+            let has_completion = evts.iter().any(|p| p.bytes == p.total && p.total > 0);
+            assert!(
+                !has_completion,
+                "失败路径不应发出 bytes == total 的完成事件，实际事件: {:?}",
+                *evts
+            );
+        }
+
+        /// 序列化契约：ManagedProgress 的 camelCase 字段名固定。
+        #[test]
+        fn managed_progress_serializes_camel_case() {
+            let p = ManagedProgress {
+                ref_id: "00000000-0000-0000-0000-000000000000".into(),
+                bytes: 1024,
+                total: 2048,
+            };
+            let v = serde_json::to_value(&p).expect("serialize");
+            let obj = v.as_object().expect("object");
+            assert!(obj.contains_key("refId"));
+            assert!(obj.contains_key("bytes"));
+            assert!(obj.contains_key("total"));
+            assert!(!obj.contains_key("ref_id"));
+            assert_eq!(obj["bytes"].as_u64(), Some(1024));
+            assert_eq!(obj["total"].as_u64(), Some(2048));
+        }
+
+        /// 常量约定：事件名 / 节流步长固定（防止意外改动破坏前端契约）。
+        #[test]
+        fn progress_constants_are_fixed() {
+            assert_eq!(MANAGED_PROGRESS_EVENT, "managed_progress");
+            assert_eq!(PROGRESS_BYTE_STEP, 1 << 20);
+            assert_eq!(PROGRESS_TIME_STEP, Duration::from_millis(200));
         }
     }
 }
