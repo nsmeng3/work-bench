@@ -680,6 +680,242 @@ pub async fn disp_preview_cancel(preview_id: String) -> CmdResult<bool> {
 }
 
 // ============================================================
+// disp_destroy：销毁（永久删除文件 + 审计 + 物理删除引用行）
+// （m4-4.5 · 详细设计 §2.6 / §4.2 / §5 / §6.7）
+// ============================================================
+//
+// 契约（§2.6）：
+// - 入参：`{ refId, confirmText, confirmed: true }`
+// - 出参：`{ deletedRefId }`（二选一固化：返回被删除的 refId 便于前端清理缓存/路由；
+//   不返回 `()` 是因为前端需要明确知道哪条引用被销毁，避免依赖入参回显）
+// - 错误：`COMMON_CONFIRM_REQUIRED` / `FS_PERMISSION_DENIED` / `COMMON_IO`
+//   / `COMMON_NOT_FOUND` / `COMMON_FORBIDDEN`
+//
+// 关键约束：
+// - **confirmText 强校验**：从 DB 读出当前 `resource_reference.name`，与入参
+//   `confirmText` **逐字符比对**（`String == String`）；不一致立即返回
+//   `COMMON_CONFIRM_REQUIRED`，**不做任何写操作**（不写文件、不写库）。
+// - **confirmed 必须为 true**：否则同样返回 `COMMON_CONFIRM_REQUIRED`。
+// - **互斥**：复用 `crate::reference::managed_write_lock()`（M3-3.2 落地 /
+//   M4-4.8 根目录迁移 / 本销毁共用同一把 `MANAGED_WRITE_LOCK`，详细设计 §5
+//   「多步写操作互斥串行化」）。临界区内含 `.await`（tokio::fs + sqlx 事务），
+//   与 reference.rs 的异步 Mutex 选型一致。
+// - **执行顺序**：
+//   1. 读 DB 拿到 name / disposition / locator_json 快照；
+//   2. confirmText / confirmed 校验（失败不写任何数据）；
+//   3. 加全局互斥锁；
+//   4. `tokio::fs::remove_file` / `remove_dir_all` 永久删除目标（不经回收站）；
+//      文件删除失败 → 不写库，直接返回错误；
+//   5. 文件删除成功后开事务：INSERT disposition_audit（action='destroy'）
+//      + DELETE resource_reference 行；
+//   6. 写库失败：永久删除无法回滚，返回 `COMMON_DB` 并 `eprintln!` 记录
+//      已删除路径与 refId，**不**尝试恢复文件（best-effort 日志补偿）。
+// - **能力规则**：`compute_capabilities.destroy` 始终为 true（兜底），
+//   因此本命令对任意 disposition（none / archived / deleted）均允许销毁，
+//   不返回 `COMMON_FORBIDDEN`。已 deleted 的引用再销毁：允许（固化注释）——
+//   此时文件可能已被外部清空，`tokio::fs::remove_*` 对不存在路径返回
+//   NotFound，按 `COMMON_NOT_FOUND` 处理；调用方需先通过 preview 确认。
+// - **审计字段**（§6.7）：
+//   - `id`：UUID v4
+//   - `ref_id` / `ref_name`：当前引用 id 与 name 快照
+//   - `action`：`'destroy'`
+//   - `locator_snapshot`：当前 `locator_json` 完整快照（含被删路径）
+//   - `actor`：`'local_user'`（`write_audit` 内固定）
+//   - `note`：填入 JSON 字符串 `{"fileCount":N,"totalBytes":M,"isDir":B}`，
+//     来自销毁前的同步统计（best-effort，统计失败则填 NULL）
+//   - `at`：Unix 秒
+// - **引用删除**：`DELETE FROM resource_reference WHERE id = ?`（物理删除；
+//   `disposition_audit` 无外键约束，审计独立存活，§6.7）。
+
+/// `disp_destroy` 出参（契约 §2.6 二选一固化：返回 `deletedRefId`）。
+///
+/// 序列化为 camelCase：`{ "deletedRefId": "..." }`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DispDestroyResult {
+    pub deleted_ref_id: String,
+}
+
+/// 销毁前的同步统计（best-effort）：返回 `(is_dir, file_count, total_bytes)`。
+///
+/// 复用 preview 的 `stat_target`，但**不注册取消**（销毁是同步短操作，
+/// 且契约未要求可取消）。统计失败仅影响 note 字段，不阻塞销毁。
+fn stat_for_destroy(path: &Path) -> CmdResult<(bool, u64, u64)> {
+    let flag = AtomicBool::new(false);
+    stat_target(path, &flag)
+}
+
+/// `disp_destroy` 业务函数：永久删除文件 + 写审计 + 物理删除引用行。
+///
+/// 详见模块级注释（m4-4.5）。
+pub async fn destroy(
+    pool: &SqlitePool,
+    ref_id: String,
+    confirm_text: String,
+    confirmed: bool,
+) -> CmdResult<DispDestroyResult> {
+    // 1) 读 DB：name / disposition / locator_json 快照。
+    let row = sqlx::query(
+        "SELECT name, disposition, locator_json FROM resource_reference WHERE id = ?",
+    )
+    .bind(&ref_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from)?
+    .ok_or_else(|| AppError::not_found(format!("资源引用不存在: {}", ref_id)))?;
+
+    let name: String = row.try_get("name").map_err(AppError::from)?;
+    let _disposition: String = row.try_get("disposition").map_err(AppError::from)?;
+    let locator_json: Option<String> = row.try_get("locator_json").map_err(AppError::from)?;
+
+    // 2) confirmText / confirmed 强校验（**不做任何写操作**）。
+    if !confirmed {
+        return Err(AppError::new(
+            "COMMON_CONFIRM_REQUIRED",
+            "confirmed 必须为 true",
+        ));
+    }
+    // 逐字符比对：Rust `String == String` 即按字节序逐字符比较。
+    if confirm_text != name {
+        return Err(AppError::new(
+            "COMMON_CONFIRM_REQUIRED",
+            format!("confirmText 与资源名称不一致（期望: {}）", name),
+        ));
+    }
+
+    // 3) 解析目标路径（locator_json 必须存在且为 kind=path）。
+    let locator_str = locator_json
+        .as_deref()
+        .ok_or_else(|| AppError::db("locator_json 为空".to_string()))?;
+    let target_path = parse_target_path(locator_str)?;
+
+    // 4) 销毁前 best-effort 统计（用于审计 note）；失败仅记日志，不阻塞。
+    let stat_note: Option<String> = match stat_for_destroy(&target_path) {
+        Ok((is_dir, file_count, total_bytes)) => Some(
+            serde_json::json!({
+                "isDir": is_dir,
+                "fileCount": file_count,
+                "totalBytes": total_bytes,
+            })
+            .to_string(),
+        ),
+        Err(e) => {
+            eprintln!(
+                "[disp_destroy] 销毁前统计失败（继续销毁） ref_id={} path={} err={}",
+                ref_id,
+                target_path.display(),
+                e
+            );
+            None
+        }
+    };
+
+    // 5) 加全局互斥锁（详细设计 §5：托管落地 / 根目录迁移 / 销毁串行化）。
+    //    `managed_write_lock()` 返回 tokio 异步 Mutex（与 reference.rs 的
+    //    `lock().await` 用法一致），允许临界区内含 `.await`（tokio::fs + sqlx）。
+    let _guard = crate::reference::managed_write_lock().lock().await;
+
+    // 6) 永久删除目标（不经回收站）。
+    //    - 单文件 / 符号链接 → remove_file
+    //    - 目录 → remove_dir_all（递归删除整棵子树）
+    //    失败 → 不写库，直接返回错误。
+    let meta = tokio::fs::symlink_metadata(&target_path)
+        .await
+        .map_err(|e| map_destroy_fs_err("读取目标元数据失败", &target_path, e))?;
+    let remove_result: std::io::Result<()> = if meta.is_dir() {
+        tokio::fs::remove_dir_all(&target_path).await
+    } else {
+        tokio::fs::remove_file(&target_path).await
+    };
+    if let Err(e) = remove_result {
+        return Err(map_destroy_fs_err("永久删除失败", &target_path, e));
+    }
+
+    // 7) 文件已删除，开事务写审计 + DELETE 引用行。
+    //    写库失败：永久删除无法回滚，返回 COMMON_DB 并 best-effort 日志补偿。
+    let mut tx = pool.begin().await.map_err(AppError::from)?;
+    if let Err(e) = write_audit(
+        &mut tx,
+        &ref_id,
+        &name,
+        "destroy",
+        Some(locator_str),
+        stat_note.as_deref(),
+    )
+    .await
+    {
+        let _ = tx.rollback().await;
+        eprintln!(
+            "[disp_destroy] 审计写入失败，文件已永久删除 ref_id={} path={} err={}",
+            ref_id,
+            target_path.display(),
+            e
+        );
+        return Err(AppError::db(format!(
+            "审计写入失败（文件已删除，无法回滚）: {}",
+            e
+        )));
+    }
+    if let Err(e) = sqlx::query("DELETE FROM resource_reference WHERE id = ?")
+        .bind(&ref_id)
+        .execute(&mut *tx)
+        .await
+    {
+        let _ = tx.rollback().await;
+        eprintln!(
+            "[disp_destroy] 引用行删除失败，文件已永久删除 ref_id={} path={} err={}",
+            ref_id,
+            target_path.display(),
+            e
+        );
+        return Err(AppError::db(format!(
+            "引用行删除失败（文件已删除，无法回滚）: {}",
+            e
+        )));
+    }
+    if let Err(e) = tx.commit().await {
+        eprintln!(
+            "[disp_destroy] 事务提交失败，文件已永久删除 ref_id={} path={} err={}",
+            ref_id,
+            target_path.display(),
+            e
+        );
+        return Err(AppError::db(format!(
+            "事务提交失败（文件已删除，无法回滚）: {}",
+            e
+        )));
+    }
+
+    Ok(DispDestroyResult {
+        deleted_ref_id: ref_id,
+    })
+}
+
+/// destroy 专用 FS 错误映射：路径不存在 → `COMMON_NOT_FOUND`；
+/// 权限不足 → `FS_PERMISSION_DENIED`；其他 → `COMMON_IO`。
+fn map_destroy_fs_err(context: &str, path: &Path, err: std::io::Error) -> AppError {
+    let msg = format!("{} {}: {}", context, path.display(), err);
+    match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            AppError::not_found(format!("目标路径不存在: {}", path.display()))
+        }
+        std::io::ErrorKind::PermissionDenied => AppError::new("FS_PERMISSION_DENIED", msg),
+        _ => AppError::io(msg),
+    }
+}
+
+/// `disp_destroy` Tauri 命令。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn disp_destroy(
+    state: tauri::State<'_, crate::AppState>,
+    ref_id: String,
+    confirm_text: String,
+    confirmed: bool,
+) -> CmdResult<DispDestroyResult> {
+    destroy(&state.pool, ref_id, confirm_text, confirmed).await
+}
+
+// ============================================================
 // 单元测试
 // ============================================================
 
@@ -1423,5 +1659,279 @@ mod tests {
         assert!(w.contains("销毁后不可恢复"));
         let w2 = build_warning(false, 1, 100);
         assert!(w2.contains("销毁后不可恢复"));
+    }
+
+    // ---------- m4-4.5 · disp_destroy ----------
+
+    /// 读取 reference 行数（用于验证物理删除）。
+    async fn ref_count(pool: &SqlitePool, ref_id: &str) -> i64 {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM resource_reference WHERE id = ?")
+            .bind(ref_id)
+            .fetch_one(pool)
+            .await
+            .expect("count reference");
+        n
+    }
+
+    /// 插入 reference，name 字段可定制；返回 id。
+    async fn make_reference_named(
+        pool: &SqlitePool,
+        collection_id: &str,
+        disposition: &str,
+        name: &str,
+        path: &std::path::Path,
+    ) -> String {
+        let id = Uuid::new_v4().to_string();
+        let now = now_unix();
+        let locator_json = serde_json::json!({
+            "kind": "path",
+            "path": path.to_string_lossy(),
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO resource_reference \
+             (id, collection_id, source_id, name, type, hosting, locator_json, \
+              description, lifecycle, confidentiality, indexed, disposition, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 'code', 'external', ?, \
+              NULL, 'active', 'internal', 1, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(collection_id)
+        .bind(DEFAULT_SOURCE_ID)
+        .bind(name)
+        .bind(&locator_json)
+        .bind(disposition)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert reference named");
+        id
+    }
+
+    #[tokio::test]
+    async fn destroy_err_ref_not_found() {
+        let pool = setup().await;
+        let err = destroy(&pool, "no-such-id".into(), "whatever".into(), true)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn destroy_err_confirmed_false() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, b"aaa").expect("write");
+        let rid = make_reference_named(&pool, &cid, "none", "myfile", &file).await;
+
+        let err = destroy(&pool, rid.clone(), "myfile".into(), false)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_CONFIRM_REQUIRED");
+        // 文件未动、库未动
+        assert!(file.exists());
+        assert_eq!(ref_count(&pool, &rid).await, 1);
+        assert_eq!(audit_count(&pool, &rid).await, 0);
+    }
+
+    #[tokio::test]
+    async fn destroy_err_confirm_text_mismatch() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, b"aaa").expect("write");
+        let rid = make_reference_named(&pool, &cid, "none", "myfile", &file).await;
+
+        // 大小写不一致也算不匹配（逐字符比对）
+        let err = destroy(&pool, rid.clone(), "MYFILE".into(), true)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_CONFIRM_REQUIRED");
+        // 文件未动、库未动
+        assert!(file.exists());
+        assert_eq!(ref_count(&pool, &rid).await, 1);
+        assert_eq!(audit_count(&pool, &rid).await, 0);
+    }
+
+    #[tokio::test]
+    async fn destroy_single_file_ok() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("hello.txt");
+        std::fs::write(&file, b"hello world").expect("write");
+        let rid = make_reference_named(&pool, &cid, "none", "hello", &file).await;
+
+        let r = destroy(&pool, rid.clone(), "hello".into(), true)
+            .await
+            .expect("destroy ok");
+        assert_eq!(r.deleted_ref_id, rid);
+
+        // 文件消失
+        assert!(!file.exists());
+        // 引用行物理删除
+        assert_eq!(ref_count(&pool, &rid).await, 0);
+        // 审计写入
+        assert_eq!(audit_count(&pool, &rid).await, 1);
+        let row = sqlx::query(
+            "SELECT ref_name, action, locator_snapshot, actor, note, at \
+             FROM disposition_audit WHERE ref_id = ?",
+        )
+        .bind(&rid)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch audit");
+        let ref_name: String = row.try_get("ref_name").expect("ref_name");
+        let action: String = row.try_get("action").expect("action");
+        let locator: String = row.try_get("locator_snapshot").expect("locator");
+        let actor: String = row.try_get("actor").expect("actor");
+        let note: Option<String> = row.try_get("note").expect("note");
+        let at: i64 = row.try_get("at").expect("at");
+
+        assert_eq!(ref_name, "hello");
+        assert_eq!(action, "destroy");
+        // locator_snapshot 含被删路径
+        assert!(locator.contains("hello.txt"));
+        assert_eq!(actor, "local_user");
+        // note 含 fileCount / totalBytes / isDir
+        let note_str = note.expect("note should be present");
+        let note_json: serde_json::Value = serde_json::from_str(&note_str).expect("note json");
+        assert_eq!(note_json["fileCount"].as_u64(), Some(1));
+        assert_eq!(note_json["totalBytes"].as_u64(), Some(11));
+        assert_eq!(note_json["isDir"].as_bool(), Some(false));
+        assert!(at > 0);
+    }
+
+    #[tokio::test]
+    async fn destroy_directory_nested_ok() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().join("proj");
+        std::fs::create_dir(&root).expect("mkdir");
+        std::fs::write(root.join("a.txt"), b"aaa").expect("a");
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).expect("mkdir sub");
+        std::fs::write(sub.join("b.txt"), b"bbbbb").expect("b");
+        std::fs::write(sub.join("c.txt"), b"c").expect("c");
+        let rid = make_reference_named(&pool, &cid, "none", "proj", &root).await;
+
+        let r = destroy(&pool, rid.clone(), "proj".into(), true)
+            .await
+            .expect("destroy ok");
+        assert_eq!(r.deleted_ref_id, rid);
+
+        // 目录整棵消失
+        assert!(!root.exists());
+        assert!(!sub.exists());
+        // 引用行物理删除
+        assert_eq!(ref_count(&pool, &rid).await, 0);
+        // 审计：fileCount=3, totalBytes=3+5+1=9, isDir=true
+        let row = sqlx::query(
+            "SELECT action, note FROM disposition_audit WHERE ref_id = ?",
+        )
+        .bind(&rid)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch audit");
+        let action: String = row.try_get("action").expect("action");
+        let note: Option<String> = row.try_get("note").expect("note");
+        assert_eq!(action, "destroy");
+        let note_json: serde_json::Value =
+            serde_json::from_str(&note.expect("note")).expect("note json");
+        assert_eq!(note_json["fileCount"].as_u64(), Some(3));
+        assert_eq!(note_json["totalBytes"].as_u64(), Some(9));
+        assert_eq!(note_json["isDir"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn destroy_disposition_deleted_allowed() {
+        // 能力规则固化注释：`compute_capabilities.destroy` 始终为 true（兜底），
+        // 因此对 disposition='deleted' 的引用再次销毁是**允许**的。
+        // 场景：软删除后用户仍想彻底清空回收站语义下的源文件。
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("trashed.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let rid = make_reference_named(&pool, &cid, "deleted", "trashed", &file).await;
+
+        let r = destroy(&pool, rid.clone(), "trashed".into(), true)
+            .await
+            .expect("destroy deleted ok");
+        assert_eq!(r.deleted_ref_id, rid);
+        assert!(!file.exists());
+        assert_eq!(ref_count(&pool, &rid).await, 0);
+        assert_eq!(audit_count(&pool, &rid).await, 1);
+    }
+
+    #[tokio::test]
+    async fn destroy_err_target_externally_deleted() {
+        // 文件已被外部删除：destroy 在 remove 阶段返回 COMMON_NOT_FOUND，
+        // 引用行**保持不动**（文件删除失败不写库）。
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("gone.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let rid = make_reference_named(&pool, &cid, "none", "gone", &file).await;
+        std::fs::remove_file(&file).expect("external remove");
+
+        let err = destroy(&pool, rid.clone(), "gone".into(), true)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+        // 库未动
+        assert_eq!(ref_count(&pool, &rid).await, 1);
+        assert_eq!(audit_count(&pool, &rid).await, 0);
+    }
+
+    #[tokio::test]
+    async fn destroy_audit_queryable_after_ref_deleted() {
+        // 销毁后引用行已删，但审计仍可通过 raw SQL 按 ref_id 查到（§6.7 无外键约束）。
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("audit.txt");
+        std::fs::write(&file, b"audit").expect("write");
+        let rid = make_reference_named(&pool, &cid, "none", "audit", &file).await;
+
+        destroy(&pool, rid.clone(), "audit".into(), true)
+            .await
+            .expect("destroy ok");
+
+        // 引用行已删
+        assert_eq!(ref_count(&pool, &rid).await, 0);
+        // 审计仍可查（raw SQL 模拟 4.6 disp_audit_list 行为）
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT ref_id, action FROM disposition_audit WHERE ref_id = ? ORDER BY rowid ASC",
+        )
+        .bind(&rid)
+        .fetch_all(&pool)
+        .await
+        .expect("list audit");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, rid);
+        assert_eq!(rows[0].1, "destroy");
+    }
+
+    #[tokio::test]
+    async fn destroy_serializes_camel_case() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("s.txt");
+        std::fs::write(&file, b"s").expect("write");
+        let rid = make_reference_named(&pool, &cid, "none", "s", &file).await;
+
+        let r = destroy(&pool, rid, "s".into(), true).await.expect("ok");
+        let v = serde_json::to_value(&r).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert!(obj.contains_key("deletedRefId"));
+        assert!(!obj.contains_key("deleted_ref_id"));
     }
 }
