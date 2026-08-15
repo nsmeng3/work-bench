@@ -3,3 +3,4 @@ export * from "./errors";
 export * from "./space";
 export * from "./collection";
 export * from "./reference";
+export * from "./query";
