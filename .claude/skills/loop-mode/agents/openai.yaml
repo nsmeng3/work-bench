@@ -1,0 +1,4 @@
+interface:
+  display_name: "Loop Mode"
+  short_description: "在隔离 worktree 中编排、验收并推进任务循环"
+  default_prompt: "Use $loop-mode to start an isolated implementation and verification loop for this project."
