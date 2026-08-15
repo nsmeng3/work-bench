@@ -1,10 +1,10 @@
 import { useState, useEffect, useCallback } from "react";
 import { Button, Modal, Segmented, Space as AntSpace, Table, Tag, Tooltip, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { PlusOutlined } from "@ant-design/icons";
-import type { Space } from "../api";
-import { spaceList, spaceArchive, spaceRestore, toApiError } from "../api";
-import { SpaceDialog } from "../components/SpaceDialog";
+import { ArrowLeftOutlined, PlusOutlined } from "@ant-design/icons";
+import type { Collection, Space } from "../api";
+import { collectionList, collectionArchive, collectionRestore, toApiError } from "../api";
+import { CollectionDialog } from "../components/CollectionDialog";
 
 type StatusFilter = "active" | "archived";
 
@@ -13,27 +13,27 @@ function formatUnixSeconds(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
 }
 
-interface SpacePageProps {
-  /** 进入某空间的资源集列表 */
-  onEnterSpace: (space: Space) => void;
+interface CollectionPageProps {
+  space: Space;
+  onBack: () => void;
 }
 
-export function SpacePage({ onEnterSpace }: SpacePageProps) {
-  const [spaces, setSpaces] = useState<Space[]>([]);
+export function CollectionPage({ space, onBack }: CollectionPageProps) {
+  const [collections, setCollections] = useState<Collection[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("active");
 
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [editingSpace, setEditingSpace] = useState<Space | undefined>(undefined);
+  const [editingCollection, setEditingCollection] = useState<Collection | undefined>(undefined);
 
   const [messageApi, messageContextHolder] = message.useMessage();
   const [modalApi, modalContextHolder] = Modal.useModal();
 
-  const fetchSpaces = useCallback(async () => {
+  const fetchCollections = useCallback(async () => {
     setLoading(true);
     try {
-      const result = await spaceList({ status: statusFilter });
-      setSpaces(result);
+      const result = await collectionList({ spaceId: space.id, status: statusFilter });
+      setCollections(result);
     } catch (err) {
       const apiErr = toApiError(err);
       messageApi.error({
@@ -43,34 +43,34 @@ export function SpacePage({ onEnterSpace }: SpacePageProps) {
     } finally {
       setLoading(false);
     }
-  }, [statusFilter, messageApi]);
+  }, [space.id, statusFilter, messageApi]);
 
   useEffect(() => {
-    fetchSpaces();
-  }, [fetchSpaces]);
+    fetchCollections();
+  }, [fetchCollections]);
 
   function handleCreate() {
-    setEditingSpace(undefined);
+    setEditingCollection(undefined);
     setDialogOpen(true);
   }
 
-  function handleEdit(space: Space) {
-    setEditingSpace(space);
+  function handleEdit(collection: Collection) {
+    setEditingCollection(collection);
     setDialogOpen(true);
   }
 
-  function handleArchiveClick(space: Space) {
+  function handleArchiveClick(collection: Collection) {
     modalApi.confirm({
-      title: "归档空间",
-      content: `确定要归档空间"${space.name}"吗？归档后不可编辑，但可随时恢复。`,
+      title: "归档资源集",
+      content: `确定要归档资源集"${collection.name}"吗？归档后不可编辑，但可随时恢复；不影响其下已关联的资源。`,
       okText: "归档",
       okButtonProps: { danger: true },
       cancelText: "取消",
       async onOk() {
         try {
-          await spaceArchive({ id: space.id });
+          await collectionArchive({ id: collection.id });
           messageApi.success("已归档");
-          fetchSpaces();
+          fetchCollections();
         } catch (err) {
           const apiErr = toApiError(err);
           messageApi.error(apiErr.message);
@@ -80,51 +80,51 @@ export function SpacePage({ onEnterSpace }: SpacePageProps) {
     });
   }
 
-  async function handleRestore(space: Space) {
+  async function handleRestore(collection: Collection) {
     try {
-      await spaceRestore({ id: space.id });
+      await collectionRestore({ id: collection.id });
       messageApi.success("已恢复");
-      fetchSpaces();
+      fetchCollections();
     } catch (err) {
       const apiErr = toApiError(err);
       messageApi.error(apiErr.message);
     }
   }
 
-  const columns: ColumnsType<Space> = [
+  const columns: ColumnsType<Collection> = [
     {
       title: "名称",
       dataIndex: "name",
       key: "name",
-      render: (_, record) => (
-        <AntSpace>
-          <span
-            style={{
-              display: "inline-block",
-              width: 12,
-              height: 12,
-              borderRadius: "50%",
-              backgroundColor: record.color || "#4A90D9",
-            }}
-          />
-          <a onClick={() => onEnterSpace(record)} style={{ fontWeight: 600 }}>
-            {record.name}
-          </a>
-        </AntSpace>
-      ),
+      render: (_, record) => <span style={{ fontWeight: 600 }}>{record.name}</span>,
     },
     {
-      title: "描述",
-      dataIndex: "description",
-      key: "description",
+      title: "简介",
+      dataIndex: "summary",
+      key: "summary",
       render: (text?: string) => text || <span style={{ color: "#999" }}>—</span>,
+    },
+    {
+      title: "标签",
+      dataIndex: "tags",
+      key: "tags",
+      render: (tags?: string[]) =>
+        tags && tags.length > 0 ? (
+          <AntSpace size={4} wrap>
+            {tags.map((t) => (
+              <Tag key={t}>{t}</Tag>
+            ))}
+          </AntSpace>
+        ) : (
+          <span style={{ color: "#999" }}>—</span>
+        ),
     },
     {
       title: "状态",
       dataIndex: "status",
       key: "status",
       width: 100,
-      render: (status: Space["status"]) =>
+      render: (status: Collection["status"]) =>
         status === "active" ? <Tag color="success">活跃</Tag> : <Tag color="warning">已归档</Tag>,
     },
     {
@@ -137,17 +137,12 @@ export function SpacePage({ onEnterSpace }: SpacePageProps) {
     {
       title: "操作",
       key: "actions",
-      width: 220,
+      width: 160,
       render: (_, record) => (
         <AntSpace>
-          <Tooltip title="进入资源集">
-            <Button size="small" type="link" onClick={() => onEnterSpace(record)}>
-              进入
-            </Button>
-          </Tooltip>
           {record.status === "active" ? (
             <>
-              <Tooltip title="编辑空间">
+              <Tooltip title="编辑资源集">
                 <Button size="small" onClick={() => handleEdit(record)}>
                   编辑
                 </Button>
@@ -181,7 +176,14 @@ export function SpacePage({ onEnterSpace }: SpacePageProps) {
           marginBottom: 16,
         }}
       >
-        <h1 style={{ fontSize: 20, margin: 0 }}>空间</h1>
+        <AntSpace>
+          <Button icon={<ArrowLeftOutlined />} onClick={onBack}>
+            返回空间
+          </Button>
+          <h1 style={{ fontSize: 20, margin: 0 }}>
+            {space.name} · 资源集
+          </h1>
+        </AntSpace>
         <AntSpace>
           <Segmented
             value={statusFilter}
@@ -191,29 +193,37 @@ export function SpacePage({ onEnterSpace }: SpacePageProps) {
               { label: "已归档", value: "archived" },
             ]}
           />
-          <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>
-            创建空间
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={handleCreate}
+            disabled={space.status === "archived"}
+          >
+            创建资源集
           </Button>
         </AntSpace>
       </div>
 
-      <Table<Space>
+      <Table<Collection>
         rowKey="id"
         loading={loading}
-        dataSource={spaces}
+        dataSource={collections}
         columns={columns}
         pagination={false}
         locale={{
           emptyText:
-            statusFilter === "active" ? "暂无活跃空间，点击上方按钮创建。" : "暂无已归档空间。",
+            statusFilter === "active"
+              ? "暂无活跃资源集，点击上方按钮创建。"
+              : "暂无已归档资源集。",
         }}
       />
 
-      <SpaceDialog
+      <CollectionDialog
         open={dialogOpen}
-        space={editingSpace}
+        spaceId={space.id}
+        collection={editingCollection}
         onClose={() => setDialogOpen(false)}
-        onSaved={fetchSpaces}
+        onSaved={fetchCollections}
       />
     </div>
   );
