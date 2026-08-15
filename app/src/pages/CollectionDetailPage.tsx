@@ -12,7 +12,7 @@ import {
   Typography,
   message,
 } from "antd";
-import { ArrowLeftOutlined, ReloadOutlined } from "@ant-design/icons";
+import { ArrowLeftOutlined, PlusOutlined, ReloadOutlined } from "@ant-design/icons";
 import type {
   Collection,
   CollectionDetail,
@@ -22,6 +22,7 @@ import type {
   Space,
 } from "../api";
 import { collectionGet, toApiError } from "../api";
+import { ReferenceCreateDialog } from "../components/ReferenceCreateDialog";
 
 const { Text, Paragraph } = Typography;
 
@@ -78,6 +79,7 @@ interface CollectionDetailPageProps {
 export function CollectionDetailPage({ space, collection, onBack }: CollectionDetailPageProps) {
   const [detail, setDetail] = useState<CollectionDetail | null>(null);
   const [loading, setLoading] = useState(true);
+  const [createOpen, setCreateOpen] = useState(false);
   const [messageApi, messageContextHolder] = message.useMessage();
 
   const fetchDetail = useCallback(async () => {
@@ -178,9 +180,19 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
             {space.name} · {collection.name}
           </h1>
         </AntSpace>
-        <Button icon={<ReloadOutlined />} onClick={fetchDetail} loading={loading}>
-          刷新
-        </Button>
+        <AntSpace>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={() => setCreateOpen(true)}
+            disabled={detail?.status === "archived"}
+          >
+            添加引用
+          </Button>
+          <Button icon={<ReloadOutlined />} onClick={fetchDetail} loading={loading}>
+            刷新
+          </Button>
+        </AntSpace>
       </div>
 
       {loading && !detail ? (
@@ -258,6 +270,13 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
       ) : (
         <Empty description="未加载到资源集详情" />
       )}
+
+      <ReferenceCreateDialog
+        open={createOpen}
+        collectionId={collection.id}
+        onClose={() => setCreateOpen(false)}
+        onCreated={fetchDetail}
+      />
     </div>
   );
 }

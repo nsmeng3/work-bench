@@ -13,6 +13,7 @@ import type {
   Reference,
   ReferenceType,
   ReferenceWithHealth,
+  RefCreateExternalInput,
 } from "./types";
 
 /**
@@ -246,7 +247,7 @@ function makeRef(partial: Partial<Reference> & Pick<Reference, "id" | "collectio
 }
 
 /** 种子引用：覆盖六类型中的 code/document/data 三类有数据，其余为空；三种 health 各至少一条 */
-const seedReferences: ReferenceWithHealth[] = [
+let seedReferences: ReferenceWithHealth[] = [
   // code
   {
     ref: makeRef({
@@ -318,3 +319,73 @@ function buildReferencesByType(collectionId: string): Record<ReferenceType, Refe
   }
   return grouped;
 }
+
+/* ---------------- 引用 mock API ---------------- */
+
+let mockRefSeq = 100;
+
+function makeRefId(): string {
+  return `mock-ref-${++mockRefSeq}`;
+}
+
+export const mockReferenceApi = {
+  /**
+   * 仅关联创建引用 — §2.5 ref_create_external。
+   * mock 不真正访问文件系统，但模拟契约错误：
+   * - 路径为空 / 非绝对路径 → COMMON_INVALID_PARAM
+   * - 路径包含 "missing" → FS_PATH_NOT_FOUND（便于联调错误分支）
+   */
+  ref_create_external(input: RefCreateExternalInput): Reference {
+    const collection = collectionStore.find((c) => c.id === input.collectionId);
+    if (!collection) {
+      throw { code: "COMMON_NOT_FOUND", message: "资源集不存在", retryable: false };
+    }
+    if (!input.name || input.name.trim() === "") {
+      throw { code: "COMMON_INVALID_PARAM", message: "名称不能为空", retryable: false };
+    }
+    if (input.locator.kind !== "path") {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: "仅支持 path 类型 locator",
+        retryable: false,
+      };
+    }
+    const path = input.locator.path;
+    if (!path || !path.startsWith("/")) {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: "路径必须为绝对路径",
+        retryable: false,
+      };
+    }
+    if (path.includes("missing")) {
+      throw {
+        code: "FS_PATH_NOT_FOUND",
+        message: `路径不存在：${path}`,
+        details: { path },
+        retryable: false,
+      };
+    }
+
+    const now = unixNow();
+    const ref: Reference = {
+      id: makeRefId(),
+      collectionId: input.collectionId,
+      sourceId: "mock-source-local",
+      name: input.name.trim(),
+      type: input.type,
+      hosting: "external",
+      locator: input.locator,
+      description: input.description,
+      tags: input.tags,
+      lifecycle: input.lifecycle ?? "active",
+      confidentiality: input.confidentiality ?? "internal",
+      indexed: input.indexed ?? true,
+      disposition: "none",
+      createdAt: now,
+      updatedAt: now,
+    };
+    seedReferences = [...seedReferences, { ref, health: "unknown" }];
+    return ref;
+  },
+};
