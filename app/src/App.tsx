@@ -10,6 +10,8 @@ import {
 import { AppShell } from "./components/AppShell";
 import type { NavItem } from "./components/AppShell";
 import { SpacePage } from "./pages/SpacePage";
+import { CollectionPage } from "./pages/CollectionPage";
+import type { Space } from "./api";
 import "./styles/theme.css";
 
 const navItems: NavItem[] = [
@@ -21,6 +23,14 @@ const navItems: NavItem[] = [
 
 function App() {
   const [activeNav, setActiveNav] = useState("spaces");
+  /** 当前下钻进入的空间；null 表示在空间列表页 */
+  const [currentSpace, setCurrentSpace] = useState<Space | null>(null);
+
+  function handleNavChange(key: string) {
+    setActiveNav(key);
+    // 切换主导航时退出下钻
+    setCurrentSpace(null);
+  }
 
   return (
     <ConfigProvider
@@ -34,8 +44,13 @@ function App() {
       }}
     >
       <AntApp>
-        <AppShell navItems={navItems} activeNav={activeNav} onNavChange={setActiveNav}>
-          {activeNav === "spaces" && <SpacePage />}
+        <AppShell navItems={navItems} activeNav={activeNav} onNavChange={handleNavChange}>
+          {activeNav === "spaces" &&
+            (currentSpace ? (
+              <CollectionPage space={currentSpace} onBack={() => setCurrentSpace(null)} />
+            ) : (
+              <SpacePage onEnterSpace={setCurrentSpace} />
+            ))}
         </AppShell>
       </AntApp>
     </ConfigProvider>

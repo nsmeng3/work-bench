@@ -1,4 +1,15 @@
-import type { Space, SpaceCreateInput, SpaceUpdateInput, SpaceIdInput, SpaceListInput } from "./types";
+import type {
+  Space,
+  SpaceCreateInput,
+  SpaceUpdateInput,
+  SpaceIdInput,
+  SpaceListInput,
+  Collection,
+  CollectionCreateInput,
+  CollectionUpdateInput,
+  CollectionIdInput,
+  CollectionListInput,
+} from "./types";
 
 /**
  * Mock 数据 — 形状与契约逐字段一致（§2.3 / §3.2 space 表）。
@@ -96,6 +107,100 @@ export const mockSpaceApi = {
     if (idx === -1) throw { code: "COMMON_NOT_FOUND", message: "空间不存在", retryable: false };
     const updated: Space = { ...store[idx], status: "active", updatedAt: unixNow() };
     store[idx] = updated;
+    return updated;
+  },
+};
+
+/* ---------------- 资源集 mock ---------------- */
+
+let mockCollectionSeq = 100;
+
+function makeCollectionId(): string {
+  return `mock-collection-${++mockCollectionSeq}`;
+}
+
+const seedCollections: Collection[] = [
+  {
+    id: "mock-collection-1",
+    spaceId: "mock-space-1",
+    name: "工作台前端",
+    summary: "资源管理工作台前端代码与文档",
+    tags: ["code", "frontend"],
+    status: "active",
+    createdAt: 1754038920,
+    updatedAt: 1754038920,
+  },
+  {
+    id: "mock-collection-2",
+    spaceId: "mock-space-1",
+    name: "设计文档",
+    summary: "概要/详细设计说明书",
+    tags: ["doc"],
+    status: "active",
+    createdAt: 1754038980,
+    updatedAt: 1754038980,
+  },
+];
+
+let collectionStore: Collection[] = [...seedCollections];
+
+export const mockCollectionApi = {
+  collection_list(input: CollectionListInput): Collection[] {
+    const status = input.status ?? "active";
+    const inSpace = collectionStore.filter((c) => c.spaceId === input.spaceId);
+    if (status === "all") return [...inSpace];
+    return inSpace.filter((c) => c.status === status);
+  },
+
+  collection_create(input: CollectionCreateInput): Collection {
+    const now = unixNow();
+    const collection: Collection = {
+      id: makeCollectionId(),
+      spaceId: input.spaceId,
+      name: input.name,
+      summary: input.summary,
+      tags: input.tags,
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    };
+    collectionStore.push(collection);
+    return collection;
+  },
+
+  collection_update(input: CollectionUpdateInput): Collection {
+    const idx = collectionStore.findIndex((c) => c.id === input.id);
+    if (idx === -1) throw { code: "COMMON_NOT_FOUND", message: "资源集不存在", retryable: false };
+    const c = collectionStore[idx];
+    if (c.status === "archived")
+      throw { code: "COMMON_CONFLICT", message: "已归档资源集不可编辑", retryable: false };
+    const updated: Collection = {
+      ...c,
+      name: input.name ?? c.name,
+      summary: input.summary ?? c.summary,
+      tags: input.tags ?? c.tags,
+      updatedAt: unixNow(),
+    };
+    collectionStore[idx] = updated;
+    return updated;
+  },
+
+  collection_archive(input: CollectionIdInput): Collection {
+    const idx = collectionStore.findIndex((c) => c.id === input.id);
+    if (idx === -1) throw { code: "COMMON_NOT_FOUND", message: "资源集不存在", retryable: false };
+    const c = collectionStore[idx];
+    if (c.status === "archived")
+      throw { code: "COMMON_CONFLICT", message: "资源集已归档", retryable: false };
+    const updated: Collection = { ...c, status: "archived", updatedAt: unixNow() };
+    collectionStore[idx] = updated;
+    return updated;
+  },
+
+  collection_restore(input: CollectionIdInput): Collection {
+    const idx = collectionStore.findIndex((c) => c.id === input.id);
+    if (idx === -1) throw { code: "COMMON_NOT_FOUND", message: "资源集不存在", retryable: false };
+    const updated: Collection = { ...collectionStore[idx], status: "active", updatedAt: unixNow() };
+    collectionStore[idx] = updated;
     return updated;
   },
 };
