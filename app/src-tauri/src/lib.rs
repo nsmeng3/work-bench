@@ -2,6 +2,7 @@
 
 mod collection;
 mod db;
+mod disposition;
 mod error;
 mod fs_ops;
 mod landing;
@@ -36,6 +37,17 @@ pub fn run() {
             let pool = tauri::async_runtime::block_on(db::init_pool_at(&data_dir))
                 .map_err(|e| format!("初始化数据库失败: {}", e))?;
 
+            // 启动探测：系统回收站可用性 → 写入默认存储源 caps_json.softDelete（§5.1）。
+            // 失败仅记录日志，不阻塞启动；下次启动会重试。
+            let soft_delete_ok = disposition::detect_soft_delete_support();
+            if let Err(e) = tauri::async_runtime::block_on(disposition::write_soft_delete_cap(
+                &pool,
+                "src_local_fs_default",
+                soft_delete_ok,
+            )) {
+                eprintln!("[startup] 写入 caps_json.softDelete 失败: {}", e);
+            }
+
             app.manage(AppState { pool });
             Ok(())
         })
@@ -67,6 +79,7 @@ pub fn run() {
             fs_ops::ref_reveal_in_finder,
             settings::settings_get_root_dir,
             settings::settings_init_root_dir,
+            disposition::disp_get_capabilities,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
