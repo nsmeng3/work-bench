@@ -52,6 +52,7 @@ pub fn run() {
             collection::collection_get,
             collection::collection_list,
             reference::ref_create_external,
+            reference::ref_create_managed,
             reference::ref_update,
             reference::ref_get,
             reference::ref_list,
