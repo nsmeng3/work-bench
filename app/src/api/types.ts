@@ -163,3 +163,16 @@ export interface CollectionDetail {
   /** 六类型分组；固定键序 code/document/data/artifact/tool/media */
   referencesByType: Record<ReferenceType, ReferenceWithHealth[]>;
 }
+
+/** ref_create_external 入参 — 详细设计说明书 §2.5 */
+export interface RefCreateExternalInput {
+  collectionId: string;
+  name: string;
+  type: ReferenceType;
+  locator: ReferenceLocator;
+  description?: string;
+  tags?: string[];
+  lifecycle?: ReferenceLifecycle;
+  confidentiality?: ReferenceConfidentiality;
+  indexed?: boolean;
+}
