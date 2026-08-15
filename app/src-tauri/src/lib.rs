@@ -43,6 +43,7 @@ pub fn run() {
             collection::collection_archive,
             collection::collection_restore,
             collection::collection_get,
+            collection::collection_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
