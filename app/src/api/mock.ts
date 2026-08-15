@@ -9,6 +9,10 @@ import type {
   CollectionUpdateInput,
   CollectionIdInput,
   CollectionListInput,
+  CollectionDetail,
+  Reference,
+  ReferenceType,
+  ReferenceWithHealth,
 } from "./types";
 
 /**
@@ -203,4 +207,114 @@ export const mockCollectionApi = {
     collectionStore[idx] = updated;
     return updated;
   },
+
+  collection_get(input: CollectionIdInput): CollectionDetail {
+    const c = collectionStore.find((x) => x.id === input.id);
+    if (!c) throw { code: "COMMON_NOT_FOUND", message: "资源集不存在", retryable: false };
+    return {
+      ...c,
+      referencesByType: buildReferencesByType(c.id),
+    };
+  },
 };
+
+/* ---------------- 引用 mock（仅供 collection_get 使用） ---------------- */
+
+const ALL_REFERENCE_TYPES: ReferenceType[] = [
+  "code",
+  "document",
+  "data",
+  "artifact",
+  "tool",
+  "media",
+];
+
+function makeRef(partial: Partial<Reference> & Pick<Reference, "id" | "collectionId" | "name" | "type">): Reference {
+  const now = 1754039000;
+  return {
+    sourceId: "mock-source-local",
+    hosting: "external",
+    locator: { kind: "path", path: `/abs/${partial.type}/${partial.id}` },
+    lifecycle: "active",
+    confidentiality: "internal",
+    indexed: true,
+    disposition: "none",
+    createdAt: now,
+    updatedAt: now,
+    ...partial,
+  };
+}
+
+/** 种子引用：覆盖六类型中的 code/document/data 三类有数据，其余为空；三种 health 各至少一条 */
+const seedReferences: ReferenceWithHealth[] = [
+  // code
+  {
+    ref: makeRef({
+      id: "mock-ref-code-1",
+      collectionId: "mock-collection-1",
+      name: "workbench-frontend",
+      type: "code",
+      description: "工作台前端代码仓",
+      tags: ["frontend", "tauri"],
+      locator: { kind: "path", path: "/Users/demo/code/workbench/app" },
+    }),
+    health: "ok",
+  },
+  {
+    ref: makeRef({
+      id: "mock-ref-code-2",
+      collectionId: "mock-collection-1",
+      name: "legacy-scripts",
+      type: "code",
+      lifecycle: "archived",
+      locator: { kind: "path", path: "/Users/demo/code/legacy/scripts" },
+    }),
+    health: "missing",
+  },
+  // document
+  {
+    ref: makeRef({
+      id: "mock-ref-doc-1",
+      collectionId: "mock-collection-1",
+      name: "详细设计说明书",
+      type: "document",
+      confidentiality: "internal",
+      locator: { kind: "path", path: "/Users/demo/docs/详细设计.md" },
+    }),
+    health: "ok",
+  },
+  {
+    ref: makeRef({
+      id: "mock-ref-doc-2",
+      collectionId: "mock-collection-2",
+      name: "概要设计说明书",
+      type: "document",
+      locator: { kind: "path", path: "/Users/demo/docs/概要设计.md" },
+    }),
+    health: "unknown",
+  },
+  // data
+  {
+    ref: makeRef({
+      id: "mock-ref-data-1",
+      collectionId: "mock-collection-1",
+      name: "样本数据集",
+      type: "data",
+      confidentiality: "sensitive",
+      lifecycle: "staged",
+      locator: { kind: "path", path: "/Users/demo/data/sample.parquet" },
+    }),
+    health: "unknown",
+  },
+];
+
+function buildReferencesByType(collectionId: string): Record<ReferenceType, ReferenceWithHealth[]> {
+  const grouped = {} as Record<ReferenceType, ReferenceWithHealth[]>;
+  for (const t of ALL_REFERENCE_TYPES) grouped[t] = [];
+  for (const item of seedReferences) {
+    if (item.ref.collectionId === collectionId) {
+      grouped[item.ref.type].push(item);
+    }
+  }
+  return grouped;
+}
