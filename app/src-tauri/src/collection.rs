@@ -1,7 +1,7 @@
 //! 资源集管理（详细设计 §2.4）
 //!
-//! 5 个命令：`collection_create` / `collection_update` / `collection_archive` /
-//! `collection_restore` / `collection_get`。
+//! 6 个命令：`collection_create` / `collection_update` / `collection_archive` /
+//! `collection_restore` / `collection_get` / `collection_list`。
 //!
 //! 归档为逻辑归档（改 status 字段），不触碰其下引用（§6.2）。
 //! tags 通过 `collection_tag` 关联表存储（§3.2）。
@@ -375,6 +375,62 @@ pub async fn get(pool: &SqlitePool, id: String) -> CmdResult<CollectionDetail> {
     })
 }
 
+/// 校验空间存在（不校验归档状态；契约：`collection_list` 仅要求空间存在）。
+async fn ensure_space_exists(pool: &SqlitePool, space_id: &str) -> CmdResult<()> {
+    sqlx::query("SELECT id FROM space WHERE id = ?")
+        .bind(space_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found(format!("空间不存在: {}", space_id)))?;
+    Ok(())
+}
+
+pub async fn list(
+    pool: &SqlitePool,
+    space_id: String,
+    status: Option<String>,
+) -> CmdResult<Vec<Collection>> {
+    ensure_space_exists(pool, &space_id).await?;
+
+    let status = status.unwrap_or_else(|| "active".to_string());
+    let rows = match status.as_str() {
+        "active" | "archived" => sqlx::query(
+            "SELECT id, space_id, name, summary, status, created_at, updated_at \
+             FROM collection WHERE space_id = ? AND status = ? \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(&space_id)
+        .bind(&status)
+        .fetch_all(pool)
+        .await
+        .map_err(AppError::from)?,
+        "all" => sqlx::query(
+            "SELECT id, space_id, name, summary, status, created_at, updated_at \
+             FROM collection WHERE space_id = ? \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(&space_id)
+        .fetch_all(pool)
+        .await
+        .map_err(AppError::from)?,
+        other => {
+            return Err(AppError::invalid_param(format!(
+                "status 取值非法: {}（应为 active|archived|all）",
+                other
+            )))
+        }
+    };
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: String = row.try_get("id").map_err(AppError::from)?;
+        let tags = fetch_tags(pool, &id).await?;
+        out.push(row_to_collection(row, tags).map_err(AppError::from)?);
+    }
+    Ok(out)
+}
+
 // ============================================================
 // Tauri Commands
 // ============================================================
@@ -423,6 +479,15 @@ pub async fn collection_get(
     id: String,
 ) -> CmdResult<CollectionDetail> {
     get(&state.pool, id).await
+}
+
+#[tauri::command]
+pub async fn collection_list(
+    state: tauri::State<'_, crate::AppState>,
+    space_id: String,
+    status: Option<String>,
+) -> CmdResult<Vec<Collection>> {
+    list(&state.pool, space_id, status).await
 }
 
 // ============================================================
@@ -782,6 +847,132 @@ mod tests {
         let detail = get(&pool, c.id.clone()).await.expect("get ok");
         assert_eq!(detail.collection.status, "archived");
         assert_eq!(detail.references_by_type["code"].len(), 1);
+    }
+
+    // ---------- collection_list ----------
+
+    #[tokio::test]
+    async fn collection_list_default_active() {
+        let pool = setup().await;
+        let a = create(&pool, PRESET_SPACE.into(), "A".into(), None, None)
+            .await
+            .expect("create a");
+        let b = create(&pool, PRESET_SPACE.into(), "B".into(), None, None)
+            .await
+            .expect("create b");
+        archive(&pool, b.id.clone()).await.expect("archive b");
+
+        let items = list(&pool, PRESET_SPACE.into(), None)
+            .await
+            .expect("list ok");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, a.id);
+        assert_eq!(items[0].status, "active");
+    }
+
+    #[tokio::test]
+    async fn collection_list_archived() {
+        let pool = setup().await;
+        let a = create(&pool, PRESET_SPACE.into(), "A".into(), None, None)
+            .await
+            .expect("create a");
+        let b = create(&pool, PRESET_SPACE.into(), "B".into(), None, None)
+            .await
+            .expect("create b");
+        archive(&pool, b.id.clone()).await.expect("archive b");
+
+        let items = list(&pool, PRESET_SPACE.into(), Some("archived".into()))
+            .await
+            .expect("list ok");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, b.id);
+        assert_eq!(items[0].status, "archived");
+        // 确认未误返回 active 项
+        assert!(items.iter().all(|x| x.id != a.id));
+    }
+
+    #[tokio::test]
+    async fn collection_list_all() {
+        let pool = setup().await;
+        let a = create(&pool, PRESET_SPACE.into(), "A".into(), None, None)
+            .await
+            .expect("create a");
+        let b = create(&pool, PRESET_SPACE.into(), "B".into(), None, None)
+            .await
+            .expect("create b");
+        archive(&pool, b.id.clone()).await.expect("archive b");
+
+        let items = list(&pool, PRESET_SPACE.into(), Some("all".into()))
+            .await
+            .expect("list ok");
+        assert_eq!(items.len(), 2);
+        let ids: Vec<&str> = items.iter().map(|x| x.id.as_str()).collect();
+        assert!(ids.contains(&a.id.as_str()));
+        assert!(ids.contains(&b.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn collection_list_scoped_by_space() {
+        let pool = setup().await;
+        // 预置空间来自 0002 迁移；此处再建一个空间用于隔离校验
+        sqlx::query(
+            "INSERT INTO space (id, name, status, created_at, updated_at) \
+             VALUES ('space_other', '其他空间', 'active', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert other space");
+        create(&pool, PRESET_SPACE.into(), "A".into(), None, None)
+            .await
+            .expect("create in work");
+        create(&pool, "space_other".into(), "X".into(), None, None)
+            .await
+            .expect("create in other");
+
+        let items = list(&pool, PRESET_SPACE.into(), None)
+            .await
+            .expect("list ok");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "A");
+        assert_eq!(items[0].space_id, PRESET_SPACE);
+    }
+
+    #[tokio::test]
+    async fn collection_list_includes_tags() {
+        let pool = setup().await;
+        create(
+            &pool,
+            PRESET_SPACE.into(),
+            "带标签".into(),
+            None,
+            Some(vec!["t1".into(), "t2".into()]),
+        )
+        .await
+        .expect("create ok");
+
+        let items = list(&pool, PRESET_SPACE.into(), None)
+            .await
+            .expect("list ok");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tags, vec!["t1".to_string(), "t2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn collection_list_err_space_not_found() {
+        let pool = setup().await;
+        let err = list(&pool, "no-such-space".into(), None)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn collection_list_err_invalid_status() {
+        let pool = setup().await;
+        let err = list(&pool, PRESET_SPACE.into(), Some("bogus".into()))
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_INVALID_PARAM");
     }
 
     // ---------- 序列化契约 ----------
