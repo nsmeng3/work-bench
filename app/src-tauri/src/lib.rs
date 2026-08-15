@@ -3,6 +3,7 @@
 mod collection;
 mod db;
 mod error;
+mod fs_ops;
 mod reference;
 mod space;
 
@@ -49,6 +50,9 @@ pub fn run() {
             reference::ref_update,
             reference::ref_get,
             reference::ref_list,
+            fs_ops::ref_check_health,
+            fs_ops::ref_open,
+            fs_ops::ref_reveal_in_finder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,0 +1,686 @@
+//! 文件系统操作（详细设计 §2.5）
+//!
+//! 本任务（m2-2.6）实现 3 个命令：
+//! `ref_check_health` / `ref_open` / `ref_reveal_in_finder`。
+//!
+//! 关键约束：
+//! - `ref_check_health` 仅做只读元数据检测（`std::fs::metadata`），
+//!   不打开文件内容、不修改任何数据。
+//! - `ref_open` / `ref_reveal_in_finder` 起子进程必须使用
+//!   `std::process::Command`，路径作为独立 argv 元素传递，
+//!   **绝不拼接 shell 字符串**（防注入）。
+//! - 跨平台分支用 `#[cfg(target_os = ...)]`；当前验收在 macOS，
+//!   其他平台仅需编译通过。
+
+use serde::{Deserialize, Serialize};
+use sqlx::sqlite::SqlitePool;
+use sqlx::Row;
+
+use crate::error::{AppError, CmdResult};
+
+/// 引用健康度（§2.5 ref_check_health.health）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Health {
+    Ok,
+    Missing,
+    Unknown,
+}
+
+/// `ref_check_health` 出参条目（§2.5）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthReport {
+    pub ref_id: String,
+    pub health: Health,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// `ref_open` 出参（§2.5）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenResult {
+    pub opened: bool,
+    /// system_default | custom
+    pub strategy: String,
+}
+
+// ============================================================
+// 内部工具
+// ============================================================
+
+/// 从 `resource_reference` 读取 `(id, locator_json)`。
+///
+/// 仅供 fs_ops 内部使用；不复用 reference.rs 的 `fetch_reference`，
+/// 因为健康检查只需要 locator，无需 tags 等额外字段。
+async fn fetch_locator(pool: &SqlitePool, id: &str) -> CmdResult<serde_json::Value> {
+    let row = sqlx::query("SELECT locator_json FROM resource_reference WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found(format!("资源引用不存在: {}", id)))?;
+    let locator_json: String = row.try_get("locator_json").map_err(AppError::from)?;
+    let locator: serde_json::Value = serde_json::from_str(&locator_json)
+        .map_err(|e| AppError::db(format!("locator_json 反序列化失败: {}", e)))?;
+    Ok(locator)
+}
+
+/// 列出某 collection 下所有引用 id（不过滤 disposition：
+/// 健康检查应覆盖全部，UI 自行决定是否展示已删除项）。
+async fn list_ids_by_collection(pool: &SqlitePool, collection_id: &str) -> CmdResult<Vec<String>> {
+    let rows = sqlx::query(
+        "SELECT id FROM resource_reference WHERE collection_id = ? ORDER BY created_at ASC, id ASC",
+    )
+    .bind(collection_id)
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::from)?;
+    Ok(rows
+        .iter()
+        .map(|r| r.get::<String, _>("id"))
+        .collect())
+}
+
+/// 从 locator JSON 提取 `path`（仅支持 `kind == "path"`）。
+///
+/// 其他 kind（repo/cloud 等预留形态）返回 `None`，由调用方标记 `unknown`。
+fn extract_path(locator: &serde_json::Value) -> Option<String> {
+    let kind = locator.get("kind")?.as_str()?;
+    if kind != "path" {
+        return None;
+    }
+    let path = locator.get("path")?.as_str()?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+/// 单条健康检查：只读 `std::fs::metadata`，不打开文件内容。
+async fn check_one(pool: &SqlitePool, ref_id: &str) -> CmdResult<HealthReport> {
+    let locator = fetch_locator(pool, ref_id).await?;
+    match extract_path(&locator) {
+        None => Ok(HealthReport {
+            ref_id: ref_id.to_string(),
+            health: Health::Unknown,
+            detail: Some("locator 非 path 形态或字段缺失".into()),
+        }),
+        Some(path) => {
+            // 仅 metadata 探测；不打开文件、不读内容。
+            match std::fs::metadata(&path) {
+                Ok(_) => Ok(HealthReport {
+                    ref_id: ref_id.to_string(),
+                    health: Health::Ok,
+                    detail: None,
+                }),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HealthReport {
+                    ref_id: ref_id.to_string(),
+                    health: Health::Missing,
+                    detail: Some(format!("路径不存在: {}", path)),
+                }),
+                Err(e) => Ok(HealthReport {
+                    ref_id: ref_id.to_string(),
+                    health: Health::Unknown,
+                    detail: Some(format!("metadata 读取失败: {}", e)),
+                }),
+            }
+        }
+    }
+}
+
+// ============================================================
+// 业务函数（命令与测试共用）
+// ============================================================
+
+/// `ref_check_health`：入参二选一（`id` 或 `collection_id`）。
+///
+/// 只检测不修改数据；路径存在 → `ok`，不存在 → `missing`，
+/// 其他情况（非 path locator / 元数据读取失败）→ `unknown`。
+pub async fn check_health(
+    pool: &SqlitePool,
+    id: Option<String>,
+    collection_id: Option<String>,
+) -> CmdResult<Vec<HealthReport>> {
+    match (id, collection_id) {
+        (Some(id), None) => Ok(vec![check_one(pool, &id).await?]),
+        (None, Some(cid)) => {
+            let ids = list_ids_by_collection(pool, &cid).await?;
+            let mut out = Vec::with_capacity(ids.len());
+            for rid in &ids {
+                out.push(check_one(pool, rid).await?);
+            }
+            Ok(out)
+        }
+        (Some(_), Some(_)) => Err(AppError::invalid_param(
+            "id 与 collectionId 二选一，不可同时提供",
+        )),
+        (None, None) => Err(AppError::invalid_param(
+            "id 与 collectionId 必须提供其一",
+        )),
+    }
+}
+
+/// `ref_open`：按系统默认程序打开；`app_override` 为本次覆盖。
+///
+/// - macOS：默认 `open <path>`；自定义 `open -a <app> <path>`。
+/// - Windows：默认 `explorer <path>`；自定义直接 `<app> <path>`。
+/// - Linux：默认 `xdg-open <path>`；自定义直接 `<app> <path>`。
+///
+/// 安全：路径作为独立 argv 元素传递，绝不拼接 shell 字符串。
+pub async fn open(
+    pool: &SqlitePool,
+    id: String,
+    app_override: Option<String>,
+) -> CmdResult<OpenResult> {
+    let locator = fetch_locator(pool, &id).await?;
+    let path = extract_path(&locator).ok_or_else(|| {
+        AppError::invalid_param(format!("引用 {} 的 locator 非 path 形态，无法打开", id))
+    })?;
+
+    // 路径存在性 / 权限校验（仅 metadata，不读内容）。
+    match std::fs::metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::new(
+                "FS_PATH_NOT_FOUND",
+                format!("目标路径不存在: {}", path),
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(AppError::new(
+                "FS_PERMISSION_DENIED",
+                format!("无权限访问: {}", path),
+            ));
+        }
+        Err(e) => {
+            return Err(AppError::io(format!("读取路径元数据失败 {}: {}", path, e)));
+        }
+    }
+
+    let strategy = if app_override.is_some() {
+        "custom"
+    } else {
+        "system_default"
+    };
+
+    spawn_open(&path, app_override.as_deref())?;
+
+    Ok(OpenResult {
+        opened: true,
+        strategy: strategy.to_string(),
+    })
+}
+
+/// `ref_reveal_in_finder`：在系统文件管理器中显示。
+///
+/// - macOS：`open -R <path>`
+/// - Windows：`explorer /select,<path>`
+/// - Linux：退化为 `xdg-open <parent_dir>`
+pub async fn reveal_in_finder(pool: &SqlitePool, id: String) -> CmdResult<()> {
+    let locator = fetch_locator(pool, &id).await?;
+    let path = extract_path(&locator).ok_or_else(|| {
+        AppError::invalid_param(format!("引用 {} 的 locator 非 path 形态，无法定位", id))
+    })?;
+
+    if !std::path::Path::new(&path).exists() {
+        return Err(AppError::new(
+            "FS_PATH_NOT_FOUND",
+            format!("目标路径不存在: {}", path),
+        ));
+    }
+
+    spawn_reveal(&path)
+}
+
+// ============================================================
+// 平台分支：起子进程（绝不拼接 shell 字符串）
+// ============================================================
+
+#[cfg(target_os = "macos")]
+fn spawn_open(path: &str, app_override: Option<&str>) -> CmdResult<()> {
+    let mut cmd = std::process::Command::new("open");
+    if let Some(app) = app_override {
+        cmd.arg("-a").arg(app);
+    }
+    cmd.arg(path);
+    cmd.spawn()
+        .map_err(|e| AppError::io(format!("启动 open 失败: {}", e)))?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_open(path: &str, app_override: Option<&str>) -> CmdResult<()> {
+    match app_override {
+        None => {
+            std::process::Command::new("explorer")
+                .arg(path)
+                .spawn()
+                .map_err(|e| AppError::io(format!("启动 explorer 失败: {}", e)))?;
+        }
+        Some(app) => {
+            std::process::Command::new(app)
+                .arg(path)
+                .spawn()
+                .map_err(|e| AppError::io(format!("启动 {} 失败: {}", app, e)))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_open(path: &str, app_override: Option<&str>) -> CmdResult<()> {
+    match app_override {
+        None => {
+            std::process::Command::new("xdg-open")
+                .arg(path)
+                .spawn()
+                .map_err(|e| AppError::io(format!("启动 xdg-open 失败: {}", e)))?;
+        }
+        Some(app) => {
+            std::process::Command::new(app)
+                .arg(path)
+                .spawn()
+                .map_err(|e| AppError::io(format!("启动 {} 失败: {}", app, e)))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_reveal(path: &str) -> CmdResult<()> {
+    std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .map_err(|e| AppError::io(format!("启动 open -R 失败: {}", e)))?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_reveal(path: &str) -> CmdResult<()> {
+    // `explorer /select,<path>`：`/select,<path>` 是 explorer 的单个参数，
+    // 不经过 shell，逗号后路径作为同一 argv 元素的一部分，无注入风险。
+    let arg = format!("/select,{}", path);
+    std::process::Command::new("explorer")
+        .arg(arg)
+        .spawn()
+        .map_err(|e| AppError::io(format!("启动 explorer 失败: {}", e)))?;
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_reveal(path: &str) -> CmdResult<()> {
+    // Linux 无统一 "reveal" 概念，退化为打开所在目录。
+    let parent = std::path::Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    std::process::Command::new("xdg-open")
+        .arg(parent)
+        .spawn()
+        .map_err(|e| AppError::io(format!("启动 xdg-open 失败: {}", e)))?;
+    Ok(())
+}
+
+// ============================================================
+// Tauri Commands
+// ============================================================
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn ref_check_health(
+    state: tauri::State<'_, crate::AppState>,
+    id: Option<String>,
+    collection_id: Option<String>,
+) -> CmdResult<Vec<HealthReport>> {
+    check_health(&state.pool, id, collection_id).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn ref_open(
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+    app_override: Option<String>,
+) -> CmdResult<OpenResult> {
+    open(&state.pool, id, app_override).await
+}
+
+#[tauri::command]
+pub async fn ref_reveal_in_finder(
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+) -> CmdResult<()> {
+    reveal_in_finder(&state.pool, id).await
+}
+
+// ============================================================
+// 单元测试
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::init_pool_in_memory;
+    use uuid::Uuid;
+
+    async fn setup() -> SqlitePool {
+        init_pool_in_memory().await.expect("migrate ok")
+    }
+
+    const PRESET_SPACE: &str = "preset_space_work";
+
+    async fn make_collection(pool: &SqlitePool) -> String {
+        let id = Uuid::new_v4().to_string();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        sqlx::query(
+            "INSERT INTO collection (id, space_id, name, status, created_at, updated_at) \
+             VALUES (?, ?, 'c', 'active', ?, ?)",
+        )
+        .bind(&id)
+        .bind(PRESET_SPACE)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert collection");
+        id
+    }
+
+    /// 直接插入一条 reference（不走 create_external，便于构造 missing 路径）。
+    async fn insert_reference(pool: &SqlitePool, collection_id: &str, path: &str) -> String {
+        let id = Uuid::new_v4().to_string();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let locator_json = serde_json::to_string(&serde_json::json!({
+            "kind": "path",
+            "path": path,
+        }))
+        .expect("serialize locator");
+        sqlx::query(
+            "INSERT INTO resource_reference \
+             (id, collection_id, source_id, name, type, hosting, locator_json, \
+              description, lifecycle, confidentiality, indexed, disposition, created_at, updated_at) \
+             VALUES (?, ?, 'src_local_fs_default', 'r', 'code', 'external', ?, NULL, \
+                     'active', 'internal', 1, 'none', ?, ?)",
+        )
+        .bind(&id)
+        .bind(collection_id)
+        .bind(&locator_json)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert reference");
+        id
+    }
+
+    /// 插入一条非 path locator 的 reference（用于 unknown 分支）。
+    async fn insert_reference_with_locator(
+        pool: &SqlitePool,
+        collection_id: &str,
+        locator: serde_json::Value,
+    ) -> String {
+        let id = Uuid::new_v4().to_string();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let locator_json = serde_json::to_string(&locator).expect("serialize");
+        sqlx::query(
+            "INSERT INTO resource_reference \
+             (id, collection_id, source_id, name, type, hosting, locator_json, \
+              description, lifecycle, confidentiality, indexed, disposition, created_at, updated_at) \
+             VALUES (?, ?, 'src_local_fs_default', 'r', 'code', 'external', ?, NULL, \
+                     'active', 'internal', 1, 'none', ?, ?)",
+        )
+        .bind(&id)
+        .bind(collection_id)
+        .bind(&locator_json)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert reference");
+        id
+    }
+
+    // ---------- ref_check_health ----------
+
+    #[tokio::test]
+    async fn check_health_ok_for_existing_path() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let rid = insert_reference(&pool, &cid, &file.to_string_lossy()).await;
+
+        let reports = check_health(&pool, Some(rid.clone()), None)
+            .await
+            .expect("check ok");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].ref_id, rid);
+        assert_eq!(reports[0].health, Health::Ok);
+        assert!(reports[0].detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_health_missing_for_nonexistent_path() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("no-such-file.txt");
+        let rid = insert_reference(&pool, &cid, &missing.to_string_lossy()).await;
+
+        let reports = check_health(&pool, Some(rid.clone()), None)
+            .await
+            .expect("check ok");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].health, Health::Missing);
+        assert!(reports[0].detail.is_some());
+    }
+
+    #[tokio::test]
+    async fn check_health_unknown_for_non_path_locator() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = insert_reference_with_locator(
+            &pool,
+            &cid,
+            serde_json::json!({ "kind": "cloud", "path": "s3://bucket/key" }),
+        )
+        .await;
+
+        let reports = check_health(&pool, Some(rid.clone()), None)
+            .await
+            .expect("check ok");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].health, Health::Unknown);
+        assert!(reports[0].detail.is_some());
+    }
+
+    #[tokio::test]
+    async fn check_health_err_when_id_not_found() {
+        let pool = setup().await;
+        let err = check_health(&pool, Some("no-such-id".into()), None)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn check_health_err_when_both_params_provided() {
+        let pool = setup().await;
+        let err = check_health(&pool, Some("a".into()), Some("b".into()))
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn check_health_err_when_neither_param_provided() {
+        let pool = setup().await;
+        let err = check_health(&pool, None, None)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn check_health_by_collection_returns_all() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f_ok = dir.path().join("ok.txt");
+        std::fs::write(&f_ok, b"x").expect("write");
+        let f_missing = dir.path().join("missing.txt");
+
+        let rid_ok = insert_reference(&pool, &cid, &f_ok.to_string_lossy()).await;
+        let rid_missing = insert_reference(&pool, &cid, &f_missing.to_string_lossy()).await;
+        let rid_unknown = insert_reference_with_locator(
+            &pool,
+            &cid,
+            serde_json::json!({ "kind": "repo", "url": "https://x" }),
+        )
+        .await;
+
+        let reports = check_health(&pool, None, Some(cid.clone()))
+            .await
+            .expect("check ok");
+        assert_eq!(reports.len(), 3);
+
+        let by_id: std::collections::HashMap<_, _> = reports
+            .iter()
+            .map(|r| (r.ref_id.as_str(), r.health))
+            .collect();
+        assert_eq!(by_id[rid_ok.as_str()], Health::Ok);
+        assert_eq!(by_id[rid_missing.as_str()], Health::Missing);
+        assert_eq!(by_id[rid_unknown.as_str()], Health::Unknown);
+    }
+
+    #[tokio::test]
+    async fn check_health_by_collection_empty_when_no_refs() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let reports = check_health(&pool, None, Some(cid))
+            .await
+            .expect("check ok");
+        assert!(reports.is_empty());
+    }
+
+    /// 健康检查不得修改源文件（mtime/内容不变）。
+    #[tokio::test]
+    async fn check_health_is_readonly() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("immutable.txt");
+        let content = b"readonly";
+        std::fs::write(&file, content).expect("write");
+        let mtime_before = std::fs::metadata(&file)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+
+        let rid = insert_reference(&pool, &cid, &file.to_string_lossy()).await;
+        check_health(&pool, Some(rid), None).await.expect("check ok");
+
+        let mtime_after = std::fs::metadata(&file)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        assert_eq!(mtime_before, mtime_after);
+        let content_after = std::fs::read(&file).expect("read");
+        assert_eq!(content, &content_after[..]);
+    }
+
+    // ---------- ref_open ----------
+
+    #[tokio::test]
+    async fn open_err_path_not_found() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("no-such.txt");
+        let rid = insert_reference(&pool, &cid, &missing.to_string_lossy()).await;
+
+        let err = open(&pool, rid, None).await.expect_err("should fail");
+        assert_eq!(err.code, "FS_PATH_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn open_err_when_id_not_found() {
+        let pool = setup().await;
+        let err = open(&pool, "no-such-id".into(), None)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn open_err_when_locator_not_path() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = insert_reference_with_locator(
+            &pool,
+            &cid,
+            serde_json::json!({ "kind": "cloud", "path": "s3://x" }),
+        )
+        .await;
+        let err = open(&pool, rid, None).await.expect_err("should fail");
+        assert_eq!(err.code, "COMMON_INVALID_PARAM");
+    }
+
+    // ---------- ref_reveal_in_finder ----------
+
+    #[tokio::test]
+    async fn reveal_err_path_not_found() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("no-such.txt");
+        let rid = insert_reference(&pool, &cid, &missing.to_string_lossy()).await;
+
+        let err = reveal_in_finder(&pool, rid).await.expect_err("should fail");
+        assert_eq!(err.code, "FS_PATH_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn reveal_err_when_id_not_found() {
+        let pool = setup().await;
+        let err = reveal_in_finder(&pool, "no-such-id".into())
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    // ---------- 序列化契约 ----------
+
+    #[test]
+    fn health_report_serializes_camel_case() {
+        let r = HealthReport {
+            ref_id: "x".into(),
+            health: Health::Ok,
+            detail: None,
+        };
+        let v = serde_json::to_value(&r).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert!(obj.contains_key("refId"));
+        assert!(obj.contains_key("health"));
+        assert!(!obj.contains_key("ref_id"));
+        // detail=None 时被跳过
+        assert!(!obj.contains_key("detail"));
+        // health 序列化为小写
+        assert_eq!(obj["health"].as_str(), Some("ok"));
+    }
+
+    #[test]
+    fn open_result_serializes_camel_case() {
+        let r = OpenResult {
+            opened: true,
+            strategy: "system_default".into(),
+        };
+        let v = serde_json::to_value(&r).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj["opened"].as_bool(), Some(true));
+        assert_eq!(obj["strategy"].as_str(), Some("system_default"));
+    }
+}
