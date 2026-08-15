@@ -20,6 +20,9 @@ import type {
   QueryFacetsInput,
   QueryFacetsOutput,
   FacetValue,
+  RootDirStatus,
+  InitRootDirInput,
+  InitRootDirResult,
 } from "./types";
 
 /**
@@ -435,6 +438,60 @@ function buildReferencesByType(collectionId: string): Record<ReferenceType, Refe
   }
   return grouped;
 }
+
+/* ---------------- 设置中心 mock（§2.8） ---------------- */
+
+/**
+ * mock 状态：模块级变量，模拟 settings 表中的 root_dir 行。
+ * 初始化为 null 表示「未初始化」，与首次启动场景一致。
+ */
+let mockRootDir: string | null = null;
+
+const MOCK_TYPE_SUBDIRS = ["Code", "Documents", "Data", "Artifacts", "Tools", "Media"];
+
+export const mockSettingsApi = {
+  settings_get_root_dir(): RootDirStatus {
+    if (mockRootDir === null) return { initialized: false };
+    return { rootDir: mockRootDir, initialized: true };
+  },
+
+  settings_init_root_dir(input: InitRootDirInput): InitRootDirResult {
+    const rootDir = input.rootDir.trim();
+    if (!rootDir) {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: "根目录不能为空",
+        retryable: false,
+      };
+    }
+    if (!rootDir.startsWith("/")) {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: "根目录必须为绝对路径",
+        retryable: false,
+      };
+    }
+    if (rootDir.includes("deny")) {
+      throw {
+        code: "FS_PERMISSION_DENIED",
+        message: `无写入权限：${rootDir}`,
+        details: { path: rootDir },
+        retryable: false,
+      };
+    }
+    if (rootDir.includes("retry")) {
+      throw {
+        code: "FS_IO_ERROR",
+        message: `IO 异常：${rootDir}`,
+        details: { path: rootDir },
+        retryable: true,
+      };
+    }
+    mockRootDir = rootDir;
+    const created = MOCK_TYPE_SUBDIRS.map((s) => `${rootDir.replace(/\/$/, "")}/${s}`);
+    return { rootDir, created };
+  },
+};
 
 /* ---------------- 引用 mock API ---------------- */
 

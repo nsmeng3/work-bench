@@ -233,3 +233,22 @@ export interface QueryFacetsOutput {
   confidentialities: FacetValue[];
   tags: FacetValue[];
 }
+
+/* ---------------- 设置中心（§2.8） ---------------- */
+
+/** settings_get_root_dir 出参 — §2.8 */
+export interface RootDirStatus {
+  rootDir?: string;
+  initialized: boolean;
+}
+
+/** settings_init_root_dir 入参 — §2.8 */
+export interface InitRootDirInput {
+  rootDir: string;
+}
+
+/** settings_init_root_dir 出参 — §2.8 */
+export interface InitRootDirResult {
+  rootDir: string;
+  created: string[];
+}

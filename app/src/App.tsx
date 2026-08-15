@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { ConfigProvider, App as AntApp } from "antd";
+import { useEffect, useState } from "react";
+import { ConfigProvider, App as AntApp, Spin } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import {
   AppstoreOutlined,
@@ -14,6 +14,8 @@ import { SpacePage } from "./pages/SpacePage";
 import { CollectionPage } from "./pages/CollectionPage";
 import { CollectionDetailPage } from "./pages/CollectionDetailPage";
 import { FilterPage } from "./pages/FilterPage";
+import { InitWizardPage } from "./pages/InitWizardPage";
+import { settingsGetRootDir, toApiError } from "./api";
 import type { Collection, Space } from "./api";
 import "./styles/theme.css";
 
@@ -25,12 +27,42 @@ const navItems: NavItem[] = [
   { key: "settings", label: "设置", icon: <SettingOutlined />, enabled: false },
 ];
 
+/** 首启检测状态：loading → ready / failed */
+type BootstrapPhase =
+  | { kind: "loading" }
+  | { kind: "ready"; initialized: boolean }
+  | { kind: "failed"; message: string };
+
 function App() {
+  const [phase, setPhase] = useState<BootstrapPhase>({ kind: "loading" });
   const [activeNav, setActiveNav] = useState("spaces");
   /** 当前下钻进入的空间；null 表示在空间列表页 */
   const [currentSpace, setCurrentSpace] = useState<Space | null>(null);
   /** 当前下钻进入的资源集；null 表示在资源集列表页 */
   const [currentCollection, setCurrentCollection] = useState<Collection | null>(null);
+
+  /**
+   * 首启检测：调 settings_get_root_dir。
+   * initialized=false 时强制渲染初始化向导（等效于路由 /init），
+   * 主界面其它入口隐藏；初始化成功后切回主界面。
+   */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const status = await settingsGetRootDir();
+        if (cancelled) return;
+        setPhase({ kind: "ready", initialized: status.initialized });
+      } catch (err) {
+        if (cancelled) return;
+        const apiErr = toApiError(err);
+        setPhase({ kind: "failed", message: apiErr.message });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   function handleNavChange(key: string) {
     setActiveNav(key);
@@ -49,6 +81,14 @@ function App() {
     setCurrentCollection(null);
   }
 
+  function handleInitialized(_rootDir: string) {
+    // 初始化成功后切回主界面（等效于已初始化状态）
+    setPhase({ kind: "ready", initialized: true });
+    setActiveNav("spaces");
+    setCurrentSpace(null);
+    setCurrentCollection(null);
+  }
+
   return (
     <ConfigProvider
       locale={zhCN}
@@ -61,25 +101,61 @@ function App() {
       }}
     >
       <AntApp>
-        <AppShell navItems={navItems} activeNav={activeNav} onNavChange={handleNavChange}>
-          {activeNav === "spaces" &&
-            (currentSpace && currentCollection ? (
-              <CollectionDetailPage
-                space={currentSpace}
-                collection={currentCollection}
-                onBack={() => setCurrentCollection(null)}
-              />
-            ) : currentSpace ? (
-              <CollectionPage
-                space={currentSpace}
-                onBack={handleBackToSpaces}
-                onEnterCollection={setCurrentCollection}
-              />
-            ) : (
-              <SpacePage onEnterSpace={handleEnterSpace} />
-            ))}
-          {activeNav === "filter" && <FilterPage />}
-        </AppShell>
+        {phase.kind === "loading" && (
+          <div
+            style={{
+              minHeight: "100vh",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Spin size="large" tip="正在加载配置…" />
+          </div>
+        )}
+
+        {phase.kind === "failed" && (
+          <div
+            style={{
+              minHeight: "100vh",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: 24,
+            }}
+          >
+            <div style={{ maxWidth: 480, textAlign: "center" }}>
+              <h2>配置加载失败</h2>
+              <p style={{ color: "#666" }}>{phase.message}</p>
+            </div>
+          </div>
+        )}
+
+        {phase.kind === "ready" && !phase.initialized && (
+          <InitWizardPage onInitialized={handleInitialized} />
+        )}
+
+        {phase.kind === "ready" && phase.initialized && (
+          <AppShell navItems={navItems} activeNav={activeNav} onNavChange={handleNavChange}>
+            {activeNav === "spaces" &&
+              (currentSpace && currentCollection ? (
+                <CollectionDetailPage
+                  space={currentSpace}
+                  collection={currentCollection}
+                  onBack={() => setCurrentCollection(null)}
+                />
+              ) : currentSpace ? (
+                <CollectionPage
+                  space={currentSpace}
+                  onBack={handleBackToSpaces}
+                  onEnterCollection={setCurrentCollection}
+                />
+              ) : (
+                <SpacePage onEnterSpace={handleEnterSpace} />
+              ))}
+            {activeNav === "filter" && <FilterPage />}
+          </AppShell>
+        )}
       </AntApp>
     </ConfigProvider>
   );

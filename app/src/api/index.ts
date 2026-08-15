@@ -4,3 +4,4 @@ export * from "./space";
 export * from "./collection";
 export * from "./reference";
 export * from "./query";
+export * from "./settings";
