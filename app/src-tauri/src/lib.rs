@@ -6,6 +6,7 @@ mod error;
 mod fs_ops;
 mod query;
 mod reference;
+mod settings;
 mod space;
 mod tag;
 
@@ -62,6 +63,8 @@ pub fn run() {
             fs_ops::ref_check_health,
             fs_ops::ref_open,
             fs_ops::ref_reveal_in_finder,
+            settings::settings_get_root_dir,
+            settings::settings_init_root_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
