@@ -213,13 +213,13 @@ async fn fetch_tags(pool: &SqlitePool, reference_id: &str) -> CmdResult<Vec<Stri
 // 业务函数（命令与测试共用）
 // ============================================================
 
-/// `query_refs`：跨资源集/空间的元数据筛选。
+/// `query_refs` 内部实现：跨资源集/空间的元数据筛选。
 ///
 /// - 所有过滤参数可选；空 filter 等价于全表扫描（仍受 limit/offset 限制）。
 /// - `disposition` 缺省时**不排除**已删除（与 `ref_list` 不同；
 ///   §2.9 未约定默认排除，由调用方显式传值）。
 /// - `total` 为不受分页影响的计数。
-pub async fn query_refs(pool: &SqlitePool, filter: QueryRefsFilter) -> CmdResult<QueryRefsResult> {
+pub async fn query_refs_impl(pool: &SqlitePool, filter: QueryRefsFilter) -> CmdResult<QueryRefsResult> {
     // 校验枚举字段
     if let Some(ref t) = filter.ref_type {
         validate_enum(t, &REF_TYPES, "引用类型")?;
@@ -293,11 +293,11 @@ pub async fn query_refs(pool: &SqlitePool, filter: QueryRefsFilter) -> CmdResult
     Ok(QueryRefsResult { total, items })
 }
 
-/// `query_facets`：返回四个维度的可用筛选值与计数。
+/// `query_facets` 内部实现：返回四个维度的可用筛选值与计数。
 ///
 /// - `spaceId` 可选；传入时仅统计该空间下的引用。
 /// - 各维度按计数降序、值升序排序，保证确定性。
-pub async fn query_facets(pool: &SqlitePool, space_id: Option<String>) -> CmdResult<QueryFacetsResult> {
+pub async fn query_facets_impl(pool: &SqlitePool, space_id: Option<String>) -> CmdResult<QueryFacetsResult> {
     // 空间过滤：JOIN collection 并按 c.space_id 过滤
     let (from_clause, where_clause, binds): (&str, &str, Vec<String>) = match &space_id {
         Some(sid) => (
@@ -389,7 +389,7 @@ pub async fn query_facets(pool: &SqlitePool, space_id: Option<String>) -> CmdRes
 // ============================================================
 
 #[tauri::command(rename_all = "camelCase")]
-pub async fn query_refs_cmd(
+pub async fn query_refs(
     state: tauri::State<'_, crate::AppState>,
     space_id: Option<String>,
     collection_id: Option<String>,
@@ -403,7 +403,7 @@ pub async fn query_refs_cmd(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> CmdResult<QueryRefsResult> {
-    query_refs(
+    query_refs_impl(
         &state.pool,
         QueryRefsFilter {
             space_id,
@@ -423,11 +423,11 @@ pub async fn query_refs_cmd(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub async fn query_facets_cmd(
+pub async fn query_facets(
     state: tauri::State<'_, crate::AppState>,
     space_id: Option<String>,
 ) -> CmdResult<QueryFacetsResult> {
-    query_facets(&state.pool, space_id).await
+    query_facets_impl(&state.pool, space_id).await
 }
 
 // ============================================================
@@ -517,7 +517,7 @@ mod tests {
         make_ref(&pool, &c1, "r1", "code", None, vec![], None, None).await;
         make_ref(&pool, &c2, "r2", "code", None, vec![], None, None).await;
 
-        let result = query_refs(
+        let result = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 space_id: Some(PRESET_SPACE.into()),
@@ -539,7 +539,7 @@ mod tests {
         make_ref(&pool, &c1, "r1", "code", None, vec![], None, None).await;
         make_ref(&pool, &c2, "r2", "code", None, vec![], None, None).await;
 
-        let result = query_refs(
+        let result = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 collection_id: Some(c1.clone()),
@@ -559,7 +559,7 @@ mod tests {
         make_ref(&pool, &cid, "r1", "code", None, vec![], None, None).await;
         make_ref(&pool, &cid, "r2", "document", None, vec![], None, None).await;
 
-        let result = query_refs(
+        let result = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 ref_type: Some("code".into()),
@@ -579,7 +579,7 @@ mod tests {
         make_ref(&pool, &cid, "r1", "code", None, vec![], Some("staged"), None).await;
         make_ref(&pool, &cid, "r2", "code", None, vec![], Some("delivered"), None).await;
 
-        let result = query_refs(
+        let result = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 lifecycle: Some("staged".into()),
@@ -599,7 +599,7 @@ mod tests {
         make_ref(&pool, &cid, "r1", "code", None, vec![], None, Some("sensitive")).await;
         make_ref(&pool, &cid, "r2", "code", None, vec![], None, Some("public")).await;
 
-        let result = query_refs(
+        let result = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 confidentiality: Some("sensitive".into()),
@@ -625,7 +625,7 @@ mod tests {
             .await
             .expect("archive");
 
-        let result = query_refs(
+        let result = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 disposition: Some("archived".into()),
@@ -644,7 +644,7 @@ mod tests {
         let cid = make_collection(&pool).await;
         make_ref(&pool, &cid, "r1", "code", None, vec![], None, None).await;
 
-        let result = query_refs(
+        let result = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 source_id: Some("src_local_fs_default".into()),
@@ -655,7 +655,7 @@ mod tests {
         .expect("query ok");
         assert_eq!(result.total, 1);
 
-        let empty = query_refs(
+        let empty = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 source_id: Some("no_such_source".into()),
@@ -678,7 +678,7 @@ mod tests {
         make_ref(&pool, &cid, "r3", "document", None, vec!["core"], Some("active"), Some("internal")).await;
         make_ref(&pool, &cid, "r4", "code", None, vec!["other"], Some("active"), Some("internal")).await;
 
-        let result = query_refs(
+        let result = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 ref_type: Some("code".into()),
@@ -705,7 +705,7 @@ mod tests {
         make_ref(&pool, &cid, "r4", "code", None, vec!["b", "c"], None, None).await;
 
         // 单标签
-        let r = query_refs(
+        let r = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 tags: Some(vec!["a".into()]),
@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(r.total, 3);
 
         // 两个标签 AND
-        let r = query_refs(
+        let r = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 tags: Some(vec!["a".into(), "b".into()]),
@@ -731,7 +731,7 @@ mod tests {
         assert!(names.contains(&"r1") && names.contains(&"r2"));
 
         // 三个标签 AND
-        let r = query_refs(
+        let r = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 tags: Some(vec!["a".into(), "b".into(), "c".into()]),
@@ -744,7 +744,7 @@ mod tests {
         assert_eq!(r.items[0].name, "r1");
 
         // 不存在的标签组合
-        let r = query_refs(
+        let r = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 tags: Some(vec!["a".into(), "nonexistent".into()]),
@@ -767,7 +767,7 @@ mod tests {
         make_ref(&pool, &cid, "其他", "code", Some("无关"), vec![], None, None).await;
 
         // 匹配 name
-        let r = query_refs(
+        let r = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 keyword: Some("设计".into()),
@@ -779,7 +779,7 @@ mod tests {
         assert_eq!(r.total, 2); // "设计文档" (name) + "代码" (description 含"设计")
 
         // 仅匹配 description
-        let r = query_refs(
+        let r = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 keyword: Some("架构".into()),
@@ -801,7 +801,7 @@ mod tests {
         make_ref(&pool, &cid, "100 percent complete", "code", None, vec![], None, None).await;
 
         // 用户输入 % 应被转义，仅匹配字面值
-        let r = query_refs(
+        let r = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 keyword: Some("100%".into()),
@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(r.items[0].name, "100%_complete");
 
         // 用户输入 _ 应被转义
-        let r = query_refs(
+        let r = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 keyword: Some("%_".into()),
@@ -838,7 +838,7 @@ mod tests {
         }
 
         // 第一页
-        let page1 = query_refs(
+        let page1 = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 limit: Some(3),
@@ -852,7 +852,7 @@ mod tests {
         assert_eq!(page1.items.len(), 3);
 
         // 第二页
-        let page2 = query_refs(
+        let page2 = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 limit: Some(3),
@@ -873,7 +873,7 @@ mod tests {
         }
 
         // 最后一页
-        let last = query_refs(
+        let last = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 limit: Some(3),
@@ -896,7 +896,7 @@ mod tests {
         }
 
         // limit 超上限 → 截断为 200（不会报错）
-        let r = query_refs(
+        let r = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 limit: Some(99999),
@@ -909,7 +909,7 @@ mod tests {
         assert_eq!(r.items.len(), 5);
 
         // limit=0 → 至少为 1
-        let r = query_refs(
+        let r = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 limit: Some(0),
@@ -921,7 +921,7 @@ mod tests {
         assert_eq!(r.items.len(), 1);
 
         // 默认 limit=50
-        let r = query_refs(&pool, QueryRefsFilter::default()).await.expect("q");
+        let r = query_refs_impl(&pool, QueryRefsFilter::default()).await.expect("q");
         assert_eq!(r.items.len(), 5);
     }
 
@@ -938,7 +938,7 @@ mod tests {
             ids.push(id);
         }
 
-        let r = query_refs(&pool, QueryRefsFilter::default()).await.expect("q");
+        let r = query_refs_impl(&pool, QueryRefsFilter::default()).await.expect("q");
         assert_eq!(r.items.len(), 5);
         // created_at DESC, id ASC：相同 created_at 时按 id 升序
         for w in r.items.windows(2) {
@@ -957,7 +957,7 @@ mod tests {
     #[tokio::test]
     async fn query_refs_err_invalid_enum() {
         let pool = setup().await;
-        let err = query_refs(
+        let err = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 ref_type: Some("bogus".into()),
@@ -968,7 +968,7 @@ mod tests {
         .expect_err("should fail");
         assert_eq!(err.code, "COMMON_INVALID_PARAM");
 
-        let err = query_refs(
+        let err = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 lifecycle: Some("bogus".into()),
@@ -979,7 +979,7 @@ mod tests {
         .expect_err("should fail");
         assert_eq!(err.code, "COMMON_INVALID_PARAM");
 
-        let err = query_refs(
+        let err = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 confidentiality: Some("bogus".into()),
@@ -990,7 +990,7 @@ mod tests {
         .expect_err("should fail");
         assert_eq!(err.code, "COMMON_INVALID_PARAM");
 
-        let err = query_refs(
+        let err = query_refs_impl(
             &pool,
             QueryRefsFilter {
                 disposition: Some("bogus".into()),
@@ -1010,7 +1010,7 @@ mod tests {
         let cid = make_collection(&pool).await;
         make_ref(&pool, &cid, "r1", "code", None, vec!["t1"], None, None).await;
 
-        let r = query_refs(&pool, QueryRefsFilter::default()).await.expect("q");
+        let r = query_refs_impl(&pool, QueryRefsFilter::default()).await.expect("q");
         let json = serde_json::to_value(&r).expect("serialize");
         let obj = json.as_object().expect("object");
         assert!(obj.contains_key("total"));
@@ -1038,7 +1038,7 @@ mod tests {
         make_ref(&pool, &cid, "r2", "code", None, vec!["a"], Some("staged"), Some("sensitive")).await;
         make_ref(&pool, &cid, "r3", "document", None, vec!["b"], Some("active"), Some("internal")).await;
 
-        let f = query_facets(&pool, None).await.expect("facets");
+        let f = query_facets_impl(&pool, None).await.expect("facets");
 
         // types: code=2, document=1
         assert_eq!(f.types.len(), 2);
@@ -1074,13 +1074,13 @@ mod tests {
         make_ref(&pool, &c1, "r1", "code", None, vec!["x"], None, None).await;
         make_ref(&pool, &c2, "r2", "document", None, vec!["y"], None, None).await;
 
-        let f = query_facets(&pool, Some(PRESET_SPACE.into())).await.expect("facets");
+        let f = query_facets_impl(&pool, Some(PRESET_SPACE.into())).await.expect("facets");
         assert_eq!(f.types.len(), 1);
         assert_eq!(f.types[0].value, "code");
         assert_eq!(f.tags.len(), 1);
         assert_eq!(f.tags[0].value, "x");
 
-        let f2 = query_facets(&pool, Some(PRESET_SPACE_OTHER.into()))
+        let f2 = query_facets_impl(&pool, Some(PRESET_SPACE_OTHER.into()))
             .await
             .expect("facets");
         assert_eq!(f2.types.len(), 1);
@@ -1090,7 +1090,7 @@ mod tests {
     #[tokio::test]
     async fn query_facets_empty_db() {
         let pool = setup().await;
-        let f = query_facets(&pool, None).await.expect("facets");
+        let f = query_facets_impl(&pool, None).await.expect("facets");
         assert!(f.types.is_empty());
         assert!(f.lifecycles.is_empty());
         assert!(f.confidentialities.is_empty());
@@ -1103,7 +1103,7 @@ mod tests {
         let cid = make_collection(&pool).await;
         make_ref(&pool, &cid, "r1", "code", None, vec!["t"], None, None).await;
 
-        let f = query_facets(&pool, None).await.expect("facets");
+        let f = query_facets_impl(&pool, None).await.expect("facets");
         let json = serde_json::to_value(&f).expect("serialize");
         let obj = json.as_object().expect("object");
         assert!(obj.contains_key("types"));
