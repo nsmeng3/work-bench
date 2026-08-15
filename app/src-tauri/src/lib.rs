@@ -4,6 +4,7 @@ mod collection;
 mod db;
 mod error;
 mod fs_ops;
+mod landing;
 mod query;
 mod reference;
 mod space;
