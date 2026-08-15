@@ -509,9 +509,19 @@ pub struct ManagedPlan {
 /// 选用 `tokio::sync::Mutex` 而非 `std::sync::Mutex`：
 /// - 临界区内含 `.await`（文件 IO + sqlx 事务），异步 Mutex 可跨 await 持有；
 /// - 与既有异步命令风格一致，避免在 async 上下文里阻塞 executor 线程。
-static MANAGED_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// 全局托管写互斥锁（详细设计 §5 多步写互斥）。
+///
+/// 跨模块共享：
+/// - M3-3.2 `ref_create_managed` 落地 + 写库
+/// - M4-4.5 销毁（预留）
+/// - M4-4.8 `settings_change_root_dir` 迁移模式（migrate 策略）
+///
+/// `pub(crate)` 暴露给 `settings` 模块与其测试复用，保证「迁移模式期间禁止
+/// 新的托管落地与处置操作」（详细设计 §4.4）。
+pub(crate) static MANAGED_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn managed_write_lock() -> &'static Mutex<()> {
+/// 获取全局托管写互斥锁（懒初始化）。
+pub(crate) fn managed_write_lock() -> &'static Mutex<()> {
     MANAGED_WRITE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
