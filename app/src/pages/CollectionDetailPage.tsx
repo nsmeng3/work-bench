@@ -379,7 +379,7 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
         confirmLoading={saving}
         okText="保存"
         cancelText="取消"
-        destroyOnHidden
+        forceRender
         maskClosable={false}
       >
         {editingRef && (

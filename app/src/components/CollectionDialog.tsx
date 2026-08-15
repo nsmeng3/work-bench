@@ -77,7 +77,7 @@ export function CollectionDialog({ open, spaceId, collection, onClose, onSaved }
         onOk={handleOk}
         okText={isEdit ? "保存" : "创建"}
         cancelText="取消"
-        destroyOnHidden
+        forceRender
         maskClosable={false}
       >
         <Form form={form} layout="vertical" preserve={false}>

@@ -79,7 +79,8 @@ export function SpaceDialog({ open, space, onClose, onSaved }: SpaceDialogProps)
         onOk={handleOk}
         okText={isEdit ? "保存" : "创建"}
         cancelText="取消"
-        destroyOnHidden
+        destroyOnHidden={false}
+        forceRender
         maskClosable={false}
       >
         <Form form={form} layout="vertical" preserve={false}>
