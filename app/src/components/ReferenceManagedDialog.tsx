@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Button,
@@ -6,6 +6,7 @@ import {
   Form,
   Input,
   Modal,
+  Progress,
   Radio,
   Space as AntSpace,
   Typography,
@@ -22,6 +23,7 @@ import type {
 } from "../api";
 import { refCreateManaged, toApiError } from "../api";
 import { ReferenceBaseFields } from "./ReferenceBaseFields";
+import { useManagedProgress } from "../hooks/useManagedProgress";
 
 const { Text } = Typography;
 
@@ -126,6 +128,14 @@ export function ReferenceManagedDialog({
   const [targetName, setTargetName] = useState<string>("");
   const [managedAction, setManagedAction] = useState<ManagedAction>("copy");
 
+  // m3-3.7 进度展示：当前 confirmed 任务的临时 refId 与失败标记
+  const [currentRefId, setCurrentRefId] = useState<string | null>(null);
+  const [progressFailed, setProgressFailed] = useState(false);
+  // 用于失败"短暂停留后关闭"的定时器
+  const failureTimerRef = useRef<number | null>(null);
+  const { get: getProgress, clear: clearProgress } = useManagedProgress();
+  const currentProgress = getProgress(currentRefId);
+
   // 打开时重置
   useEffect(() => {
     if (open) {
@@ -134,6 +144,8 @@ export function ReferenceManagedDialog({
       setStageOneValues(null);
       setTargetName("");
       setManagedAction("copy");
+      setCurrentRefId(null);
+      setProgressFailed(false);
       form.setFieldsValue({
         path: "",
         type: "document",
@@ -147,6 +159,16 @@ export function ReferenceManagedDialog({
       form.resetFields();
     }
   }, [open, form]);
+
+  // 卸载时清理失败定时器
+  useEffect(() => {
+    return () => {
+      if (failureTimerRef.current !== null) {
+        window.clearTimeout(failureTimerRef.current);
+        failureTimerRef.current = null;
+      }
+    };
+  }, []);
 
   async function handlePick(kind: "file" | "directory") {
     const path = await pickPath(kind);
@@ -237,11 +259,13 @@ export function ReferenceManagedDialog({
     if (!plan || !stageOneValues) return;
     if (activeConflicts.length > 0) return; // 防御：按钮已禁用
 
-    // 3.7 hook：生成临时 refId 供后续订阅 managed_progress 事件
+    // m3-3.7：生成临时 refId 并订阅 managed_progress 事件做进度展示
     const tempRefId = makeTempRefId();
+    setCurrentRefId(tempRefId);
+    setProgressFailed(false);
     onRefIdReady?.(tempRefId);
     // eslint-disable-next-line no-console
-    console.log("[m3-3.6] confirmed 调用临时 refId（供 3.7 订阅进度事件）:", tempRefId);
+    console.log("[m3-3.7] confirmed 调用临时 refId（订阅 managed_progress）:", tempRefId);
 
     const input: RefCreateManagedInput = {
       collectionId,
@@ -263,11 +287,28 @@ export function ReferenceManagedDialog({
     setConfirmLoading(true);
     try {
       await refCreateManaged({ ...input, confirmed: true });
-      messageApi.success("已导入并托管");
+      messageApi.success(`已导入并托管到 ${targetPreview}`);
+      clearProgress(tempRefId);
+      setCurrentRefId(null);
       onCreated();
       onClose();
     } catch (err) {
       const apiErr = toApiError(err);
+      // m3-3.7 失败处理（固化选择）：进度条 status="exception" 短暂停留（1.5s）后关闭确认框。
+      // 备选方案是"留在确认框允许重试"，本任务选择前者，避免用户在失败态下误点重试
+      // 导致后端冲突；用户可重新打开对话框再次尝试。
+      setProgressFailed(true);
+      if (failureTimerRef.current !== null) {
+        window.clearTimeout(failureTimerRef.current);
+      }
+      failureTimerRef.current = window.setTimeout(() => {
+        failureTimerRef.current = null;
+        clearProgress(tempRefId);
+        setCurrentRefId(null);
+        setProgressFailed(false);
+        onClose();
+      }, 1500);
+
       if (apiErr.code === "FS_TARGET_EXISTS") {
         messageApi.error(`目标已存在：${apiErr.message}。请修改目标名后重试。`);
       } else if (apiErr.code === "FS_PATH_NOT_FOUND") {
@@ -277,7 +318,6 @@ export function ReferenceManagedDialog({
       } else {
         messageApi.error(apiErr.retryable ? `${apiErr.message}（可重试）` : apiErr.message);
       }
-      // 不关闭弹窗，允许用户修正后重试
     } finally {
       setConfirmLoading(false);
     }
@@ -285,7 +325,20 @@ export function ReferenceManagedDialog({
 
   function handleCancel() {
     // 任何阶段取消都直接关闭，无写操作
-    if (planLoading || confirmLoading) return;
+    if (planLoading) return;
+    // m3-3.7 已知限制（契约冻结）：confirmed 进行中允许取消，但**不真正中断后端复制**。
+    // 后端无取消机制（详见任务包 m3-3.7 §5）；此处仅 UI 隐藏进度，后台复制继续完成。
+    // 用户重新打开对话框时不会看到上次的进度（currentRefId 已重置）。
+    if (confirmLoading) {
+      if (currentRefId) {
+        clearProgress(currentRefId);
+      }
+      setCurrentRefId(null);
+      setProgressFailed(false);
+      setConfirmLoading(false);
+      onClose();
+      return;
+    }
     onClose();
   }
 
@@ -317,7 +370,8 @@ export function ReferenceManagedDialog({
               <Button onClick={handleBack} disabled={confirmLoading}>
                 上一步
               </Button>
-              <Button onClick={handleCancel} disabled={confirmLoading}>
+              {/* m3-3.7：confirmed 进行中允许取消（仅 UI 隐藏进度，后端继续复制 —— 已知限制） */}
+              <Button onClick={handleCancel}>
                 取消
               </Button>
               <Button
@@ -476,6 +530,60 @@ export function ReferenceManagedDialog({
                 message="移动动作将删除源文件"
                 description="确认后源路径下的文件将被移动到目标位置，此操作不可撤销。"
               />
+            )}
+
+            {/* m3-3.7 进度展示：confirmed 进行中渲染 Progress；多任务通过 refId 区分（本对话框同一时刻仅一个任务） */}
+            {confirmLoading && currentRefId && (
+              <div style={{ marginTop: 16 }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  正在{managedAction === "move" ? "移动" : "复制"}文件…
+                </Text>
+                {(() => {
+                  // total === 0（空文件/空目录）显示 indeterminate 态
+                  const total = currentProgress?.total ?? 0;
+                  const bytes = currentProgress?.bytes ?? 0;
+                  const percent =
+                    total > 0 ? Math.min(100, Math.round((bytes / total) * 100)) : 0;
+                  const status = progressFailed ? ("exception" as const) : undefined;
+                  if (total === 0) {
+                    return (
+                      <Progress
+                        percent={100}
+                        status={progressFailed ? "exception" : "active"}
+                        showInfo={false}
+                      />
+                    );
+                  }
+                  return (
+                    <>
+                      <Progress percent={percent} status={status} />
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        {formatBytes(bytes)} / {formatBytes(total)}
+                      </Text>
+                    </>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* 失败短暂停留期间也保留进度条显示（status=exception） */}
+            {!confirmLoading && progressFailed && currentRefId && currentProgress && (
+              <div style={{ marginTop: 16 }}>
+                <Progress
+                  percent={
+                    currentProgress.total > 0
+                      ? Math.min(
+                          100,
+                          Math.round((currentProgress.bytes / currentProgress.total) * 100),
+                        )
+                      : 100
+                  }
+                  status="exception"
+                />
+                <Text type="danger" style={{ fontSize: 12 }}>
+                  导入失败，对话框即将关闭…
+                </Text>
+              </div>
             )}
           </>
         ) : null}
