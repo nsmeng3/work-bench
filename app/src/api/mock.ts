@@ -13,6 +13,7 @@ import type {
   Reference,
   ReferenceType,
   ReferenceWithHealth,
+  RefUpdateInput,
 } from "./types";
 
 /**
@@ -246,7 +247,7 @@ function makeRef(partial: Partial<Reference> & Pick<Reference, "id" | "collectio
 }
 
 /** 种子引用：覆盖六类型中的 code/document/data 三类有数据，其余为空；三种 health 各至少一条 */
-const seedReferences: ReferenceWithHealth[] = [
+let seedReferences: ReferenceWithHealth[] = [
   // code
   {
     ref: makeRef({
@@ -318,3 +319,36 @@ function buildReferencesByType(collectionId: string): Record<ReferenceType, Refe
   }
   return grouped;
 }
+
+/* ---------------- 引用管理 mock（ref_update） ---------------- */
+
+export const mockReferenceApi = {
+  /**
+   * §2.5 ref_update：仅允许修改管理属性；type/locator/hosting 不可改。
+   * tags 为全量替换语义。
+   */
+  ref_update(input: RefUpdateInput): Reference {
+    const idx = seedReferences.findIndex((r) => r.ref.id === input.id);
+    if (idx === -1)
+      throw { code: "COMMON_NOT_FOUND", message: "引用不存在", retryable: false };
+    const item = seedReferences[idx];
+    if (input.name !== undefined && input.name.trim() === "")
+      throw { code: "COMMON_INVALID_ARGUMENT", message: "名称不能为空", retryable: false };
+    const updated: Reference = {
+      ...item.ref,
+      name: input.name ?? item.ref.name,
+      description: input.description ?? item.ref.description,
+      tags: input.tags ?? item.ref.tags,
+      lifecycle: input.lifecycle ?? item.ref.lifecycle,
+      confidentiality: input.confidentiality ?? item.ref.confidentiality,
+      indexed: input.indexed ?? item.ref.indexed,
+      updatedAt: unixNow(),
+    };
+    seedReferences = [
+      ...seedReferences.slice(0, idx),
+      { ...item, ref: updated },
+      ...seedReferences.slice(idx + 1),
+    ];
+    return updated;
+  },
+};

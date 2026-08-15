@@ -150,6 +150,21 @@ export interface ReferenceWithHealth {
   health: ReferenceHealth;
 }
 
+/**
+ * ref_update 入参 — §2.5：仅允许修改管理属性；
+ * type / locator / hosting 不可改，故不在此出现。
+ * 所有字段可选，仅传入需要修改的字段；tags 为全量替换语义。
+ */
+export interface RefUpdateInput {
+  id: string;
+  name?: string;
+  description?: string;
+  tags?: string[];
+  lifecycle?: ReferenceLifecycle;
+  confidentiality?: ReferenceConfidentiality;
+  indexed?: boolean;
+}
+
 /** collection_get 出参 — §2.4 CollectionDetail */
 export interface CollectionDetail {
   id: string;
