@@ -11,6 +11,7 @@ mod reference;
 mod settings;
 mod space;
 mod tag;
+mod watch;
 
 use sqlx::sqlite::SqlitePool;
 
@@ -49,6 +50,27 @@ pub fn run() {
             }
 
             app.manage(AppState { pool });
+
+            // m5-5.1 · 启动目录监听器（详细设计 §5.2）。
+            // 事件通道先建 256 缓冲；上层消费者（5.2 忽略规则 / 5.3 聚合窗口）后续接入。
+            // 启动失败仅记录日志，不阻塞应用启动。
+            {
+                let pool_for_watch = app.state::<AppState>().pool.clone();
+                let (tx, _rx) = tokio::sync::mpsc::channel::<watch::WatchEvent>(256);
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    match watch::start_watchers(pool_for_watch, tx).await {
+                        Ok(handle) => {
+                            // manage 到 State，供 5.4 增量订阅 / 应用退出时 stop_watchers 使用。
+                            app_handle.manage(handle);
+                        }
+                        Err(e) => {
+                            eprintln!("[startup] 启动目录监听失败: {}", e);
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
