@@ -1,5 +1,6 @@
 //! 应用入口：注册命令、初始化数据库连接池。
 
+mod aggregate;
 mod collection;
 mod db;
 mod disposition;
@@ -82,12 +83,20 @@ pub fn run() {
                             // manage 到 State，供 5.4 inbox_ignore 触发规则重载时写入。
                             app_handle.manage(shared_rules.clone());
 
-                            // 过滤后的事件流出口：5.3 聚合窗口将消费 filtered_rx。
-                            let (filtered_tx, _filtered_rx) =
+                            // 过滤后的事件流出口：5.3 聚合窗口消费 filtered_rx。
+                            let (filtered_tx, filtered_rx) =
                                 tokio::sync::mpsc::channel::<watch::WatchEvent>(256);
                             let _filter_handle =
                                 ignore::filter_events(rx, filtered_tx, shared_rules);
                             // _filter_handle 在后台持续运行；应用退出时随 runtime 关闭。
+
+                            // m5-5.3 · 聚合窗口：消费 5.2 过滤后的事件流，
+                            // 按 5 秒窗口缓冲合并写入 inbox_item。
+                            let _aggregator_handle = aggregate::start_aggregator(
+                                pool_for_watch.clone(),
+                                filtered_rx,
+                            );
+                            // _aggregator_handle 在后台持续运行；应用退出时随 runtime 关闭。
                         }
                         Err(e) => {
                             eprintln!("[startup] 启动目录监听失败: {}", e);
