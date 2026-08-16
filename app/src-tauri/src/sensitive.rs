@@ -46,6 +46,21 @@ pub const SENSITIVE_PATTERNS: &[&str] = &[
     "*.jks",
 ];
 
+/// 敏感目录规则（m5-5.9）：目录段子串命中即整目录敏感。
+///
+/// 规则为「目录段精确匹配」：把路径按 `/` 切段后，任一段与规则相等即命中。
+/// 用目录段而非裸子串，避免 `secretary/` 误命中 `secret`。
+pub const SENSITIVE_DIR_PATTERNS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    "secrets",
+    "secret",
+    "deny",
+    "credentials",
+    "private",
+];
+
 // ============================================================
 // 匹配（纯函数）
 // ============================================================
@@ -98,6 +113,31 @@ pub fn is_sensitive(path: &Path) -> bool {
         .any(|rule| pattern_matches(rule, path))
 }
 
+/// 命中路径的敏感目录段名（若有）。
+///
+/// 把路径按 `/` 切段（跳过最后一段文件名），任一段等于
+/// `SENSITIVE_DIR_PATTERNS` 中的规则即返回该段名。
+pub fn matched_sensitive_dir(path: &Path) -> Option<String> {
+    let slash = path_to_slash(path);
+    let mut segments: Vec<&str> = slash.split('/').collect();
+    // 最后一段是文件名，不属于「目录」
+    segments.pop();
+    for seg in segments {
+        if seg.is_empty() {
+            continue;
+        }
+        if SENSITIVE_DIR_PATTERNS.contains(&seg) {
+            return Some(seg.to_string());
+        }
+    }
+    None
+}
+
+/// 判断路径是否位于敏感目录下（m5-5.9，纯函数）。
+pub fn is_in_sensitive_dir(path: &Path) -> bool {
+    matched_sensitive_dir(path).is_some()
+}
+
 /// 敏感文件的风险提示文案。
 ///
 /// 包含文件名（前端直接渲染为黄色 Alert 标题/正文）。
@@ -107,6 +147,18 @@ pub fn sensitive_warning(path: &Path) -> String {
     format!(
         "「{}」可能是敏感文件（含凭据 / 密钥 / 配置），已禁用内容预览以防泄露。",
         name
+    )
+}
+
+/// 敏感目录命中的风险提示文案（m5-5.9）。
+///
+/// 包含命中的目录段名与文件名，便于用户理解为何被禁用预览。
+pub fn sensitive_dir_warning(path: &Path) -> String {
+    let name = file_name(path).unwrap_or("<未知文件>");
+    let dir = matched_sensitive_dir(path).unwrap_or_else(|| "<未知目录>".to_string());
+    format!(
+        "「{}」位于敏感目录「{}」下，已禁用内容预览以防泄露。",
+        name, dir
     )
 }
 
@@ -236,5 +288,73 @@ mod tests {
     fn warning_indicates_preview_disabled() {
         let msg = sensitive_warning(&p("/proj/.env"));
         assert!(msg.contains("预览"), "提示应说明预览被禁用: {}", msg);
+    }
+
+    // ---------- 敏感目录（m5-5.9） ----------
+
+    #[test]
+    fn dir_sensitive_ssh() {
+        assert!(is_in_sensitive_dir(&p("/home/user/.ssh/known_hosts")));
+    }
+
+    #[test]
+    fn dir_sensitive_secrets() {
+        assert!(is_in_sensitive_dir(&p("/proj/secrets/api_token.txt")));
+    }
+
+    #[test]
+    fn dir_sensitive_secret() {
+        assert!(is_in_sensitive_dir(&p("/proj/secret/config.yaml")));
+    }
+
+    #[test]
+    fn dir_sensitive_deny() {
+        assert!(is_in_sensitive_dir(&p("/data/deny/report.pdf")));
+    }
+
+    #[test]
+    fn dir_sensitive_nested() {
+        // 深层嵌套也应命中
+        assert!(is_in_sensitive_dir(&p("/a/b/c/private/d/e.txt")));
+    }
+
+    #[test]
+    fn dir_not_sensitive_substring_secretary() {
+        // 「secretary」不应命中「secret」——目录段精确匹配
+        assert!(!is_in_sensitive_dir(&p("/proj/secretary/notes.md")));
+    }
+
+    #[test]
+    fn dir_not_sensitive_normal() {
+        assert!(!is_in_sensitive_dir(&p("/docs/report.pdf")));
+    }
+
+    #[test]
+    fn dir_not_sensitive_file_segment_ignored() {
+        // 文件名叫 "secret" 不算目录命中（最后一段被剔除）
+        assert!(!is_in_sensitive_dir(&p("/proj/secret")));
+    }
+
+    #[test]
+    fn dir_matched_returns_segment() {
+        assert_eq!(
+            matched_sensitive_dir(&p("/home/user/.aws/credentials.bak")),
+            Some(".aws".to_string())
+        );
+    }
+
+    #[test]
+    fn dir_warning_contains_dir_and_name() {
+        let msg = sensitive_dir_warning(&p("/proj/secrets/token.txt"));
+        assert!(msg.contains("secrets"), "提示应包含目录名: {}", msg);
+        assert!(msg.contains("token.txt"), "提示应包含文件名: {}", msg);
+    }
+
+    #[test]
+    fn dir_sensitive_file_also_sensitive_via_dir() {
+        // 一个普通文件名，仅因所在目录敏感而被拦截
+        let path = p("/proj/deny/normal.txt");
+        assert!(!is_sensitive(&path), "文件名本身不敏感");
+        assert!(is_in_sensitive_dir(&path), "但所在目录敏感");
     }
 }

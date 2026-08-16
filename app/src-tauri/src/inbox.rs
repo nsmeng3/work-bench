@@ -23,6 +23,7 @@ use crate::error::{AppError, CmdResult};
 use crate::ignore::{self, IgnoreRule};
 use crate::reference::{self, Locator, ManagedAction, ManagedCreateResult, ManagedPlan, Reference};
 use crate::sensitive;
+use crate::types::WatchDirConfig;
 
 // ============================================================
 // 常量
@@ -254,11 +255,24 @@ const PREVIEW_MAX_LINES: usize = 50;
 const PREVIEW_MAX_BYTES: usize = 16 * 1024;
 
 /// 构造 `InboxItemDetail`：敏感判定 + 文本预览。
+///
+/// m5-5.5：命中 `SENSITIVE_PATTERNS` 的文件禁用预览。
+/// m5-5.9：位于 `SENSITIVE_DIR_PATTERNS` 目录下的文件同样禁用预览，
+///         且风险提示说明命中的是目录段。
 fn build_detail(item: InboxItem) -> InboxItemDetail {
     let path = std::path::Path::new(&item.path);
 
     if sensitive::is_sensitive(path) {
         let warning = sensitive::sensitive_warning(path);
+        return InboxItemDetail {
+            item,
+            preview: None,
+            sensitive_warning: Some(warning),
+        };
+    }
+
+    if sensitive::is_in_sensitive_dir(path) {
+        let warning = sensitive::sensitive_dir_warning(path);
         return InboxItemDetail {
             item,
             preview: None,
@@ -729,6 +743,123 @@ pub async fn inbox_stats(state: tauri::State<'_, crate::AppState>) -> CmdResult<
 }
 
 // ============================================================
+// 监控目录命令（M6-6.1 契约）
+// ============================================================
+
+/// 监控目录允许的根前缀（路径校验白名单）。
+const WATCH_DIR_ROOT_PREFIX: &str =
+    "/Users/differentw/data/00_Admin/workbench/Code/Documents/";
+
+fn row_to_watch_dir(row: &sqlx::sqlite::SqliteRow) -> Result<WatchDirConfig, sqlx::Error> {
+    Ok(WatchDirConfig {
+        id: row.try_get("id")?,
+        path: row.try_get("path")?,
+        name: row.try_get("name")?,
+        description: row.try_get("description")?,
+    })
+}
+
+#[tauri::command]
+pub async fn watch_dir_get(state: tauri::State<'_, crate::AppState>) -> CmdResult<Vec<WatchDirConfig>> {
+    let rows = sqlx::query(
+        "SELECT id, path, name, description \
+         FROM watch_dir \
+         ORDER BY path ASC",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::from)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(row_to_watch_dir(row).map_err(AppError::from)?);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn watch_dir_set(
+    state: tauri::State<'_, crate::AppState>,
+    input: WatchDirConfig,
+) -> CmdResult<WatchDirConfig> {
+    // 路径校验：必须在 Code/Documents 子树内
+    if !input.path.starts_with(WATCH_DIR_ROOT_PREFIX) {
+        return Err(AppError::invalid_param(format!(
+            "监控目录必须位于 {} 子树内: {}",
+            WATCH_DIR_ROOT_PREFIX, input.path
+        )));
+    }
+    if input.path.trim().is_empty() {
+        return Err(AppError::invalid_param("监控目录路径不能为空"));
+    }
+
+    // 已存在同 path → 视为更新 name/description（UPSERT 语义）
+    let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM watch_dir WHERE path = ?")
+        .bind(&input.path)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(AppError::from)?;
+
+    let now = now_unix();
+    match existing {
+        Some((existing_id,)) => {
+            sqlx::query(
+                "UPDATE watch_dir SET name = ?, description = ? WHERE id = ?",
+            )
+            .bind(&input.name)
+            .bind(&input.description)
+            .bind(&existing_id)
+            .execute(&state.pool)
+            .await
+            .map_err(AppError::from)?;
+            Ok(WatchDirConfig {
+                id: existing_id,
+                ..input
+            })
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO watch_dir (id, path, name, description, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&input.id)
+            .bind(&input.path)
+            .bind(&input.name)
+            .bind(&input.description)
+            .bind(now)
+            .execute(&state.pool)
+            .await
+            .map_err(AppError::from)?;
+            Ok(input)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn watch_dir_unset(
+    state: tauri::State<'_, crate::AppState>,
+    path: String,
+) -> CmdResult<WatchDirConfig> {
+    // 先查出再删，保证返回值携带被删配置
+    let row = sqlx::query(
+        "SELECT id, path, name, description FROM watch_dir WHERE path = ?",
+    )
+    .bind(&path)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(AppError::from)?
+    .ok_or_else(|| AppError::not_found(format!("监控目录不存在: {}", path)))?;
+    let cfg = row_to_watch_dir(&row).map_err(AppError::from)?;
+
+    sqlx::query("DELETE FROM watch_dir WHERE path = ?")
+        .bind(&path)
+        .execute(&state.pool)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok(cfg)
+}
+
+// ============================================================
 // 单元测试
 // ============================================================
 
@@ -963,6 +1094,56 @@ mod tests {
 
         let detail = get(&pool, id).await.expect("get");
         assert!(detail.preview.is_none());
+        assert!(detail.sensitive_warning.is_none());
+    }
+
+    // ---------- inbox_get · m5-5.9 敏感目录保护 ----------
+
+    #[tokio::test]
+    async fn inbox_get_in_deny_dir_no_preview() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let deny_dir = dir.path().join("deny");
+        std::fs::create_dir_all(&deny_dir).expect("mkdir");
+        let f = deny_dir.join("normal.txt");
+        std::fs::write(&f, b"hello\n").expect("w");
+        let id = make_pending(&pool, &f).await;
+
+        let detail = get(&pool, id).await.expect("get");
+        assert!(detail.preview.is_none(), "敏感目录下文件不应有预览");
+        let warning = detail.sensitive_warning.expect("sensitiveWarning");
+        assert!(warning.contains("deny"), "提示应包含目录名: {}", warning);
+        assert!(warning.contains("normal.txt"), "提示应包含文件名: {}", warning);
+    }
+
+    #[tokio::test]
+    async fn inbox_get_in_secrets_dir_no_preview() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("mkdir");
+        let f = secrets_dir.join("notes.md");
+        std::fs::write(&f, b"# notes\n").expect("w");
+        let id = make_pending(&pool, &f).await;
+
+        let detail = get(&pool, id).await.expect("get");
+        assert!(detail.preview.is_none());
+        assert!(detail.sensitive_warning.is_some());
+    }
+
+    #[tokio::test]
+    async fn inbox_get_secretary_dir_not_sensitive() {
+        // 「secretary」目录段不应命中「secret」规则
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let secretary_dir = dir.path().join("secretary");
+        std::fs::create_dir_all(&secretary_dir).expect("mkdir");
+        let f = secretary_dir.join("memo.md");
+        std::fs::write(&f, b"# memo\n").expect("w");
+        let id = make_pending(&pool, &f).await;
+
+        let detail = get(&pool, id).await.expect("get");
+        assert!(detail.preview.is_some(), "secretary 目录不应被误判为敏感");
         assert!(detail.sensitive_warning.is_none());
     }
 
