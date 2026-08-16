@@ -146,26 +146,42 @@ export function CollectionPage({ space, onBack, onEnterCollection }: CollectionP
       width: 220,
       render: (_, record) => (
         <AntSpace>
-          <Tooltip title="查看资源集详情">
-            <Button size="small" type="link" onClick={() => onEnterCollection(record)}>
-              详情
-            </Button>
-          </Tooltip>
           {record.status === "active" ? (
             <>
               <Tooltip title="编辑资源集">
-                <Button size="small" onClick={() => handleEdit(record)}>
+                <Button
+                  size="small"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleEdit(record);
+                  }}
+                >
                   编辑
                 </Button>
               </Tooltip>
               <Tooltip title="归档后不可编辑">
-                <Button size="small" danger onClick={() => handleArchiveClick(record)}>
+                <Button
+                  size="small"
+                  danger
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleArchiveClick(record);
+                  }}
+                >
                   归档
                 </Button>
               </Tooltip>
             </>
           ) : (
-            <Button size="small" type="primary" ghost onClick={() => handleRestore(record)}>
+            <Button
+              size="small"
+              type="primary"
+              ghost
+              onClick={(e) => {
+                e.stopPropagation();
+                handleRestore(record);
+              }}
+            >
               恢复
             </Button>
           )}
@@ -221,6 +237,10 @@ export function CollectionPage({ space, onBack, onEnterCollection }: CollectionP
         dataSource={collections}
         columns={columns}
         pagination={false}
+        onRow={(record) => ({
+          onClick: () => onEnterCollection(record),
+          style: { cursor: "pointer" },
+        })}
         locale={{
           emptyText:
             statusFilter === "active"
