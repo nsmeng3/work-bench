@@ -38,6 +38,9 @@ thiserror = "2"
 # m4-4.4 · disp_soft_delete：跨平台系统回收站（macOS Finder / Windows Recycle Bin / freedesktop Trash）
 # 版本：5.2.6（cargo add trash 当前稳定版；语义化版本约束 "5.2.6" 兼容 5.x 后续 patch）
 trash = "5.2.6"
+# m5-5.1 · 目录监听：跨平台文件系统事件（macOS FSEvents / Windows ReadDirectoryChangesW / Linux inotify）
+# 版本：8.2.0（cargo add notify 当前稳定版；语义化版本约束 "8.2.0" 兼容 8.x 后续 patch）
+notify = "8.2.0"
 
 [dev-dependencies]
 tempfile = "3"
