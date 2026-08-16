@@ -5,6 +5,7 @@ mod db;
 mod disposition;
 mod error;
 mod fs_ops;
+mod ignore;
 mod landing;
 mod query;
 mod reference;
@@ -56,13 +57,37 @@ pub fn run() {
             // 启动失败仅记录日志，不阻塞应用启动。
             {
                 let pool_for_watch = app.state::<AppState>().pool.clone();
-                let (tx, _rx) = tokio::sync::mpsc::channel::<watch::WatchEvent>(256);
+                let (tx, rx) = tokio::sync::mpsc::channel::<watch::WatchEvent>(256);
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    match watch::start_watchers(pool_for_watch, tx).await {
+                    match watch::start_watchers(pool_for_watch.clone(), tx).await {
                         Ok(handle) => {
                             // manage 到 State，供 5.4 增量订阅 / 应用退出时 stop_watchers 使用。
                             app_handle.manage(handle);
+
+                            // m5-5.2 · 忽略规则前置过滤：
+                            // 加载规则（DB 用户规则 + 默认规则集），共享到 Arc<RwLock<..>>，
+                            // 在 5.1 事件流与下游（5.3 聚合窗口）之间架过滤管道。
+                            // 规则加载失败仅记录日志，退化为「无过滤」放行（不阻塞监听）。
+                            let initial_rules = match ignore::load_rules(&pool_for_watch).await {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    eprintln!("[startup] 加载忽略规则失败，退化为无过滤: {}", e);
+                                    Vec::new()
+                                }
+                            };
+                            let shared_rules = std::sync::Arc::new(
+                                std::sync::RwLock::new(initial_rules),
+                            );
+                            // manage 到 State，供 5.4 inbox_ignore 触发规则重载时写入。
+                            app_handle.manage(shared_rules.clone());
+
+                            // 过滤后的事件流出口：5.3 聚合窗口将消费 filtered_rx。
+                            let (filtered_tx, _filtered_rx) =
+                                tokio::sync::mpsc::channel::<watch::WatchEvent>(256);
+                            let _filter_handle =
+                                ignore::filter_events(rx, filtered_tx, shared_rules);
+                            // _filter_handle 在后台持续运行；应用退出时随 runtime 关闭。
                         }
                         Err(e) => {
                             eprintln!("[startup] 启动目录监听失败: {}", e);
