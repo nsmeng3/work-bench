@@ -495,6 +495,24 @@ export interface InboxDismissStaleInput {
   id: string;
 }
 
+/* ---------------- 监控目录（M6 §2.8） ---------------- */
+
+/** 监控目录配置 — M6 声明契约 */
+export interface WatchDirConfig {
+  path: string;
+  name: string;
+  description?: string;
+}
+
+/** 监控事件 — M6 声明契约 */
+export interface WatchEvent {
+  type: "created" | "modified" | "renamed" | "removed";
+  sourceType: "directory";
+  sourcePath: string;
+  created: number;
+  modified?: number;
+}
+
 /* ---------------- 导入撤销（m4-4.9 · ref_undo_import） ---------------- */
 
 /**

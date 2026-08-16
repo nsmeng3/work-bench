@@ -34,6 +34,8 @@ Run verification from the task worktree, not the orchestrator checkout.
 6. Move the task to `review` only when scope, acceptance, and repository checks all pass.
 7. On failure, send the same task back to an implementation agent with the full failing command, exit status, relevant logs, current diff summary, and instruction to fix only the failure without expanding scope.
 
+**Agent continuation over orchestrator fixes (MUST).** When verification, inspection, or post-merge checks reveal a functional problem, the orchestrator MUST send the work back to the original implementation agent (SendMessage to continue its session, or a fresh agent on the same worktree if the original is unavailable) rather than fixing the code itself. Rationale: (a) loop-mode's core discipline is "agents implement, orchestrator coordinates" — even mechanical-looking fixes often embed business-logic judgment; (b) the original agent has full context of its intent and can fix faster and safer; (c) orchestrator-written code blurs the approval boundary and makes evidence trails harder to audit. The ONLY exceptions where the orchestrator may edit implementation code directly are: (1) purely mechanical merge-conflict resolution in import/registration areas where both sides append to the same block and keeping both is trivially correct; (2) updating task packages, boards, or orchestration-rule documents. Anything beyond that — test failures, scope violations, structural conflicts, business-logic bugs — goes back to the agent.
+
 ### 3. Fill available capacity
 
 While active task count is below the configured limit:

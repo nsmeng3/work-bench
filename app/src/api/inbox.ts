@@ -9,6 +9,7 @@ import type {
   InboxAssignResult,
   InboxDismissStaleInput,
   InboxStats,
+  WatchDirConfig,
 } from "./types";
 import { mockInboxApi } from "./mock";
 
@@ -71,4 +72,30 @@ export async function inboxAssign(input: InboxAssignInput): Promise<InboxAssignR
 export async function inboxDismissStale(input: InboxDismissStaleInput): Promise<InboxItem> {
   if (MOCK) return mockInboxApi.inbox_dismiss_stale(input);
   return invoke<InboxItem>("inbox_dismiss_stale", { ...input });
+}
+
+/**
+ * 监控目录命令 — M6-6.1 声明契约
+ */
+/** `inbox_get_watch_dirs ()` → `WatchDirConfig[]`（按 path 升序） */
+export async function inboxGetWatchDirs(): Promise<WatchDirConfig[]> {
+  if (MOCK) return mockInboxApi.inbox_get_watch_dirs();
+  return invoke<WatchDirConfig[]>("inbox_get_watch_dirs");
+}
+
+/**
+ * `inbox_set_watch_dir { path, name, description? }` → `WatchDirConfig`。
+ * 路径校验：必须在 `Code/Documents` 子树内，否则抛 `INVALID_PATH`。
+ */
+export async function inboxSetWatchDir(input: WatchDirConfig): Promise<WatchDirConfig> {
+  if (MOCK) return mockInboxApi.inbox_set_watch_dir(input);
+  return invoke<WatchDirConfig>("inbox_set_watch_dir", { ...input });
+}
+
+/**
+ * `inbox_unset_watch_dir { path }` → `WatchDirConfig`。
+ */
+export async function inboxUnsetWatchDir(input: { path: string }): Promise<WatchDirConfig> {
+  if (MOCK) return mockInboxApi.inbox_unset_watch_dir(input);
+  return invoke<WatchDirConfig>("inbox_unset_watch_dir", { ...input });
 }

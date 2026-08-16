@@ -150,7 +150,7 @@ export function InboxPage() {
         }}
       >
         <div style={{ padding: "16px 16px 0" }}>
-          <Typography.Title level={4} style={{ margin: 0, marginBottom: 12, color: "#1e1e1e" }}>
+          <Typography.Title level={4} style={{ margin: 0, marginBottom: 12 }}>
             收件箱
           </Typography.Title>
           <Tabs

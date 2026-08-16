@@ -40,6 +40,7 @@ import type {
   InboxAssignResult,
   InboxDismissStaleInput,
   InboxStats,
+  WatchDirConfig,
 } from "./types";
 
 /**
@@ -1564,6 +1565,20 @@ export const mockInboxApi = {
       ...inboxStore.slice(idx + 1),
     ];
     return updated;
+  },
+
+  /** 监控目录 mock — M6-6.1 声明契约 */
+  inbox_get_watch_dirs(): WatchDirConfig[] {
+    // mock 返回空数组，由后端 6.2 实现真实 watch 逻辑
+    return [];
+  },
+  inbox_set_watch_dir(_input: WatchDirConfig): WatchDirConfig {
+    // mock 不做持久化，返回输入（路径校验留待后端）
+    return { ..._input };
+  },
+  inbox_unset_watch_dir(_input: { path: string }): WatchDirConfig {
+    // mock 不做清理，直接返回
+    return { path: _input.path, name: "mock", description: "" };
   },
 };
 
