@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::error::{AppError, CmdResult};
 use crate::ignore::{self, IgnoreRule};
 use crate::reference::{self, Locator, ManagedAction, ManagedCreateResult, ManagedPlan, Reference};
+use crate::sensitive;
 
 // ============================================================
 // 常量
@@ -82,15 +83,19 @@ pub struct InboxItem {
     pub discovered_at: i64,
 }
 
-/// `inbox_get` 出参（含可选预览）。
+/// `inbox_get` 出参（含可选预览 + 敏感提示）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct InboxItemDetail {
     #[serde(flatten)]
     pub item: InboxItem,
-    /// 预览：5.5 敏感文件识别扩展点；当前任务仅返回 None。
+    /// 预览：m5-5.5 起，非敏感文本文件返回前 N 行；敏感文件 / 二进制 / 读取失败返回 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<serde_json::Value>,
+    /// m5-5.5 · 敏感文件风险提示（命中 `sensitive::SENSITIVE_PATTERNS` 时非空）。
+    /// 前端按 §6.9 渲染黄色 Alert，且不显示预览。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensitive_warning: Option<String>,
 }
 
 /// `inbox_assign` 入参（契约 §2.7）。
@@ -233,18 +238,69 @@ pub async fn list(
 // ============================================================
 
 /// `inbox_get { id }` → `InboxItemDetail`。
+///
+/// m5-5.5 集成：
+/// - 敏感文件（`sensitive::is_sensitive` 命中）→ `preview=None` + `sensitiveWarning=Some(..)`；
+/// - 非敏感文本文件 → 读前 [`PREVIEW_MAX_LINES`] 行作为 `preview.content`；
+/// - 非敏感但读取失败 / 二进制 / 不存在 → `preview=None`。
 pub async fn get(pool: &SqlitePool, id: String) -> CmdResult<InboxItemDetail> {
     let item = fetch_inbox_item(pool, &id).await?;
-    Ok(InboxItem { ..item.clone() }.into_detail())
+    Ok(build_detail(item))
 }
 
-impl InboxItem {
-    fn into_detail(self) -> InboxItemDetail {
-        InboxItemDetail {
-            item: self,
+/// 文本预览最多读取的行数。
+const PREVIEW_MAX_LINES: usize = 50;
+/// 文本预览最多读取的字节数（防御：单行超大文件）。
+const PREVIEW_MAX_BYTES: usize = 16 * 1024;
+
+/// 构造 `InboxItemDetail`：敏感判定 + 文本预览。
+fn build_detail(item: InboxItem) -> InboxItemDetail {
+    let path = std::path::Path::new(&item.path);
+
+    if sensitive::is_sensitive(path) {
+        let warning = sensitive::sensitive_warning(path);
+        return InboxItemDetail {
+            item,
             preview: None,
-        }
+            sensitive_warning: Some(warning),
+        };
     }
+
+    let preview = read_text_preview(path);
+    InboxItemDetail {
+        item,
+        preview,
+        sensitive_warning: None,
+    }
+}
+
+/// 读取文本文件前 N 行作为预览。
+///
+/// 返回 `Some(json!({ "kind": "text", "content": "..." }))`；
+/// 文件不存在 / 读取失败 / 非 UTF-8 文本 → `None`（不视为错误，仅无预览）。
+fn read_text_preview(path: &std::path::Path) -> Option<serde_json::Value> {
+    use std::io::Read;
+
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(PREVIEW_MAX_BYTES.min(4096));
+    f.take(PREVIEW_MAX_BYTES as u64).read_to_end(&mut buf).ok()?;
+
+    // 拒绝明显二进制（含 NUL 字节）
+    if buf.contains(&0) {
+        return None;
+    }
+
+    let text = String::from_utf8(buf).ok()?;
+    let content: String = text
+        .lines()
+        .take(PREVIEW_MAX_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(serde_json::json!({
+        "kind": "text",
+        "content": content,
+    }))
 }
 
 // ============================================================
@@ -801,13 +857,19 @@ mod tests {
         let pool = setup().await;
         let dir = tempfile::tempdir().expect("tmp");
         let f = dir.path().join("a.txt");
-        std::fs::write(&f, b"x").expect("w");
+        std::fs::write(&f, b"line1\nline2\nline3\n").expect("w");
         let id = make_pending(&pool, &f).await;
 
         let detail = get(&pool, id.clone()).await.expect("get");
         assert_eq!(detail.item.id, id);
         assert_eq!(detail.item.status, "pending");
-        assert!(detail.preview.is_none());
+        // m5-5.5：非敏感文本文件 preview 有内容
+        let preview = detail.preview.expect("preview");
+        assert_eq!(preview["kind"], "text");
+        let content = preview["content"].as_str().expect("content str");
+        assert!(content.contains("line1"));
+        assert!(content.contains("line3"));
+        assert!(detail.sensitive_warning.is_none());
     }
 
     #[tokio::test]
@@ -815,6 +877,93 @@ mod tests {
         let pool = setup().await;
         let err = get(&pool, "no-such".into()).await.expect_err("err");
         assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    // ---------- inbox_get · m5-5.5 敏感文件保护 ----------
+
+    #[tokio::test]
+    async fn inbox_get_sensitive_env_no_preview() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let f = dir.path().join(".env");
+        std::fs::write(&f, b"SECRET=abc123\n").expect("w");
+        let id = make_pending(&pool, &f).await;
+
+        let detail = get(&pool, id).await.expect("get");
+        assert!(detail.preview.is_none(), "敏感文件不应有预览");
+        let warning = detail.sensitive_warning.expect("sensitiveWarning");
+        assert!(warning.contains(".env"), "提示应包含文件名: {}", warning);
+    }
+
+    #[tokio::test]
+    async fn inbox_get_sensitive_pem_no_preview() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let f = dir.path().join("server.pem");
+        std::fs::write(&f, b"-----BEGIN PRIVATE KEY-----\nXXX\n").expect("w");
+        let id = make_pending(&pool, &f).await;
+
+        let detail = get(&pool, id).await.expect("get");
+        assert!(detail.preview.is_none());
+        let warning = detail.sensitive_warning.expect("sensitiveWarning");
+        assert!(warning.contains("server.pem"));
+    }
+
+    #[tokio::test]
+    async fn inbox_get_sensitive_id_rsa_no_preview() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let f = dir.path().join("id_rsa");
+        std::fs::write(&f, b"PRIVATE KEY").expect("w");
+        let id = make_pending(&pool, &f).await;
+
+        let detail = get(&pool, id).await.expect("get");
+        assert!(detail.preview.is_none());
+        assert!(detail.sensitive_warning.is_some());
+    }
+
+    #[tokio::test]
+    async fn inbox_get_non_sensitive_text_has_preview() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let f = dir.path().join("notes.md");
+        std::fs::write(&f, b"# Hello\nworld\n").expect("w");
+        let id = make_pending(&pool, &f).await;
+
+        let detail = get(&pool, id).await.expect("get");
+        let preview = detail.preview.expect("preview");
+        assert_eq!(preview["kind"], "text");
+        let content = preview["content"].as_str().expect("content");
+        assert!(content.contains("# Hello"));
+        assert!(content.contains("world"));
+        assert!(detail.sensitive_warning.is_none());
+    }
+
+    #[tokio::test]
+    async fn inbox_get_non_sensitive_binary_no_preview() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let f = dir.path().join("data.bin");
+        // 含 NUL 字节 → 视为二进制
+        std::fs::write(&f, &[0u8, 1, 2, 3, 0, 255]).expect("w");
+        let id = make_pending(&pool, &f).await;
+
+        let detail = get(&pool, id).await.expect("get");
+        assert!(detail.preview.is_none(), "二进制文件不应有预览");
+        assert!(detail.sensitive_warning.is_none());
+    }
+
+    #[tokio::test]
+    async fn inbox_get_non_sensitive_missing_file_no_preview() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let f = dir.path().join("ghost.txt");
+        // 不写文件，直接插入 inbox_item（源文件已不存在）
+        let id = make_pending(&pool, &f).await;
+
+        let detail = get(&pool, id).await.expect("get");
+        assert!(detail.preview.is_none());
+        assert!(detail.sensitive_warning.is_none());
     }
 
     // ---------- inbox_assign external ----------
