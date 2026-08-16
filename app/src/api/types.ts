@@ -371,6 +371,93 @@ export interface DispDestroyResult {
   deletedRefId: string;
 }
 
+/* ---------------- 收件箱（§2.7） ---------------- */
+
+/** 收件箱条目状态 — 与 inbox_item.status CHECK 一致 */
+export type InboxStatus = "pending" | "snoozed" | "processed" | "ignored" | "stale";
+
+/** 收件箱事件类型 — inbox_item.event_kind */
+export type InboxEventKind = "created" | "modified" | "renamed" | "removed";
+
+/** 忽略规则种类 — inbox_ignore.rule.kind */
+export type InboxIgnoreRuleKind = "once" | "by_ext" | "by_name" | "by_dir";
+
+/**
+ * 收件箱条目 — 详细设计说明书 §2.7 / §3.2 inbox_item 表。
+ * 序列化为 camelCase（与后端 serde rename_all 对齐）。
+ * discoveredAt / mtime / remindAt 为 Unix 秒（number）。
+ */
+export interface InboxItem {
+  id: string;
+  watchDirId?: string | null;
+  /** 绝对路径 */
+  path: string;
+  eventKind?: InboxEventKind | null;
+  sizeBytes?: number | null;
+  mtime?: number | null;
+  /** 小写扩展名，无点 */
+  ext?: string | null;
+  /** 建议类型（六类型之一；可空表示未识别） */
+  suggestedType?: ReferenceType | null;
+  status: InboxStatus;
+  /** 处理动作快照（assign 时写入）；JSON 字符串 */
+  assignJson?: string | null;
+  ignoreRuleId?: string | null;
+  snoozeNote?: string | null;
+  remindAt?: number | null;
+  discoveredAt: number;
+}
+
+/** 文本预览（契约 §2.7 预览形状；当前后端恒为 null，5.5 敏感识别扩展点） */
+export interface InboxPreview {
+  kind: "text";
+  /** 前 N 行文本 */
+  lines: string[];
+  /** 是否被截断（实际行数 > N） */
+  truncated: boolean;
+}
+
+/**
+ * 收件箱条目详情 — inbox_get 出参。
+ * 在 InboxItem 基础上扩展可选预览与敏感提示。
+ * 敏感文件：sensitiveWarning 非空时前端不显示预览（§6.9）。
+ */
+export interface InboxItemDetail extends InboxItem {
+  preview?: InboxPreview | null;
+  /** 敏感文件风险提示；非空时前端显示黄色 Alert 且不显示预览 */
+  sensitiveWarning?: string | null;
+}
+
+/** inbox_stats 出参 — §2.7 */
+export interface InboxStats {
+  pending: number;
+  snoozed: number;
+  lastEventAt?: number | null;
+}
+
+/** inbox_list 入参 */
+export interface InboxListInput {
+  status?: InboxStatus;
+  limit?: number;
+  offset?: number;
+}
+
+/** inbox_snooze 入参 */
+export interface InboxSnoozeInput {
+  id: string;
+  note?: string;
+  remindAt?: number;
+}
+
+/** inbox_ignore 入参 */
+export interface InboxIgnoreInput {
+  id: string;
+  rule?: {
+    kind: InboxIgnoreRuleKind;
+    value?: string;
+  };
+}
+
 /* ---------------- 导入撤销（m4-4.9 · ref_undo_import） ---------------- */
 
 /**
