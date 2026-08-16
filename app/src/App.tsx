@@ -92,6 +92,16 @@ function App() {
     setCurrentCollection(null);
   }
 
+  /**
+   * 筛选页「跳转到资源集」（m5-filter-jump）：
+   * 切到 spaces 主导航并下钻到指定 space/collection。
+   */
+  function handleJumpToCollection(space: Space, collection: Collection) {
+    setActiveNav("spaces");
+    setCurrentSpace(space);
+    setCurrentCollection(collection);
+  }
+
   return (
     <ConfigProvider
       locale={zhCN}
@@ -156,7 +166,7 @@ function App() {
               ) : (
                 <SpacePage onEnterSpace={handleEnterSpace} />
               ))}
-            {activeNav === "filter" && <FilterPage />}
+            {activeNav === "filter" && <FilterPage onJumpToCollection={handleJumpToCollection} />}
             {activeNav === "audit" && <AuditPage />}
           </AppShell>
         )}
