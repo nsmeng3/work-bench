@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import {
+  Button,
   Checkbox,
   Empty,
   Input,
@@ -13,6 +14,7 @@ import {
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import type {
+  Collection,
   FacetValue,
   QueryFacetsOutput,
   QueryRefsInput,
@@ -20,6 +22,7 @@ import type {
   ReferenceConfidentiality,
   ReferenceLifecycle,
   ReferenceType,
+  Space,
 } from "../api";
 import { collectionList, queryFacets, queryRefs, spaceList, toApiError } from "../api";
 
@@ -129,12 +132,23 @@ function FacetGroup({ title, values, selected, onChange, single, labelMap }: Fac
   );
 }
 
-export function FilterPage() {
+interface FilterPageProps {
+  /**
+   * 跳转到资源集详情页（m5-filter-jump）。
+   * 由 App.tsx 注入：内部需要切换 activeNav 并下钻到指定 space/collection，
+   * 因此无法仅在 FilterPage 内部完成跳转。
+   */
+  onJumpToCollection?: (space: Space, collection: Collection) => void;
+}
+
+export function FilterPage({ onJumpToCollection }: FilterPageProps = {}) {
   const [facets, setFacets] = useState<QueryFacetsOutput | null>(null);
   const [facetsLoading, setFacetsLoading] = useState(true);
 
-  // 资源集 id -> name 映射（用于所属资源集列展示）
-  const [collectionNameMap, setCollectionNameMap] = useState<Record<string, string>>({});
+  // 资源集 id -> Collection 映射（用于「所属资源集」列展示 + 跳转时反查 space）
+  const [collectionMap, setCollectionMap] = useState<Record<string, Collection>>({});
+  // 空间 id -> Space 映射（跳转时通过 collection.spaceId 反查）
+  const [spaceMap, setSpaceMap] = useState<Record<string, Space>>({});
 
   // 筛选状态（受控）
   const [typeSel, setTypeSel] = useState<string[]>([]);
@@ -160,15 +174,20 @@ export function FilterPage() {
         const collections = await Promise.all(
           spaces.map((s) => collectionList({ spaceId: s.id, status: "active" })),
         );
-        const nameMap: Record<string, string> = {};
+        const collMap: Record<string, Collection> = {};
         for (const list of collections) {
           for (const c of list) {
-            nameMap[c.id] = c.name;
+            collMap[c.id] = c;
           }
+        }
+        const spMap: Record<string, Space> = {};
+        for (const s of spaces) {
+          spMap[s.id] = s;
         }
         if (!cancelled) {
           setFacets(f);
-          setCollectionNameMap(nameMap);
+          setCollectionMap(collMap);
+          setSpaceMap(spMap);
         }
       } catch (err) {
         if (!cancelled) {
@@ -247,7 +266,7 @@ export function FilterPage() {
         width: 160,
         render: (id: string) => (
           <Typography.Text title={id}>
-            {collectionNameMap[id] ?? id}
+            {collectionMap[id]?.name ?? id}
           </Typography.Text>
         ),
       },
@@ -291,8 +310,32 @@ export function FilterPage() {
         width: 170,
         render: (ts: number) => formatUnixSeconds(ts),
       },
+      {
+        title: "操作",
+        key: "actions",
+        width: 130,
+        render: (_, r) => {
+          const coll = collectionMap[r.collectionId];
+          const space = coll ? spaceMap[coll.spaceId] : undefined;
+          const disabled = !coll || !space || !onJumpToCollection;
+          return (
+            <Button
+              type="link"
+              size="small"
+              disabled={disabled}
+              onClick={() => {
+                if (coll && space && onJumpToCollection) {
+                  onJumpToCollection(space, coll);
+                }
+              }}
+            >
+              跳转到资源集
+            </Button>
+          );
+        },
+      },
     ],
-    [collectionNameMap],
+    [collectionMap, spaceMap, onJumpToCollection],
   );
 
   return (
