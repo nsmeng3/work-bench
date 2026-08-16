@@ -1377,4 +1377,41 @@ export const mockInboxApi = {
         : null;
     return { pending, snoozed, lastEventAt };
   },
+
+  /**
+   * 测试辅助（m5-5.8）：手动向 inbox 注入一条 pending 条目，
+   * 触发 inbox_stats.pending 增量，便于在 mock 模式下点验合并通知。
+   * 仅 mock 模式可用；真实后端无此命令。
+   *
+   * 用法（浏览器控制台）：
+   *   window.__triggerInboxEvent?.()
+   */
+  __triggerInboxEvent(path?: string): InboxItem {
+    const now = Math.floor(Date.now() / 1000);
+    const id = `mock-inbox-manual-${now}-${Math.random().toString(36).slice(2, 8)}`;
+    const item: InboxItem = {
+      id,
+      watchDirId: null,
+      path: path ?? `/mock/watch/manual-${id}.txt`,
+      eventKind: "created",
+      sizeBytes: 128,
+      mtime: now,
+      ext: "txt",
+      suggestedType: "document",
+      status: "pending",
+      assignJson: null,
+      ignoreRuleId: null,
+      snoozeNote: null,
+      remindAt: null,
+      discoveredAt: now,
+    };
+    inboxStore = [...inboxStore, item];
+    return item;
+  },
 };
+
+// 暴露到 window 便于控制台手动触发（仅 mock 模式）
+if (typeof window !== "undefined") {
+  (window as unknown as { __triggerInboxEvent?: (path?: string) => InboxItem }).__triggerInboxEvent =
+    (path?: string) => mockInboxApi.__triggerInboxEvent(path);
+}

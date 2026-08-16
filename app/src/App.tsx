@@ -11,6 +11,7 @@ import {
 } from "@ant-design/icons";
 import { AppShell } from "./components/AppShell";
 import type { NavItem } from "./components/AppShell";
+import { InboxNotification } from "./components/InboxNotification";
 import { SpacePage } from "./pages/SpacePage";
 import { CollectionPage } from "./pages/CollectionPage";
 import { CollectionDetailPage } from "./pages/CollectionDetailPage";
@@ -18,12 +19,10 @@ import { FilterPage } from "./pages/FilterPage";
 import { InitWizardPage } from "./pages/InitWizardPage";
 import { AuditPage } from "./pages/AuditPage";
 import { InboxPage } from "./pages/InboxPage";
-import { inboxStats, settingsGetRootDir, toApiError } from "./api";
+import { settingsGetRootDir, toApiError } from "./api";
 import type { Collection, Space } from "./api";
+import { useInboxStats } from "./hooks/useInboxStats";
 import "./styles/theme.css";
-
-/** 角标轮询间隔（毫秒）：30s，与 5.8 合并通知节奏对齐 */
-const INBOX_BADGE_POLL_MS = 30_000;
 
 const navItems: NavItem[] = [
   { key: "spaces", label: "空间", icon: <AppstoreOutlined />, enabled: true },
@@ -47,8 +46,10 @@ function App() {
   const [currentSpace, setCurrentSpace] = useState<Space | null>(null);
   /** 当前下钻进入的资源集；null 表示在资源集列表页 */
   const [currentCollection, setCurrentCollection] = useState<Collection | null>(null);
-  /** 收件箱待处理计数（侧边栏角标）；拉取失败时保持上次值 */
-  const [inboxPending, setInboxPending] = useState(0);
+
+  /** 收件箱统计：5s 轮询；同时驱动角标与合并通知（m5-5.8） */
+  const statsReady = phase.kind === "ready" && phase.initialized;
+  const { pending: inboxPending, prevPending: inboxPrevPending } = useInboxStats(statsReady);
 
   /** 侧边栏导航：收件箱项 label 包装 Badge 显示 pending 计数。
    *  NavItem.label 类型为 string，但 antd Menu 实际接受 ReactNode；
@@ -88,29 +89,6 @@ function App() {
       cancelled = true;
     };
   }, []);
-
-  /**
-   * 收件箱角标：初始化完成后启动轮询 inbox_stats.pending。
-   * 失败静默（保持上次值），避免打扰主流程。
-   */
-  useEffect(() => {
-    if (phase.kind !== "ready" || !phase.initialized) return;
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const s = await inboxStats();
-        if (!cancelled) setInboxPending(s.pending);
-      } catch {
-        // 静默：后端未就绪或网络异常时保持上次值
-      }
-    };
-    void tick();
-    const timer = window.setInterval(() => void tick(), INBOX_BADGE_POLL_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [phase]);
 
   function handleNavChange(key: string) {
     setActiveNav(key);
@@ -195,6 +173,11 @@ function App() {
 
         {phase.kind === "ready" && phase.initialized && (
           <AppShell navItems={navItemsWithBadge} activeNav={activeNav} onNavChange={handleNavChange}>
+            <InboxNotification
+              pending={inboxPending}
+              prevPending={inboxPrevPending}
+              onGoInbox={() => handleNavChange("inbox")}
+            />
             {activeNav === "spaces" &&
               (currentSpace && currentCollection ? (
                 <CollectionDetailPage
