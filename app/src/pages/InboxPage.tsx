@@ -16,15 +16,16 @@ import type {
 import { inboxGet, inboxList, toApiError } from "../api";
 import { InboxItemCard } from "../components/InboxItemCard";
 import { InboxDetailPanel } from "../components/InboxDetailPanel";
+import { InboxAssignDialog } from "../components/InboxAssignDialog";
 
 /**
- * 收件箱页 — 任务包 m5-5.6。
+ * 收件箱页 — 任务包 m5-5.6 / m5-5.7。
  * 契约：详细设计说明书 §2.7。
  *
  * 布局：左侧列表（Tabs 状态过滤 + List + Pagination pageSize=50），
  * 右侧详情面板（InboxDetailPanel）。
  *
- * 「处理」按钮：本任务仅占位 — 5.7 处理对话框接入时由 onProcess 钩子替换。
+ * 「处理」按钮：m5-5.7 接入 InboxAssignDialog，支持 external/managed 两种模式。
  */
 
 const PAGE_SIZE = 50;
@@ -49,6 +50,10 @@ export function InboxPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<InboxItemDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+
+  // m5-5.7 处理对话框
+  const [assignOpen, setAssignOpen] = useState(false);
+  const [assignItem, setAssignItem] = useState<InboxItem | null>(null);
 
   const loadList = useCallback(
     async (nextStatus: StatusFilter, nextPage: number, keepSelection = false) => {
@@ -117,9 +122,19 @@ export function InboxPage() {
     }
   }
 
-  /** 「处理」按钮：5.7 处理对话框接入点（当前任务仅占位提示） */
-  function handleProcess(_item: InboxItem) {
-    message.info("处理对话框将在 5.7 任务中接入");
+  /** 「处理」按钮：打开 m5-5.7 处理对话框 */
+  function handleProcess(item: InboxItem) {
+    setAssignItem(item);
+    setAssignOpen(true);
+  }
+
+  /** 处理成功后：关闭对话框 + 刷新列表 + 清空选中（条目已转为 processed） */
+  function handleAssigned() {
+    setAssignOpen(false);
+    setAssignItem(null);
+    setSelectedId(null);
+    setDetail(null);
+    void loadList(status, page);
   }
 
   return (
@@ -187,6 +202,17 @@ export function InboxPage() {
           onChanged={handleChanged}
         />
       </Layout.Content>
+
+      {/* m5-5.7 处理对话框 */}
+      <InboxAssignDialog
+        open={assignOpen}
+        item={assignItem}
+        onClose={() => {
+          setAssignOpen(false);
+          setAssignItem(null);
+        }}
+        onAssigned={handleAssigned}
+      />
     </Layout>
   );
 }
