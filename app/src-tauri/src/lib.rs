@@ -7,6 +7,7 @@ mod disposition;
 mod error;
 mod fs_ops;
 mod ignore;
+mod inbox;
 mod landing;
 mod query;
 mod reference;
@@ -145,6 +146,13 @@ pub fn run() {
             disposition::disp_soft_delete,
             disposition::disp_audit_list,
             disposition::ref_undo_import,
+            inbox::inbox_list,
+            inbox::inbox_get,
+            inbox::inbox_assign,
+            inbox::inbox_snooze,
+            inbox::inbox_ignore,
+            inbox::inbox_dismiss_stale,
+            inbox::inbox_stats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
