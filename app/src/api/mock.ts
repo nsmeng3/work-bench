@@ -31,6 +31,12 @@ import type {
   DispPreview,
   DispDestroyResult,
   UndoPlan,
+  InboxItem,
+  InboxItemDetail,
+  InboxListInput,
+  InboxSnoozeInput,
+  InboxIgnoreInput,
+  InboxStats,
 } from "./types";
 
 /**
@@ -1146,5 +1152,229 @@ export const mockDispositionApi = {
     // 模拟执行：从 seedReferences 中移除引用
     seedReferences = seedReferences.filter((r) => r.ref.id !== refId);
     return null;
+  },
+};
+
+/* ---------------- 收件箱 mock（§2.7 · m5-5.6） ---------------- */
+
+/**
+ * 收件箱 mock 数据：覆盖 5 种 status × 多种 suggestedType × 敏感/非敏感。
+ * discoveredAt 使用相对当前时间的偏移，保证「3 分钟前」等相对时间显示自然。
+ */
+const seedInboxItems: InboxItem[] = (() => {
+  const now = Math.floor(Date.now() / 1000);
+  const list: InboxItem[] = [
+    {
+      id: "mock-inbox-1",
+      watchDirId: "mock-watch-1",
+      path: "/Users/demo/Downloads/季度报告-2026Q2.pdf",
+      eventKind: "created",
+      sizeBytes: 1024 * 1024 * 3 + 512 * 1024, // 3.5 MB
+      mtime: now - 180,
+      ext: "pdf",
+      suggestedType: "document",
+      status: "pending",
+      discoveredAt: now - 180, // 3 分钟前
+    },
+    {
+      id: "mock-inbox-2",
+      watchDirId: "mock-watch-1",
+      path: "/Users/demo/Downloads/frontend-snapshot.tar.gz",
+      eventKind: "created",
+      sizeBytes: 1024 * 1024 * 48,
+      mtime: now - 900,
+      ext: "gz",
+      suggestedType: "code",
+      status: "pending",
+      discoveredAt: now - 900, // 15 分钟前
+    },
+    {
+      id: "mock-inbox-3",
+      watchDirId: "mock-watch-1",
+      path: "/Users/demo/Downloads/身份证扫描件.jpg",
+      eventKind: "created",
+      sizeBytes: 1024 * 512,
+      mtime: now - 3600,
+      ext: "jpg",
+      suggestedType: "media",
+      status: "pending",
+      discoveredAt: now - 3600, // 1 小时前
+    },
+    {
+      id: "mock-inbox-4",
+      watchDirId: "mock-watch-1",
+      path: "/Users/demo/Downloads/meeting-notes.md",
+      eventKind: "modified",
+      sizeBytes: 1024 * 12,
+      mtime: now - 7200,
+      ext: "md",
+      suggestedType: "document",
+      status: "snoozed",
+      snoozeNote: "等下周例会前再处理",
+      remindAt: now + 86400 * 3,
+      discoveredAt: now - 7200, // 2 小时前
+    },
+    {
+      id: "mock-inbox-5",
+      watchDirId: "mock-watch-1",
+      path: "/Users/demo/Downloads/temp-dataset.csv",
+      eventKind: "created",
+      sizeBytes: 1024 * 256,
+      mtime: now - 86400,
+      ext: "csv",
+      suggestedType: "data",
+      status: "snoozed",
+      snoozeNote: "需要先确认数据来源",
+      discoveredAt: now - 86400, // 1 天前
+    },
+    {
+      id: "mock-inbox-6",
+      watchDirId: "mock-watch-1",
+      path: "/Users/demo/Downloads/.DS_Store",
+      eventKind: "created",
+      sizeBytes: 6148,
+      mtime: now - 86400 * 2,
+      ext: undefined,
+      suggestedType: undefined,
+      status: "ignored",
+      discoveredAt: now - 86400 * 2, // 2 天前
+    },
+    {
+      id: "mock-inbox-7",
+      watchDirId: "mock-watch-1",
+      path: "/Users/demo/Downloads/老照片.zip",
+      eventKind: "created",
+      sizeBytes: 1024 * 1024 * 220,
+      mtime: now - 86400 * 3,
+      ext: "zip",
+      suggestedType: "media",
+      status: "ignored",
+      ignoreRuleId: "mock-ignore-rule-1",
+      discoveredAt: now - 86400 * 3, // 3 天前
+    },
+    {
+      id: "mock-inbox-8",
+      watchDirId: "mock-watch-1",
+      path: "/Users/demo/Downloads/合同草稿-v3.docx",
+      eventKind: "renamed",
+      sizeBytes: 1024 * 88,
+      mtime: now - 86400 * 4,
+      ext: "docx",
+      suggestedType: "document",
+      status: "processed",
+      assignJson: JSON.stringify({
+        mode: "external",
+        spaceId: "mock-space-1",
+        collectionId: "mock-collection-2",
+        type: "document",
+        referenceId: "mock-ref-doc-1",
+        processedAt: now - 86400 * 4 + 60,
+      }),
+      discoveredAt: now - 86400 * 4, // 4 天前
+    },
+  ];
+  return list;
+})();
+
+let inboxStore: InboxItem[] = [...seedInboxItems];
+
+/** 敏感文件 mock 规则：文件名含「身份证 / 合同 / 护照 / 银行」返回提示 */
+function mockSensitiveWarning(item: InboxItem): string | null {
+  const sensitive = ["身份证", "护照", "银行卡", "合同"];
+  const name = item.path.split("/").pop() ?? item.path;
+  if (item.status !== "pending" && item.status !== "snoozed") return null;
+  if (sensitive.some((k) => name.includes(k))) {
+    return `该文件可能包含敏感信息（${name}），预览已禁用`;
+  }
+  return null;
+}
+
+/** 文本预览 mock：仅对文本类扩展名（md/txt/csv/json/log）返回前 N 行 */
+function mockPreview(item: InboxItem): InboxItemDetail["preview"] {
+  if (mockSensitiveWarning(item)) return null;
+  const textExts = ["md", "txt", "csv", "json", "log"];
+  if (!item.ext || !textExts.includes(item.ext)) return null;
+  const name = item.path.split("/").pop() ?? item.path;
+  const lines = [
+    `# ${name} 预览（mock）`,
+    ``,
+    `这是 mock 数据，用于联调收件箱详情面板。`,
+    `实际预览由后端 5.5 敏感识别扩展点提供。`,
+    `路径：${item.path}`,
+    `大小：${item.sizeBytes ?? 0} 字节`,
+    `建议类型：${item.suggestedType ?? "未识别"}`,
+  ];
+  return { kind: "text", lines, truncated: false };
+}
+
+function toInboxDetail(item: InboxItem): InboxItemDetail {
+  return {
+    ...item,
+    preview: mockPreview(item),
+    sensitiveWarning: mockSensitiveWarning(item),
+  };
+}
+
+export const mockInboxApi = {
+  inbox_list(input: InboxListInput): InboxItem[] {
+    let items = inboxStore.slice();
+    if (input.status) items = items.filter((i) => i.status === input.status);
+    // 与后端 ORDER BY discovered_at DESC 对齐
+    items.sort((a, b) => b.discoveredAt - a.discoveredAt);
+    const offset = Math.max(0, input.offset ?? 0);
+    const limit = Math.min(200, Math.max(1, input.limit ?? 50));
+    return items.slice(offset, offset + limit);
+  },
+
+  inbox_get(id: string): InboxItemDetail {
+    const item = inboxStore.find((i) => i.id === id);
+    if (!item) throw { code: "COMMON_NOT_FOUND", message: "收件箱条目不存在", retryable: false };
+    return toInboxDetail(item);
+  },
+
+  inbox_snooze(input: InboxSnoozeInput): InboxItem {
+    const idx = inboxStore.findIndex((i) => i.id === input.id);
+    if (idx === -1)
+      throw { code: "COMMON_NOT_FOUND", message: "收件箱条目不存在", retryable: false };
+    const updated: InboxItem = {
+      ...inboxStore[idx],
+      status: "snoozed",
+      snoozeNote: input.note ?? null,
+      remindAt: input.remindAt ?? null,
+    };
+    inboxStore = [
+      ...inboxStore.slice(0, idx),
+      updated,
+      ...inboxStore.slice(idx + 1),
+    ];
+    return updated;
+  },
+
+  inbox_ignore(input: InboxIgnoreInput): InboxItem {
+    const idx = inboxStore.findIndex((i) => i.id === input.id);
+    if (idx === -1)
+      throw { code: "COMMON_NOT_FOUND", message: "收件箱条目不存在", retryable: false };
+    const kind = input.rule?.kind ?? "once";
+    const updated: InboxItem = {
+      ...inboxStore[idx],
+      status: "ignored",
+      ignoreRuleId: kind === "once" ? null : `mock-ignore-rule-${input.id}`,
+    };
+    inboxStore = [
+      ...inboxStore.slice(0, idx),
+      updated,
+      ...inboxStore.slice(idx + 1),
+    ];
+    return updated;
+  },
+
+  inbox_stats(): InboxStats {
+    const pending = inboxStore.filter((i) => i.status === "pending").length;
+    const snoozed = inboxStore.filter((i) => i.status === "snoozed").length;
+    const lastEventAt =
+      inboxStore.length > 0
+        ? Math.max(...inboxStore.map((i) => i.discoveredAt))
+        : null;
+    return { pending, snoozed, lastEventAt };
   },
 };
