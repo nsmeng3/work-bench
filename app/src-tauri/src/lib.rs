@@ -11,6 +11,7 @@ mod inbox;
 mod landing;
 mod query;
 mod reference;
+mod sensitive;
 mod settings;
 mod space;
 mod tag;
