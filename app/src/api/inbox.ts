@@ -5,6 +5,9 @@ import type {
   InboxListInput,
   InboxSnoozeInput,
   InboxIgnoreInput,
+  InboxAssignInput,
+  InboxAssignResult,
+  InboxDismissStaleInput,
   InboxStats,
 } from "./types";
 import { mockInboxApi } from "./mock";
@@ -47,4 +50,25 @@ export async function inboxIgnore(input: InboxIgnoreInput): Promise<InboxItem> {
 export async function inboxStats(): Promise<InboxStats> {
   if (MOCK) return mockInboxApi.inbox_stats();
   return invoke<InboxStats>("inbox_stats");
+}
+
+/**
+ * `inbox_assign { id, mode, spaceId, collectionId, type, managedAction?, targetName?, confirmed }`
+ * → `InboxAssignResult`（§2.7）。
+ * - external：confirmed=true，直接转正式引用
+ * - managed confirmed=false：返回 managedPlan 用于二次确认
+ * - managed confirmed=true：执行导入并托管
+ */
+export async function inboxAssign(input: InboxAssignInput): Promise<InboxAssignResult> {
+  if (MOCK) return mockInboxApi.inbox_assign(input);
+  return invoke<InboxAssignResult>("inbox_assign", { ...input });
+}
+
+/**
+ * `inbox_dismiss_stale { id }` → `InboxItem`（status → processed）。
+ * 用于源文件已不在（INBOX_STALE）时用户主动标记为已处理。
+ */
+export async function inboxDismissStale(input: InboxDismissStaleInput): Promise<InboxItem> {
+  if (MOCK) return mockInboxApi.inbox_dismiss_stale(input);
+  return invoke<InboxItem>("inbox_dismiss_stale", { ...input });
 }

@@ -36,6 +36,9 @@ import type {
   InboxListInput,
   InboxSnoozeInput,
   InboxIgnoreInput,
+  InboxAssignInput,
+  InboxAssignResult,
+  InboxDismissStaleInput,
   InboxStats,
 } from "./types";
 
@@ -1407,6 +1410,160 @@ export const mockInboxApi = {
     };
     inboxStore = [...inboxStore, item];
     return item;
+  },
+
+  /**
+   * §2.7 inbox_assign mock。
+   * - external：直接生成 external Reference，条目 status → processed
+   * - managed confirmed=false：返回 managedPlan（复用 ref_create_managed_plan 逻辑）
+   * - managed confirmed=true：生成 managed Reference，条目 status → processed
+   * 路径含 "missing" → INBOX_STALE；targetName 含 "exists" → FS_TARGET_EXISTS
+   */
+  inbox_assign(input: InboxAssignInput): InboxAssignResult {
+    const idx = inboxStore.findIndex((i) => i.id === input.id);
+    if (idx === -1)
+      throw { code: "COMMON_NOT_FOUND", message: "收件箱条目不存在", retryable: false };
+    const item = inboxStore[idx];
+
+    // INBOX_STALE 模拟：路径含 "missing" 时源文件已不在
+    if (item.path.includes("missing")) {
+      throw {
+        code: "INBOX_STALE",
+        message: `源文件已不在：${item.path}`,
+        details: { path: item.path },
+        retryable: false,
+      };
+    }
+
+    const collection = collectionStore.find((c) => c.id === input.collectionId);
+    if (!collection) {
+      throw { code: "COMMON_NOT_FOUND", message: "资源集不存在", retryable: false };
+    }
+
+    const baseName = item.path.split("/").filter(Boolean).pop() ?? "unnamed";
+
+    // managed confirmed=false → 返回 plan
+    if (input.mode === "managed" && !input.confirmed) {
+      const TYPE_DIR: Record<string, string> = {
+        code: "Code",
+        document: "Documents",
+        data: "Data",
+        artifact: "Artifacts",
+        tool: "Tools",
+        media: "Media",
+      };
+      const root = mockRootDir ?? "/mock-root";
+      const proposedTarget = `${root}/${TYPE_DIR[input.type] ?? "Documents"}/${baseName}`;
+      const conflicts: string[] = [];
+      if (item.path.includes("conflict")) {
+        conflicts.push(`目标已存在同名项：${proposedTarget}`);
+      }
+      return {
+        inboxItem: item,
+        reference: null,
+        managedPlan: {
+          kind: "managed_plan",
+          source: item.path,
+          proposedTarget,
+          action: input.managedAction ?? "copy",
+          sizeBytes: item.sizeBytes ?? 1024,
+          fileCount: 1,
+          conflicts,
+        },
+      };
+    }
+
+    // managed confirmed=true：FS_TARGET_EXISTS 模拟
+    if (input.mode === "managed" && input.targetName?.includes("exists")) {
+      throw {
+        code: "FS_TARGET_EXISTS",
+        message: `目标已存在：${input.targetName}`,
+        details: { targetName: input.targetName },
+        retryable: false,
+      };
+    }
+
+    // 生成正式引用
+    const now = unixNow();
+    const refId = makeRefId();
+    const isManaged = input.mode === "managed";
+    const TYPE_DIR: Record<string, string> = {
+      code: "Code",
+      document: "Documents",
+      data: "Data",
+      artifact: "Artifacts",
+      tool: "Tools",
+      media: "Media",
+    };
+    const root = mockRootDir ?? "/mock-root";
+    const finalName = input.targetName?.trim() || baseName;
+    const locatorPath = isManaged
+      ? `${root}/${TYPE_DIR[input.type] ?? "Documents"}/${finalName}`
+      : item.path;
+
+    const ref: Reference = {
+      id: refId,
+      collectionId: input.collectionId,
+      sourceId: "mock-source-local",
+      name: finalName,
+      type: input.type,
+      hosting: isManaged ? "managed" : "external",
+      locator: isManaged
+        ? {
+            kind: "path",
+            path: locatorPath,
+            originalSource: item.path,
+            managedAction: input.managedAction ?? "copy",
+          }
+        : { kind: "path", path: locatorPath },
+      lifecycle: "active",
+      confidentiality: "internal",
+      indexed: true,
+      disposition: "none",
+      createdAt: now,
+      updatedAt: now,
+    };
+    seedReferences = [...seedReferences, { ref, health: "ok" }];
+
+    // 条目 status → processed，写入 assignJson 快照
+    const updated: InboxItem = {
+      ...item,
+      status: "processed",
+      assignJson: JSON.stringify({
+        mode: input.mode,
+        spaceId: input.spaceId,
+        collectionId: input.collectionId,
+        type: input.type,
+        referenceId: refId,
+        processedAt: now,
+      }),
+    };
+    inboxStore = [
+      ...inboxStore.slice(0, idx),
+      updated,
+      ...inboxStore.slice(idx + 1),
+    ];
+
+    return { inboxItem: updated, reference: ref, managedPlan: null };
+  },
+
+  /**
+   * §2.7 inbox_dismiss_stale mock：标记已失效条目为已处理。
+   */
+  inbox_dismiss_stale(input: InboxDismissStaleInput): InboxItem {
+    const idx = inboxStore.findIndex((i) => i.id === input.id);
+    if (idx === -1)
+      throw { code: "COMMON_NOT_FOUND", message: "收件箱条目不存在", retryable: false };
+    const updated: InboxItem = {
+      ...inboxStore[idx],
+      status: "processed",
+    };
+    inboxStore = [
+      ...inboxStore.slice(0, idx),
+      updated,
+      ...inboxStore.slice(idx + 1),
+    ];
+    return updated;
   },
 };
 

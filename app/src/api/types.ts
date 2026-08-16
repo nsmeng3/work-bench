@@ -458,6 +458,43 @@ export interface InboxIgnoreInput {
   };
 }
 
+/** inbox_assign 处理方式 — §2.7 */
+export type InboxAssignMode = "external" | "managed";
+
+/**
+ * inbox_assign 入参 — 详细设计说明书 §2.7。
+ * - mode=external：仅关联，confirmed 必须为 true（无 plan 阶段）
+ * - mode=managed + confirmed=false：拿 ManagedPlan 二次确认
+ * - mode=managed + confirmed=true：执行导入并托管
+ * targetName 仅在 managed + confirmed=true 阶段生效（缺省用源名）
+ */
+export interface InboxAssignInput {
+  id: string;
+  mode: InboxAssignMode;
+  spaceId: string;
+  collectionId: string;
+  type: ReferenceType;
+  managedAction?: ManagedAction;
+  targetName?: string;
+  confirmed: boolean;
+}
+
+/**
+ * inbox_assign 出参 — §2.7。
+ * - external / managed confirmed=true：reference 为落地后的正式引用
+ * - managed confirmed=false：managedPlan 非空，用于二次确认
+ */
+export interface InboxAssignResult {
+  inboxItem: InboxItem;
+  reference?: Reference | null;
+  managedPlan?: ManagedPlan | null;
+}
+
+/** inbox_dismiss_stale 入参 — §2.7 */
+export interface InboxDismissStaleInput {
+  id: string;
+}
+
 /* ---------------- 导入撤销（m4-4.9 · ref_undo_import） ---------------- */
 
 /**
