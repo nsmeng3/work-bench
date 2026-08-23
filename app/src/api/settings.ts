@@ -7,6 +7,8 @@ import type {
   StorageSourceUpdateInput,
   DefaultAppConfig,
   DefaultAppSetInput,
+  SettingsChangeRootDirInput,
+  ChangeRootResult,
 } from "./types";
 import { mockSettingsApi } from "./mock";
 
@@ -67,4 +69,21 @@ export async function settingsSetDefaultApp(
 ): Promise<DefaultAppConfig> {
   if (MOCK) return mockSettingsApi.settings_set_default_app(input);
   return invoke<DefaultAppConfig>("settings_set_default_app", { ...input });
+}
+
+/**
+ * 修改资源根目录 — §2.8 settings_change_root_dir（两阶段）。
+ *
+ * - confirmed=false → MigrationPlan（不写文件不改库，前端据此渲染确认页）
+ * - confirmed=true && strategy="future_only" → FutureOnlyResult
+ * - confirmed=true && strategy="migrate" → MigrationResult
+ *
+ * 出参为 untagged 联合，请用 isMigrationPlan / isMigrationResult /
+ * isFutureOnlyResult 类型守卫鉴别。
+ */
+export async function settingsChangeRootDir(
+  input: SettingsChangeRootDirInput,
+): Promise<ChangeRootResult> {
+  if (MOCK) return mockSettingsApi.settings_change_root_dir(input);
+  return invoke<ChangeRootResult>("settings_change_root_dir", { ...input });
 }

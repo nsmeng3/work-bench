@@ -333,6 +333,92 @@ export interface DefaultAppSetInput {
   appPath?: string;
 }
 
+/* ---------------- 修改根目录（§2.8 settings_change_root_dir 两阶段） ---------------- */
+
+/**
+ * 修改根目录策略 — §2.8 / §4.4。
+ * - future_only：仅改 settings.root_dir，不动已有文件与引用。
+ * - migrate：逐项复制 + 更新 locator_json。
+ */
+export type ChangeRootStrategy = "future_only" | "migrate";
+
+/** settings_change_root_dir 入参 */
+export interface SettingsChangeRootDirInput {
+  newRootDir: string;
+  strategy: ChangeRootStrategy;
+  confirmed: boolean;
+}
+
+/** MigrationPlan.items 单项状态 */
+export type MigrationItemStatus = "ok" | "source_missing" | "target_conflict";
+
+/** MigrationPlan.items 单项（§2.8） */
+export interface MigrationPlanItem {
+  refId: string;
+  currentPath: string;
+  proposedPath: string;
+  status: MigrationItemStatus;
+}
+
+/** confirmed=false 时 settings_change_root_dir 的出参（§2.8 MigrationPlan） */
+export interface MigrationPlan {
+  newRootDir: string;
+  strategy: ChangeRootStrategy;
+  items: MigrationPlanItem[];
+  /** 可迁移项（status == "ok"）源文件总字节数 */
+  totalBytes: number;
+  /** 目标冲突的 proposedPath 列表 */
+  conflicts: string[];
+}
+
+/** migrate 单项失败记录 */
+export interface MigrationFailure {
+  refId: string;
+  currentPath: string;
+  proposedPath: string;
+  /** 人类可读失败原因 */
+  error: string;
+}
+
+/** confirmed=true && strategy="migrate" 出参（§2.8 MigrationResult） */
+export interface MigrationResult {
+  migrated: string[];
+  failed: MigrationFailure[];
+}
+
+/** confirmed=true && strategy="future_only" 出参 */
+export interface FutureOnlyResult {
+  newRootDir: string;
+}
+
+/**
+ * settings_change_root_dir 两阶段出参（untagged 联合）。
+ * 通过字段鉴别：
+ * - 含 `items` → MigrationPlan
+ * - 含 `migrated` / `failed` → MigrationResult
+ * - 仅 `newRootDir` → FutureOnlyResult
+ */
+export type ChangeRootResult = MigrationPlan | MigrationResult | FutureOnlyResult;
+
+/** 类型守卫：MigrationPlan */
+export function isMigrationPlan(r: ChangeRootResult): r is MigrationPlan {
+  return Array.isArray((r as MigrationPlan).items);
+}
+
+/** 类型守卫：MigrationResult */
+export function isMigrationResult(r: ChangeRootResult): r is MigrationResult {
+  return Array.isArray((r as MigrationResult).migrated);
+}
+
+/** 类型守卫：FutureOnlyResult */
+export function isFutureOnlyResult(r: ChangeRootResult): r is FutureOnlyResult {
+  return (
+    !isMigrationPlan(r) &&
+    !isMigrationResult(r) &&
+    typeof (r as FutureOnlyResult).newRootDir === "string"
+  );
+}
+
 /* ---------------- 处置审计（§2.6 disp_audit_list） ---------------- */
 
 /** 审计 action 合法值 — 与 disposition_audit.action CHECK 约束一致（m4-4.9 加入 undo_import） */

@@ -38,6 +38,7 @@ import {
   toApiError,
 } from "../api";
 import { RootDirPicker } from "../components/RootDirPicker";
+import { MigrationWizard } from "../components/MigrationWizard";
 
 /**
  * 设置页 — 四分区卡片式布局（M6-6.5）。
@@ -74,6 +75,7 @@ export function SettingsPage() {
   // ---------- 根目录状态 ----------
   const [rootDirStatus, setRootDirStatus] = useState<RootDirStatus | null>(null);
   const [rootDirLoading, setRootDirLoading] = useState(false);
+  const [migrationWizardOpen, setMigrationWizardOpen] = useState(false);
 
   // ---------- 存储源状态 ----------
   const [sources, setSources] = useState<StorageSourceInfo[]>([]);
@@ -282,7 +284,8 @@ export function SettingsPage() {
         extra={
           <Button
             icon={<SettingOutlined />}
-            onClick={() => message.info("迁移向导由 M6-6.6 实现")}
+            onClick={() => setMigrationWizardOpen(true)}
+            disabled={!rootDirStatus?.initialized}
           >
             修改根目录
           </Button>
@@ -581,6 +584,17 @@ export function SettingsPage() {
           </Form.Item>
         </Form>
       </Modal>
+
+      {/* 根目录迁移向导 — M6-6.6 */}
+      <MigrationWizard
+        open={migrationWizardOpen}
+        onClose={() => setMigrationWizardOpen(false)}
+        onSuccess={() => {
+          setMigrationWizardOpen(false);
+          message.success("根目录已更新");
+          void loadRootDir();
+        }}
+      />
     </div>
   );
 }
