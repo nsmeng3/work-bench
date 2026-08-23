@@ -27,11 +27,9 @@ import { RootDirPicker } from "../components/RootDirPicker";
  *
  * 功能：
  * - 展示已添加的监控目录列表（按 path 升序）
- * - 添加新目录（表单校验：path 必填、绝对路径、Code/Documents 子树内）
+ * - 添加新目录（表单校验：path 必填、绝对路径）
  * - 移除目录（确认对话框）
  */
-
-const WATCH_DIR_ROOT_PREFIX = "/Users/differentw/data/00_Admin/workbench/Code/Documents/";
 
 export function SettingsPage() {
   const [dirs, setDirs] = useState<WatchDirConfig[]>([]);
@@ -127,7 +125,7 @@ export function SettingsPage() {
         }
       >
         <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
-          监控目录中的新文件会自动进入收件箱。目录必须位于 {WATCH_DIR_ROOT_PREFIX} 子树内。
+          监控目录中的新文件会自动进入收件箱。请使用绝对路径。
         </Typography.Paragraph>
 
         <List<WatchDirConfig>
@@ -189,22 +187,12 @@ export function SettingsPage() {
                 pattern: /^\/.*/,
                 message: "请输入绝对路径（以 / 开头）",
               },
-              {
-                validator: (_, value) => {
-                  if (value && !value.startsWith(WATCH_DIR_ROOT_PREFIX)) {
-                    return Promise.reject(
-                      new Error(`目录必须位于 ${WATCH_DIR_ROOT_PREFIX} 子树内`)
-                    );
-                  }
-                  return Promise.resolve();
-                },
-              },
             ]}
           >
             <RootDirPicker
               value={form.getFieldValue("path") || ""}
               onChange={(path) => form.setFieldValue("path", path)}
-              placeholder={`例如 ${WATCH_DIR_ROOT_PREFIX}Documents`}
+              placeholder="例如 /Users/you/Documents"
             />
           </Form.Item>
           <Form.Item name="name" label="名称（可选）">

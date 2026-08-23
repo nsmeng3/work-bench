@@ -85,7 +85,7 @@ export async function inboxGetWatchDirs(): Promise<WatchDirConfig[]> {
 
 /**
  * `inbox_set_watch_dir { path, name, description? }` → `WatchDirConfig`。
- * 路径校验：必须在 `Code/Documents` 子树内，否则抛 `INVALID_PATH`。
+ * 路径校验：必须为绝对路径。
  */
 export async function inboxSetWatchDir(input: WatchDirConfig): Promise<WatchDirConfig> {
   if (MOCK) return mockInboxApi.inbox_set_watch_dir(input);

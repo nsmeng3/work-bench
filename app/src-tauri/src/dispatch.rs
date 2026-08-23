@@ -4,7 +4,7 @@
 //! 按 (dirId, created, path, file, kind) 去重后写 `inbox_item`（status='pending'）。
 //! 只处理 `WatchEventKind::Created`（新增文件进收件箱）。
 //!
-//! 路径校验：`watch_dir.path` 必须在 `Code/Documents` 子树内，否则拒绝。
+//! 路径校验：`watch_dir.path` 必须为绝对路径。
 //! 去重键：同路径同文件同时间戳只记一次。
 
 use serde::{Deserialize, Serialize};
@@ -22,11 +22,8 @@ use std::hash::{Hash, Hasher};
 // ============================================================
 
 /// 聚合窗口（M5 6.1 契约固化 5 秒）。
+#[allow(dead_code)]
 const AGGREGATE_WINDOW_SECS: i64 = 5;
-
-/// 监控目录允许的根前缀（路径校验白名单）。
-const WATCH_DIR_ROOT_PREFIX: &str =
-    "/Users/differentw/data/00_Admin/workbench/Code/Documents/";
 
 // ============================================================
 // 数据模型
@@ -130,10 +127,10 @@ async fn collect_channels(pool: &SqlitePool) -> CmdResult<Vec<Channel>> {
     for row in rows {
         // 路径校验
         let path: String = row.try_get("path").map_err(AppError::from)?;
-        if !path.starts_with(WATCH_DIR_ROOT_PREFIX) {
+        if !path.starts_with('/') {
             return Err(AppError::invalid_param(format!(
-                "监控目录必须位于 {} 子树内：{}",
-                WATCH_DIR_ROOT_PREFIX, path
+                "监控目录必须为绝对路径: {}",
+                path
             )));
         }
         if path.trim().is_empty() {
@@ -292,10 +289,10 @@ pub async fn watch_dir_event_test(
     .ok_or_else(|| AppError::not_found(format!("监控目录不存在：{}", input.dir_id)))?;
 
     let path: String = row.try_get("path").map_err(AppError::from)?;
-    if !path.starts_with(WATCH_DIR_ROOT_PREFIX) {
+    if !path.starts_with('/') {
         return Err(AppError::invalid_param(format!(
-            "监控目录必须位于 {} 子树内：{}",
-            WATCH_DIR_ROOT_PREFIX, path
+            "监控目录必须为绝对路径: {}",
+            path
         )));
     }
     if path.trim().is_empty() {

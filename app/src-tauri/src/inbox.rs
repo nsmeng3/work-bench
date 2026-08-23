@@ -746,10 +746,6 @@ pub async fn inbox_stats(state: tauri::State<'_, crate::AppState>) -> CmdResult<
 // 监控目录命令（M6-6.1 契约）
 // ============================================================
 
-/// 监控目录允许的根前缀（路径校验白名单）。
-const WATCH_DIR_ROOT_PREFIX: &str =
-    "/Users/differentw/data/00_Admin/workbench/Code/Documents/";
-
 fn row_to_watch_dir(row: &sqlx::sqlite::SqliteRow) -> Result<WatchDirConfig, sqlx::Error> {
     Ok(WatchDirConfig {
         id: row.try_get("id")?,
@@ -781,11 +777,11 @@ pub async fn watch_dir_set(
     state: tauri::State<'_, crate::AppState>,
     input: WatchDirConfig,
 ) -> CmdResult<WatchDirConfig> {
-    // 路径校验：必须在 Code/Documents 子树内
-    if !input.path.starts_with(WATCH_DIR_ROOT_PREFIX) {
+    // 路径校验：必须为绝对路径
+    if !input.path.starts_with('/') {
         return Err(AppError::invalid_param(format!(
-            "监控目录必须位于 {} 子树内: {}",
-            WATCH_DIR_ROOT_PREFIX, input.path
+            "监控目录必须为绝对路径: {}",
+            input.path
         )));
     }
     if input.path.trim().is_empty() {
