@@ -41,6 +41,10 @@ import type {
   InboxDismissStaleInput,
   InboxStats,
   WatchDirConfig,
+  StorageSourceInfo,
+  StorageSourceUpdateInput,
+  DefaultAppConfig,
+  DefaultAppSetInput,
 } from "./types";
 
 /**
@@ -573,6 +577,23 @@ let mockRootDir: string | null = null;
 
 const MOCK_TYPE_SUBDIRS = ["Code", "Documents", "Data", "Artifacts", "Tools", "Media"];
 
+/** mock 存储源：与 0001_init.sql 初始数据一致 */
+let mockStorageSource: StorageSourceInfo = {
+  id: "src_local_fs_default",
+  name: "Local Filesystem",
+  kind: "local_fs",
+  status: "ok",
+  capabilities: {
+    archive: true,
+    softDelete: true,
+    destroy: true,
+    restoreFromBin: true,
+  },
+};
+
+/** mock 默认程序配置：内存存储 */
+const mockDefaultApps: Record<string, DefaultAppConfig> = {};
+
 export const mockSettingsApi = {
   settings_get_root_dir(): RootDirStatus {
     if (mockRootDir === null) return { initialized: false };
@@ -614,6 +635,36 @@ export const mockSettingsApi = {
     mockRootDir = rootDir;
     const created = MOCK_TYPE_SUBDIRS.map((s) => `${rootDir.replace(/\/$/, "")}/${s}`);
     return { rootDir, created };
+  },
+
+  settings_list_sources(): StorageSourceInfo[] {
+    return [{ ...mockStorageSource }];
+  },
+
+  settings_update_source(input: StorageSourceUpdateInput): StorageSourceInfo {
+    if (input.id !== mockStorageSource.id) {
+      throw { code: "COMMON_NOT_FOUND", message: "存储源不存在", retryable: false };
+    }
+    if (input.name !== undefined) {
+      mockStorageSource = { ...mockStorageSource, name: input.name };
+    }
+    return { ...mockStorageSource };
+  },
+
+  settings_get_default_app(type: string): DefaultAppConfig {
+    const cfg = mockDefaultApps[type];
+    if (cfg) return { ...cfg };
+    return { type, strategy: "system_default" };
+  },
+
+  settings_set_default_app(input: DefaultAppSetInput): DefaultAppConfig {
+    const cfg: DefaultAppConfig = {
+      type: input.type,
+      strategy: input.strategy,
+      appPath: input.strategy === "app" ? input.appPath : undefined,
+    };
+    mockDefaultApps[input.type] = cfg;
+    return { ...cfg };
   },
 };
 

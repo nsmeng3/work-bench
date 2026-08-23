@@ -299,6 +299,40 @@ export interface InitRootDirResult {
   created: string[];
 }
 
+/** 存储源信息 — §2.8 settings_list_sources 出参 */
+export interface StorageSourceInfo {
+  id: string;
+  name: string;
+  kind: string;
+  status: string;
+  capabilities: {
+    archive: boolean;
+    softDelete: boolean;
+    destroy: boolean;
+    restoreFromBin: boolean;
+  };
+}
+
+/** settings_update_source 入参 — §2.8 */
+export interface StorageSourceUpdateInput {
+  id: string;
+  name?: string;
+}
+
+/** 默认程序配置 — §2.8 settings_get_default_app / settings_set_default_app */
+export interface DefaultAppConfig {
+  type: string;
+  strategy: "system_default" | "app";
+  appPath?: string;
+}
+
+/** settings_set_default_app 入参 — §2.8 */
+export interface DefaultAppSetInput {
+  type: string;
+  strategy: "system_default" | "app";
+  appPath?: string;
+}
+
 /* ---------------- 处置审计（§2.6 disp_audit_list） ---------------- */
 
 /** 审计 action 合法值 — 与 disposition_audit.action CHECK 约束一致（m4-4.9 加入 undo_import） */
