@@ -1,5 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { RootDirStatus, InitRootDirInput, InitRootDirResult } from "./types";
+import type {
+  RootDirStatus,
+  InitRootDirInput,
+  InitRootDirResult,
+  StorageSourceInfo,
+  StorageSourceUpdateInput,
+  DefaultAppConfig,
+  DefaultAppSetInput,
+} from "./types";
 import { mockSettingsApi } from "./mock";
 
 const MOCK = import.meta.env.VITE_MOCK_API === "true";
@@ -19,4 +27,44 @@ export async function settingsInitRootDir(
 ): Promise<InitRootDirResult> {
   if (MOCK) return mockSettingsApi.settings_init_root_dir(input);
   return invoke<InitRootDirResult>("settings_init_root_dir", { ...input });
+}
+
+/**
+ * 列出存储源 — §2.8 settings_list_sources。
+ * 第一阶段仅返回默认 LocalFsSource。
+ */
+export async function settingsListSources(): Promise<StorageSourceInfo[]> {
+  if (MOCK) return mockSettingsApi.settings_list_sources();
+  return invoke<StorageSourceInfo[]>("settings_list_sources");
+}
+
+/**
+ * 更新存储源 — §2.8 settings_update_source。
+ * 第一阶段仅允许修改名称。
+ */
+export async function settingsUpdateSource(
+  input: StorageSourceUpdateInput,
+): Promise<StorageSourceInfo> {
+  if (MOCK) return mockSettingsApi.settings_update_source(input);
+  return invoke<StorageSourceInfo>("settings_update_source", { ...input });
+}
+
+/**
+ * 获取某类型的默认查看程序配置 — §2.8 settings_get_default_app。
+ */
+export async function settingsGetDefaultApp(
+  type: string,
+): Promise<DefaultAppConfig> {
+  if (MOCK) return mockSettingsApi.settings_get_default_app(type);
+  return invoke<DefaultAppConfig>("settings_get_default_app", { type });
+}
+
+/**
+ * 设置某类型的默认查看程序配置 — §2.8 settings_set_default_app。
+ */
+export async function settingsSetDefaultApp(
+  input: DefaultAppSetInput,
+): Promise<DefaultAppConfig> {
+  if (MOCK) return mockSettingsApi.settings_set_default_app(input);
+  return invoke<DefaultAppConfig>("settings_set_default_app", { ...input });
 }
