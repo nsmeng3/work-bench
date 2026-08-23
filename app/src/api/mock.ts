@@ -45,6 +45,9 @@ import type {
   StorageSourceUpdateInput,
   DefaultAppConfig,
   DefaultAppSetInput,
+  SettingsChangeRootDirInput,
+  ChangeRootResult,
+  MigrationPlan,
 } from "./types";
 
 /**
@@ -665,6 +668,42 @@ export const mockSettingsApi = {
     };
     mockDefaultApps[input.type] = cfg;
     return { ...cfg };
+  },
+
+  settings_change_root_dir(input: SettingsChangeRootDirInput): ChangeRootResult {
+    const newRootDir = input.newRootDir.trim();
+    if (!newRootDir) {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: "新根目录不能为空",
+        retryable: false,
+      };
+    }
+    if (!newRootDir.startsWith("/")) {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: "新根目录必须为绝对路径",
+        retryable: false,
+      };
+    }
+    if (!input.confirmed) {
+      // 计划阶段：返回空 items 的 MigrationPlan（mock 简化）
+      const plan: MigrationPlan = {
+        newRootDir,
+        strategy: input.strategy,
+        items: [],
+        totalBytes: 0,
+        conflicts: [],
+      };
+      return plan;
+    }
+    if (input.strategy === "future_only") {
+      mockRootDir = newRootDir;
+      return { newRootDir };
+    }
+    // migrate：mock 直接成功
+    mockRootDir = newRootDir;
+    return { migrated: [], failed: [] };
   },
 };
 
