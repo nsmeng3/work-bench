@@ -189,6 +189,212 @@ pub async fn init_root_dir(pool: &SqlitePool, root_dir: String) -> CmdResult<Ini
 }
 
 // ============================================================
+// m6-6.4 · settings_get_default_app / settings_set_default_app
+// ============================================================
+//
+// 详细设计 §2.8 / §5.3：默认查看程序配置。
+//
+// 存储：复用 `settings` 表，key 格式 `default_app_{type}`，value 为 JSON：
+//   `{ "strategy": "system_default" }`
+//   或 `{ "strategy": "app", "appPath": "/Applications/Typora.app" }`
+//
+// 语义：
+// - `system_default`：使用系统默认程序（ref_open 现有行为）。
+// - `app`：使用 `appPath` 指定的应用打开（macOS `open -a <app>`，Windows/Linux 直接执行）。
+//
+// 优先级（在 ref_open 中生效）：`appOverride` > 类型默认程序 > 系统默认。
+
+/// `settings` 表中默认程序 key 前缀。
+const DEFAULT_APP_KEY_PREFIX: &str = "default_app_";
+
+/// `settings_get_default_app` / `settings_set_default_app` 出入参 strategy。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultAppStrategy {
+    /// 系统默认程序。
+    SystemDefault,
+    /// 指定应用。
+    App,
+}
+
+impl DefaultAppStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DefaultAppStrategy::SystemDefault => "system_default",
+            DefaultAppStrategy::App => "app",
+        }
+    }
+}
+
+/// `settings_get_default_app` 出参 / `settings_set_default_app` 出参（§2.8）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DefaultAppConfig {
+    /// 引用类型（如 "code" / "document" / ...）。
+    #[serde(rename = "type")]
+    pub ref_type: String,
+    /// "system_default" | "app"
+    pub strategy: String,
+    /// 仅 strategy == "app" 时存在。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_path: Option<String>,
+}
+
+/// 拼接 `settings` 表 key：`default_app_{type}`。
+fn default_app_key(ref_type: &str) -> String {
+    format!("{}{}", DEFAULT_APP_KEY_PREFIX, ref_type)
+}
+
+/// 校验 `ref_type`：非空、不含空白与路径分隔符（避免 key 注入）。
+fn validate_ref_type(ref_type: &str) -> CmdResult<()> {
+    let t = ref_type.trim();
+    if t.is_empty() {
+        return Err(AppError::invalid_param("type 不能为空"));
+    }
+    if t != ref_type {
+        return Err(AppError::invalid_param(format!(
+            "type 不允许首尾空白: {:?}",
+            ref_type
+        )));
+    }
+    if t.contains('/') || t.contains('\\') {
+        return Err(AppError::invalid_param(format!(
+            "type 不允许包含路径分隔符: {}",
+            ref_type
+        )));
+    }
+    Ok(())
+}
+
+/// 从 `settings` 表读取某类型的默认程序配置。
+///
+/// 返回 `None` 表示无配置（调用方应回退到系统默认）。
+pub async fn load_default_app(
+    pool: &SqlitePool,
+    ref_type: &str,
+) -> CmdResult<Option<DefaultAppConfig>> {
+    let key = default_app_key(ref_type);
+    let row = sqlx::query("SELECT value_json FROM settings WHERE key = ?")
+        .bind(&key)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::from)?;
+    let Some(r) = row else {
+        return Ok(None);
+    };
+    let value_json: String = r.try_get("value_json").map_err(AppError::from)?;
+    let v: serde_json::Value = serde_json::from_str(&value_json)
+        .map_err(|e| AppError::db(format!("settings.{} 反序列化失败: {}", key, e)))?;
+    let strategy_str = v
+        .get("strategy")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| AppError::db(format!("settings.{} 缺 strategy 字段", key)))?;
+    let app_path = v
+        .get("appPath")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_string());
+    Ok(Some(DefaultAppConfig {
+        ref_type: ref_type.to_string(),
+        strategy: strategy_str.to_string(),
+        app_path,
+    }))
+}
+
+/// 写入某类型的默认程序配置（UPSERT）。
+async fn save_default_app(
+    pool: &SqlitePool,
+    ref_type: &str,
+    strategy: DefaultAppStrategy,
+    app_path: Option<&str>,
+) -> CmdResult<()> {
+    let key = default_app_key(ref_type);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "strategy".to_string(),
+        serde_json::Value::String(strategy.as_str().to_string()),
+    );
+    if let Some(p) = app_path {
+        obj.insert(
+            "appPath".to_string(),
+            serde_json::Value::String(p.to_string()),
+        );
+    }
+    let value_json = serde_json::to_string(&serde_json::Value::Object(obj))
+        .map_err(|e| AppError::db(format!("settings.{} 序列化失败: {}", key, e)))?;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    sqlx::query(
+        "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+    )
+    .bind(&key)
+    .bind(&value_json)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(AppError::from)?;
+    Ok(())
+}
+
+/// `settings_get_default_app` 业务函数。
+///
+/// - 无配置 → 返回 `{ type, strategy: "system_default" }`（不返回 appPath）。
+/// - 有配置 → 返回存储的 strategy 与 appPath。
+pub async fn get_default_app(pool: &SqlitePool, ref_type: String) -> CmdResult<DefaultAppConfig> {
+    validate_ref_type(&ref_type)?;
+    match load_default_app(pool, &ref_type).await? {
+        Some(cfg) => Ok(cfg),
+        None => Ok(DefaultAppConfig {
+            ref_type,
+            strategy: DefaultAppStrategy::SystemDefault.as_str().to_string(),
+            app_path: None,
+        }),
+    }
+}
+
+/// `settings_set_default_app` 业务函数。
+///
+/// - `strategy = "system_default"`：忽略 `app_path`，写 `{ "strategy": "system_default" }`。
+/// - `strategy = "app"`：`app_path` 必填、非空、绝对路径。
+pub async fn set_default_app(
+    pool: &SqlitePool,
+    ref_type: String,
+    strategy: DefaultAppStrategy,
+    app_path: Option<String>,
+) -> CmdResult<DefaultAppConfig> {
+    validate_ref_type(&ref_type)?;
+
+    let normalized_app_path: Option<String> = match strategy {
+        DefaultAppStrategy::SystemDefault => None,
+        DefaultAppStrategy::App => {
+            let p = app_path
+                .ok_or_else(|| {
+                    AppError::invalid_param("strategy=app 时 appPath 必填")
+                })?;
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                return Err(AppError::invalid_param("appPath 不能为空"));
+            }
+            let path = std::path::Path::new(trimmed);
+            if !path.is_absolute() {
+                return Err(AppError::invalid_param(format!(
+                    "appPath 必须为绝对路径: {}",
+                    trimmed
+                )));
+            }
+            Some(trimmed.to_string())
+        }
+    };
+
+    save_default_app(pool, &ref_type, strategy, normalized_app_path.as_deref()).await?;
+
+    Ok(DefaultAppConfig {
+        ref_type,
+        strategy: strategy.as_str().to_string(),
+        app_path: normalized_app_path,
+    })
+}
+
+// ============================================================
 // m4-4.8 · settings_change_root_dir（修改资源根目录，两阶段）
 // ============================================================
 //
@@ -725,6 +931,26 @@ pub async fn settings_change_root_dir(
     confirmed: bool,
 ) -> CmdResult<ChangeRootResult> {
     change_root_dir(&state.pool, new_root_dir, strategy, confirmed).await
+}
+
+/// `settings_get_default_app`：读取某类型的默认查看程序配置（§2.8）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn settings_get_default_app(
+    state: tauri::State<'_, crate::AppState>,
+    r#type: String,
+) -> CmdResult<DefaultAppConfig> {
+    get_default_app(&state.pool, r#type).await
+}
+
+/// `settings_set_default_app`：写入某类型的默认查看程序配置（§2.8）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn settings_set_default_app(
+    state: tauri::State<'_, crate::AppState>,
+    r#type: String,
+    strategy: DefaultAppStrategy,
+    app_path: Option<String>,
+) -> CmdResult<DefaultAppConfig> {
+    set_default_app(&state.pool, r#type, strategy, app_path).await
 }
 
 // ============================================================
@@ -1682,6 +1908,260 @@ mod tests {
             assert!(v3.get("newRootDir").is_some());
             assert!(v3.get("items").is_none());
             assert!(v3.get("migrated").is_none());
+        }
+    }
+
+    // ============================================================
+    // m6-6.4 · settings_get_default_app / settings_set_default_app
+    // ============================================================
+
+    mod default_app_tests {
+        use super::*;
+
+        // ---------- 入参校验 ----------
+
+        #[tokio::test]
+        async fn default_app_rejects_empty_type() {
+            let pool = setup().await;
+            let err = get_default_app(&pool, "".into())
+                .await
+                .expect_err("should fail");
+            assert_eq!(err.code, "COMMON_INVALID_PARAM");
+
+            let err = get_default_app(&pool, "   ".into())
+                .await
+                .expect_err("should fail");
+            assert_eq!(err.code, "COMMON_INVALID_PARAM");
+        }
+
+        #[tokio::test]
+        async fn default_app_rejects_type_with_path_separator() {
+            let pool = setup().await;
+            let err = get_default_app(&pool, "a/b".into())
+                .await
+                .expect_err("should fail");
+            assert_eq!(err.code, "COMMON_INVALID_PARAM");
+
+            let err = get_default_app(&pool, "a\\b".into())
+                .await
+                .expect_err("should fail");
+            assert_eq!(err.code, "COMMON_INVALID_PARAM");
+        }
+
+        #[tokio::test]
+        async fn set_default_app_rejects_app_strategy_without_path() {
+            let pool = setup().await;
+            let err = set_default_app(&pool, "code".into(), DefaultAppStrategy::App, None)
+                .await
+                .expect_err("should fail");
+            assert_eq!(err.code, "COMMON_INVALID_PARAM");
+        }
+
+        #[tokio::test]
+        async fn set_default_app_rejects_app_strategy_with_empty_path() {
+            let pool = setup().await;
+            let err = set_default_app(
+                &pool,
+                "code".into(),
+                DefaultAppStrategy::App,
+                Some("   ".into()),
+            )
+            .await
+            .expect_err("should fail");
+            assert_eq!(err.code, "COMMON_INVALID_PARAM");
+        }
+
+        #[tokio::test]
+        async fn set_default_app_rejects_app_strategy_with_relative_path() {
+            let pool = setup().await;
+            let err = set_default_app(
+                &pool,
+                "code".into(),
+                DefaultAppStrategy::App,
+                Some("Typora".into()),
+            )
+            .await
+            .expect_err("should fail");
+            assert_eq!(err.code, "COMMON_INVALID_PARAM");
+        }
+
+        // ---------- 读写流程 ----------
+
+        #[tokio::test]
+        async fn get_default_app_returns_system_default_when_unset() {
+            let pool = setup().await;
+            let cfg = get_default_app(&pool, "code".into()).await.expect("get ok");
+            assert_eq!(cfg.ref_type, "code");
+            assert_eq!(cfg.strategy, "system_default");
+            assert!(cfg.app_path.is_none());
+        }
+
+        #[tokio::test]
+        async fn set_then_get_default_app_roundtrip_system_default() {
+            let pool = setup().await;
+            let r = set_default_app(
+                &pool,
+                "code".into(),
+                DefaultAppStrategy::SystemDefault,
+                Some("/should/be/ignored".into()),
+            )
+            .await
+            .expect("set ok");
+            assert_eq!(r.strategy, "system_default");
+            assert!(r.app_path.is_none(), "system_default 不应返回 appPath");
+
+            let cfg = get_default_app(&pool, "code".into()).await.expect("get ok");
+            assert_eq!(cfg.strategy, "system_default");
+            assert!(cfg.app_path.is_none());
+        }
+
+        #[tokio::test]
+        async fn set_then_get_default_app_roundtrip_app() {
+            let pool = setup().await;
+            let r = set_default_app(
+                &pool,
+                "document".into(),
+                DefaultAppStrategy::App,
+                Some("/Applications/Typora.app".into()),
+            )
+            .await
+            .expect("set ok");
+            assert_eq!(r.ref_type, "document");
+            assert_eq!(r.strategy, "app");
+            assert_eq!(r.app_path.as_deref(), Some("/Applications/Typora.app"));
+
+            let cfg = get_default_app(&pool, "document".into())
+                .await
+                .expect("get ok");
+            assert_eq!(cfg.strategy, "app");
+            assert_eq!(cfg.app_path.as_deref(), Some("/Applications/Typora.app"));
+        }
+
+        #[tokio::test]
+        async fn set_default_app_overwrites_previous_value() {
+            let pool = setup().await;
+            set_default_app(
+                &pool,
+                "code".into(),
+                DefaultAppStrategy::App,
+                Some("/Applications/VSCode.app".into()),
+            )
+            .await
+            .expect("set1 ok");
+
+            set_default_app(
+                &pool,
+                "code".into(),
+                DefaultAppStrategy::SystemDefault,
+                None,
+            )
+            .await
+            .expect("set2 ok");
+
+            let cfg = get_default_app(&pool, "code".into()).await.expect("get ok");
+            assert_eq!(cfg.strategy, "system_default");
+            assert!(cfg.app_path.is_none(), "覆盖为 system_default 后 appPath 应被清除");
+        }
+
+        #[tokio::test]
+        async fn default_app_is_per_type() {
+            let pool = setup().await;
+            set_default_app(
+                &pool,
+                "code".into(),
+                DefaultAppStrategy::App,
+                Some("/Applications/VSCode.app".into()),
+            )
+            .await
+            .expect("set code");
+            set_default_app(
+                &pool,
+                "document".into(),
+                DefaultAppStrategy::App,
+                Some("/Applications/Typora.app".into()),
+            )
+            .await
+            .expect("set document");
+
+            let code_cfg = get_default_app(&pool, "code".into()).await.expect("get code");
+            let doc_cfg = get_default_app(&pool, "document".into())
+                .await
+                .expect("get document");
+            let media_cfg = get_default_app(&pool, "media".into())
+                .await
+                .expect("get media");
+
+            assert_eq!(code_cfg.app_path.as_deref(), Some("/Applications/VSCode.app"));
+            assert_eq!(doc_cfg.app_path.as_deref(), Some("/Applications/Typora.app"));
+            assert_eq!(media_cfg.strategy, "system_default");
+            assert!(media_cfg.app_path.is_none());
+        }
+
+        #[tokio::test]
+        async fn default_app_persists_across_pool_reopen() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let db_path = tmp.path().join("test.db");
+
+            {
+                let pool = crate::db::init_pool_with_file(&db_path)
+                    .await
+                    .expect("init pool");
+                set_default_app(
+                    &pool,
+                    "code".into(),
+                    DefaultAppStrategy::App,
+                    Some("/Applications/VSCode.app".into()),
+                )
+                .await
+                .expect("set ok");
+                pool.close().await;
+            }
+
+            let pool2 = crate::db::init_pool_with_file(&db_path)
+                .await
+                .expect("reopen pool");
+            let cfg = get_default_app(&pool2, "code".into()).await.expect("get ok");
+            assert_eq!(cfg.strategy, "app");
+            assert_eq!(cfg.app_path.as_deref(), Some("/Applications/VSCode.app"));
+        }
+
+        // ---------- 序列化契约 ----------
+
+        #[test]
+        fn default_app_strategy_deserializes_snake_case() {
+            let s: DefaultAppStrategy =
+                serde_json::from_str(r#""system_default""#).expect("system_default");
+            let a: DefaultAppStrategy = serde_json::from_str(r#""app""#).expect("app");
+            assert_eq!(s, DefaultAppStrategy::SystemDefault);
+            assert_eq!(a, DefaultAppStrategy::App);
+            assert!(serde_json::from_str::<DefaultAppStrategy>(r#""SystemDefault""#).is_err());
+        }
+
+        #[test]
+        fn default_app_config_serializes_camel_case() {
+            let c = DefaultAppConfig {
+                ref_type: "code".into(),
+                strategy: "app".into(),
+                app_path: Some("/Applications/VSCode.app".into()),
+            };
+            let v = serde_json::to_value(&c).expect("serialize");
+            let obj = v.as_object().expect("object");
+            assert!(obj.contains_key("type"));
+            assert!(obj.contains_key("strategy"));
+            assert!(obj.contains_key("appPath"));
+            assert!(!obj.contains_key("ref_type"));
+            assert!(!obj.contains_key("app_path"));
+
+            // appPath=None 时被 skip
+            let c2 = DefaultAppConfig {
+                ref_type: "code".into(),
+                strategy: "system_default".into(),
+                app_path: None,
+            };
+            let v2 = serde_json::to_value(&c2).expect("serialize");
+            let obj2 = v2.as_object().expect("object");
+            assert!(!obj2.contains_key("appPath"));
+            assert_eq!(obj2["strategy"].as_str(), Some("system_default"));
         }
     }
 }

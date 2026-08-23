@@ -139,6 +139,8 @@ pub fn run() {
             fs_ops::ref_reveal_in_finder,
             settings::settings_get_root_dir,
             settings::settings_init_root_dir,
+            settings::settings_get_default_app,
+            settings::settings_set_default_app,
             disposition::disp_get_capabilities,
             settings::settings_change_root_dir,
             disposition::disp_archive,

@@ -67,6 +67,26 @@ async fn fetch_locator(pool: &SqlitePool, id: &str) -> CmdResult<serde_json::Val
     Ok(locator)
 }
 
+/// 从 `resource_reference` 读取 `(locator_json, type)`。
+///
+/// m6-6.4 引入：`ref_open` 需要按引用类型读取默认程序配置（§5.3）。
+async fn fetch_locator_and_type(
+    pool: &SqlitePool,
+    id: &str,
+) -> CmdResult<(serde_json::Value, String)> {
+    let row = sqlx::query("SELECT locator_json, type FROM resource_reference WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found(format!("资源引用不存在: {}", id)))?;
+    let locator_json: String = row.try_get("locator_json").map_err(AppError::from)?;
+    let ref_type: String = row.try_get("type").map_err(AppError::from)?;
+    let locator: serde_json::Value = serde_json::from_str(&locator_json)
+        .map_err(|e| AppError::db(format!("locator_json 反序列化失败: {}", e)))?;
+    Ok((locator, ref_type))
+}
+
 /// 列出某 collection 下所有引用 id（不过滤 disposition：
 /// 健康检查应覆盖全部，UI 自行决定是否展示已删除项）。
 async fn list_ids_by_collection(pool: &SqlitePool, collection_id: &str) -> CmdResult<Vec<String>> {
@@ -162,8 +182,80 @@ pub async fn check_health(
     }
 }
 
-/// `ref_open`：按系统默认程序打开；`app_override` 为本次覆盖。
+/// `ref_open` 策略选择结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenStrategy {
+    /// 系统默认程序。
+    SystemDefault,
+    /// 类型默认程序（来自 settings 表 `default_app_{type}`）。
+    TypedDefault(String),
+    /// 本次调用显式指定（appOverride）。
+    Custom(String),
+}
+
+impl OpenStrategy {
+    /// 序列化为 `OpenResult.strategy` 字符串。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OpenStrategy::SystemDefault => "system_default",
+            OpenStrategy::TypedDefault(_) => "app",
+            OpenStrategy::Custom(_) => "custom",
+        }
+    }
+
+    /// 提取实际用于 spawn 的 app 路径（SystemDefault 时返回 None）。
+    pub fn app_path(&self) -> Option<&str> {
+        match self {
+            OpenStrategy::SystemDefault => None,
+            OpenStrategy::TypedDefault(p) => Some(p.as_str()),
+            OpenStrategy::Custom(p) => Some(p.as_str()),
+        }
+    }
+}
+
+/// 选择 `ref_open` 的打开策略（纯函数，便于测试）。
 ///
+/// 优先级：`appOverride` > 类型默认程序 > 系统默认。
+///
+/// - `app_override` 非空白 → `Custom(app)`。
+/// - 否则查 `settings` 表 `default_app_{ref_type}`：
+///   - `strategy = "app"` 且 `appPath` 非空白 → `TypedDefault(appPath)`。
+///   - 其他（`system_default` / 无配置 / appPath 缺失或空白）→ `SystemDefault`。
+pub async fn choose_open_strategy(
+    pool: &SqlitePool,
+    ref_type: &str,
+    app_override: Option<String>,
+) -> CmdResult<OpenStrategy> {
+    if let Some(app) = app_override {
+        let trimmed = app.trim();
+        if !trimmed.is_empty() {
+            return Ok(OpenStrategy::Custom(trimmed.to_string()));
+        }
+    }
+    match crate::settings::load_default_app(pool, ref_type).await? {
+        Some(cfg) if cfg.strategy == "app" => {
+            if let Some(p) = cfg.app_path {
+                let trimmed = p.trim().to_string();
+                if !trimmed.is_empty() {
+                    return Ok(OpenStrategy::TypedDefault(trimmed));
+                }
+            }
+            Ok(OpenStrategy::SystemDefault)
+        }
+        _ => Ok(OpenStrategy::SystemDefault),
+    }
+}
+
+/// `ref_open`：按优先级选择打开策略（§2.5 / §5.3）。
+///
+/// 优先级：`appOverride` > 类型默认程序 > 系统默认。
+///
+/// - `app_override` 非空 → 用指定程序打开（strategy = "custom"）。
+/// - `app_override` 为空 → 按引用类型读取 `settings` 表 `default_app_{type}`：
+///   - 配置 `strategy = "app"` 且 `appPath` 非空 → 用配置的 appPath 打开（strategy = "app"）。
+///   - 配置 `strategy = "system_default"` 或无配置 → 系统默认（strategy = "system_default"）。
+///
+/// 平台分支：
 /// - macOS：默认 `open <path>`；自定义 `open -a <app> <path>`。
 /// - Windows：默认 `explorer <path>`；自定义直接 `<app> <path>`。
 /// - Linux：默认 `xdg-open <path>`；自定义直接 `<app> <path>`。
@@ -174,7 +266,7 @@ pub async fn open(
     id: String,
     app_override: Option<String>,
 ) -> CmdResult<OpenResult> {
-    let locator = fetch_locator(pool, &id).await?;
+    let (locator, ref_type) = fetch_locator_and_type(pool, &id).await?;
     let path = extract_path(&locator).ok_or_else(|| {
         AppError::invalid_param(format!("引用 {} 的 locator 非 path 形态，无法打开", id))
     })?;
@@ -199,17 +291,13 @@ pub async fn open(
         }
     }
 
-    let strategy = if app_override.is_some() {
-        "custom"
-    } else {
-        "system_default"
-    };
-
-    spawn_open(&path, app_override.as_deref())?;
+    let strategy = choose_open_strategy(pool, &ref_type, app_override).await?;
+    let strategy_label = strategy.as_str().to_string();
+    spawn_open(&path, strategy.app_path())?;
 
     Ok(OpenResult {
         opened: true,
-        strategy: strategy.to_string(),
+        strategy: strategy_label,
     })
 }
 
@@ -682,5 +770,177 @@ mod tests {
         let obj = v.as_object().expect("object");
         assert_eq!(obj["opened"].as_bool(), Some(true));
         assert_eq!(obj["strategy"].as_str(), Some("system_default"));
+    }
+
+    // ---------- m6-6.4 · choose_open_strategy（ref_open 策略选择） ----------
+
+    /// 直接写 settings.default_app_{type}（绕过 set_default_app 命令层）。
+    async fn seed_default_app(pool: &SqlitePool, ref_type: &str, value: serde_json::Value) {
+        let key = format!("default_app_{}", ref_type);
+        let value_json = serde_json::to_string(&value).expect("serialize");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        sqlx::query(
+            "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+        )
+        .bind(&key)
+        .bind(&value_json)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed default_app");
+    }
+
+    #[tokio::test]
+    async fn strategy_override_wins_over_typed_default() {
+        let pool = setup().await;
+        seed_default_app(
+            &pool,
+            "code",
+            serde_json::json!({ "strategy": "app", "appPath": "/Applications/VSCode.app" }),
+        )
+        .await;
+
+        let s = choose_open_strategy(&pool, "code", Some("/Applications/Sublime.app".into()))
+            .await
+            .expect("choose ok");
+        assert_eq!(
+            s,
+            OpenStrategy::Custom("/Applications/Sublime.app".into())
+        );
+        assert_eq!(s.as_str(), "custom");
+        assert_eq!(s.app_path(), Some("/Applications/Sublime.app"));
+    }
+
+    #[tokio::test]
+    async fn strategy_typed_default_when_no_override() {
+        let pool = setup().await;
+        seed_default_app(
+            &pool,
+            "document",
+            serde_json::json!({ "strategy": "app", "appPath": "/Applications/Typora.app" }),
+        )
+        .await;
+
+        let s = choose_open_strategy(&pool, "document", None)
+            .await
+            .expect("choose ok");
+        assert_eq!(
+            s,
+            OpenStrategy::TypedDefault("/Applications/Typora.app".into())
+        );
+        assert_eq!(s.as_str(), "app");
+        assert_eq!(s.app_path(), Some("/Applications/Typora.app"));
+    }
+
+    #[tokio::test]
+    async fn strategy_system_default_when_no_config() {
+        let pool = setup().await;
+        let s = choose_open_strategy(&pool, "media", None)
+            .await
+            .expect("choose ok");
+        assert_eq!(s, OpenStrategy::SystemDefault);
+        assert_eq!(s.as_str(), "system_default");
+        assert_eq!(s.app_path(), None);
+    }
+
+    #[tokio::test]
+    async fn strategy_system_default_when_config_is_system_default() {
+        let pool = setup().await;
+        seed_default_app(
+            &pool,
+            "code",
+            serde_json::json!({ "strategy": "system_default" }),
+        )
+        .await;
+
+        let s = choose_open_strategy(&pool, "code", None)
+            .await
+            .expect("choose ok");
+        assert_eq!(s, OpenStrategy::SystemDefault);
+    }
+
+    #[tokio::test]
+    async fn strategy_system_default_when_app_path_missing() {
+        let pool = setup().await;
+        // strategy=app 但缺 appPath → 回退 system_default（防御性）
+        seed_default_app(
+            &pool,
+            "code",
+            serde_json::json!({ "strategy": "app" }),
+        )
+        .await;
+
+        let s = choose_open_strategy(&pool, "code", None)
+            .await
+            .expect("choose ok");
+        assert_eq!(s, OpenStrategy::SystemDefault);
+    }
+
+    #[tokio::test]
+    async fn strategy_system_default_when_app_path_blank() {
+        let pool = setup().await;
+        seed_default_app(
+            &pool,
+            "code",
+            serde_json::json!({ "strategy": "app", "appPath": "   " }),
+        )
+        .await;
+
+        let s = choose_open_strategy(&pool, "code", None)
+            .await
+            .expect("choose ok");
+        assert_eq!(s, OpenStrategy::SystemDefault);
+    }
+
+    #[tokio::test]
+    async fn strategy_blank_override_falls_back_to_typed_default() {
+        let pool = setup().await;
+        seed_default_app(
+            &pool,
+            "code",
+            serde_json::json!({ "strategy": "app", "appPath": "/Applications/VSCode.app" }),
+        )
+        .await;
+
+        // 空白 override 应视为未提供
+        let s = choose_open_strategy(&pool, "code", Some("   ".into()))
+            .await
+            .expect("choose ok");
+        assert_eq!(
+            s,
+            OpenStrategy::TypedDefault("/Applications/VSCode.app".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn strategy_per_type_isolation() {
+        let pool = setup().await;
+        seed_default_app(
+            &pool,
+            "code",
+            serde_json::json!({ "strategy": "app", "appPath": "/Applications/VSCode.app" }),
+        )
+        .await;
+        seed_default_app(
+            &pool,
+            "document",
+            serde_json::json!({ "strategy": "app", "appPath": "/Applications/Typora.app" }),
+        )
+        .await;
+
+        let s_code = choose_open_strategy(&pool, "code", None)
+            .await
+            .expect("code");
+        let s_doc = choose_open_strategy(&pool, "document", None)
+            .await
+            .expect("doc");
+        let s_media = choose_open_strategy(&pool, "media", None)
+            .await
+            .expect("media");
+
+        assert_eq!(s_code.app_path(), Some("/Applications/VSCode.app"));
+        assert_eq!(s_doc.app_path(), Some("/Applications/Typora.app"));
+        assert_eq!(s_media, OpenStrategy::SystemDefault);
     }
 }
