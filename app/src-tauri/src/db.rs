@@ -60,7 +60,44 @@ pub async fn init_pool_with_file(db_path: &Path) -> CmdResult<SqlitePool> {
         .await
         .map_err(AppError::from)?;
 
+    // 启动时兜底修复：watch_dir 表若缺少 name/description 列则自动添加（m6-6.3）
+    ensure_watch_dir_columns(&pool).await?;
+
     Ok(pool)
+}
+
+/// 检查 watch_dir 表结构，缺失 name/description 列时自动补全。
+/// 用于兼容旧版本数据库（迁移未执行或执行失败的情况）。
+async fn ensure_watch_dir_columns(pool: &SqlitePool) -> CmdResult<()> {
+    let has_name: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('watch_dir') WHERE name = 'name'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(AppError::from)?;
+
+    if !has_name {
+        sqlx::query("ALTER TABLE watch_dir ADD COLUMN name TEXT")
+            .execute(pool)
+            .await
+            .map_err(AppError::from)?;
+    }
+
+    let has_description: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('watch_dir') WHERE name = 'description'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(AppError::from)?;
+
+    if !has_description {
+        sqlx::query("ALTER TABLE watch_dir ADD COLUMN description TEXT")
+            .execute(pool)
+            .await
+            .map_err(AppError::from)?;
+    }
+
+    Ok(())
 }
 
 /// 内存数据库，仅用于单元测试。

@@ -1578,7 +1578,7 @@ export const mockInboxApi = {
   },
   inbox_unset_watch_dir(_input: { path: string }): WatchDirConfig {
     // mock 不做清理，直接返回
-    return { path: _input.path, name: "mock", description: "" };
+    return { id: "mock-id", path: _input.path, name: "mock", description: "" };
   },
 };
 

@@ -57,15 +57,12 @@ export function SettingsPage() {
     void loadDirs();
   }, [loadDirs]);
 
-  function handleAdd() {
-    setAddModalOpen(true);
-  }
-
   async function handleAddSubmit() {
     try {
       const values = await form.validateFields();
       setSubmitting(true);
       await inboxSetWatchDir({
+        id: crypto.randomUUID(),
         path: values.path,
         name: values.name || values.path.split("/").pop() || "未命名",
         description: values.description,
@@ -75,7 +72,6 @@ export function SettingsPage() {
       void loadDirs();
     } catch (err) {
       if (err && typeof err === "object" && "errorFields" in err) {
-        // 表单校验失败，不处理
         return;
       }
       const apiErr = toApiError(err);
@@ -117,7 +113,7 @@ export function SettingsPage() {
           <Button
             type="primary"
             icon={<FolderAddOutlined />}
-            onClick={handleAdd}
+            onClick={() => setAddModalOpen(true)}
           >
             添加目录
           </Button>

@@ -499,6 +499,7 @@ export interface InboxDismissStaleInput {
 
 /** 监控目录配置 — M6 声明契约 */
 export interface WatchDirConfig {
+  id: string;
   path: string;
   name: string;
   description?: string;

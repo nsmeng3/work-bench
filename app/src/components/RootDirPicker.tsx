@@ -3,10 +3,10 @@ import { Button, Input, Space, message } from "antd";
 import { FolderOpenOutlined } from "@ant-design/icons";
 
 interface RootDirPickerProps {
-  /** 当前路径值 */
-  value: string;
-  /** 路径变化回调（手动输入或浏览选择均触发） */
-  onChange: (path: string) => void;
+  /** 当前路径值（由 antd Form.Item 自动注入，或手动传入） */
+  value?: string;
+  /** 路径变化回调（由 antd Form.Item 自动注入，或手动传入） */
+  onChange?: (path: string) => void;
   /** 输入框占位符 */
   placeholder?: string;
   /** 是否禁用（如提交中） */
@@ -22,7 +22,7 @@ interface RootDirPickerProps {
  * 命名与形态与 M4 设置中心「根目录迁移」入口复用约定保持一致。
  */
 export function RootDirPicker({
-  value,
+  value = "",
   onChange,
   placeholder = "请选择或输入绝对路径，例如 /Users/you/Workbench",
   disabled = false,
@@ -39,7 +39,7 @@ export function RootDirPicker({
         multiple: false,
       });
       if (typeof selected === "string" && selected) {
-        onChange(selected);
+        onChange?.(selected);
       }
       // selected === null 表示用户取消，保持原值
     } catch (err) {
@@ -56,7 +56,7 @@ export function RootDirPicker({
       {contextHolder}
       <Input
         value={value}
-        onChange={(e) => onChange(e.target.value)}
+        onChange={(e) => onChange?.(e.target.value)}
         placeholder={placeholder}
         disabled={disabled}
         allowClear
