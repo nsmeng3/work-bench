@@ -19,6 +19,7 @@ import { FilterPage } from "./pages/FilterPage";
 import { InitWizardPage } from "./pages/InitWizardPage";
 import { AuditPage } from "./pages/AuditPage";
 import { InboxPage } from "./pages/InboxPage";
+import { SettingsPage } from "./pages/SettingsPage";
 import { settingsGetRootDir, toApiError } from "./api";
 import type { Collection, Space } from "./api";
 import { useInboxStats } from "./hooks/useInboxStats";
@@ -30,7 +31,7 @@ const navItems: NavItem[] = [
   { key: "audit", label: "审计", icon: <AuditOutlined />, enabled: true },
   { key: "inbox", label: "收件箱", icon: <InboxOutlined />, enabled: true },
   { key: "collections", label: "资源集", icon: <FolderOutlined />, enabled: false },
-  { key: "settings", label: "设置", icon: <SettingOutlined />, enabled: false },
+  { key: "settings", label: "设置", icon: <SettingOutlined />, enabled: true },
 ];
 
 /** 首启检测状态：loading → ready / failed */
@@ -197,6 +198,7 @@ function App() {
             {activeNav === "filter" && <FilterPage onJumpToCollection={handleJumpToCollection} />}
             {activeNav === "audit" && <AuditPage />}
             {activeNav === "inbox" && <InboxPage />}
+            {activeNav === "settings" && <SettingsPage />}
           </AppShell>
         )}
       </AntApp>
