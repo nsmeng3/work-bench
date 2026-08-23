@@ -58,7 +58,6 @@ export function SettingsPage() {
   }, [loadDirs]);
 
   function handleAdd() {
-    form.resetFields();
     setAddModalOpen(true);
   }
 
@@ -176,6 +175,7 @@ export function SettingsPage() {
         confirmLoading={submitting}
         okText="添加"
         cancelText="取消"
+        destroyOnHidden
       >
         <Form form={form} layout="vertical">
           <Form.Item
