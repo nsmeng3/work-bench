@@ -44,6 +44,9 @@ notify = "8.2.0"
 # m5-5.2 · 忽略规则引擎：ByPattern 完整路径 glob 匹配（"**/*.part" / "**/build/**"）
 # 版本：0.3.4（cargo add glob 当前稳定版；语义化版本约束 "0.3.4" 兼容 0.3.x 后续 patch）
 glob = "0.3.4"
+# m6-6.2 · watch 调度器：目录树遍历（walkdir）
+# 版本：2.4.0（cargo add walkdir 当前稳定版；语义化版本约束 "2.4.0" 兼容 2.x 后续 patch）
+walkdir = "2.4.0"
 
 [dev-dependencies]
 tempfile = "3"
