@@ -17,6 +17,7 @@ mod space;
 mod tag;
 mod types;
 mod watch;
+mod dispatch;
 
 use sqlx::sqlite::SqlitePool;
 
@@ -158,6 +159,7 @@ pub fn run() {
             inbox::watch_dir_get,
             inbox::watch_dir_set,
             inbox::watch_dir_unset,
+            dispatch::watch_dir_event,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
