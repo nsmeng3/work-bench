@@ -77,25 +77,25 @@ export async function inboxDismissStale(input: InboxDismissStaleInput): Promise<
 /**
  * 监控目录命令 — M6-6.1 声明契约
  */
-/** `inbox_get_watch_dirs ()` → `WatchDirConfig[]`（按 path 升序） */
+/** `watch_dir_get ()` → `WatchDirConfig[]`（按 path 升序） */
 export async function inboxGetWatchDirs(): Promise<WatchDirConfig[]> {
   if (MOCK) return mockInboxApi.inbox_get_watch_dirs();
-  return invoke<WatchDirConfig[]>("inbox_get_watch_dirs");
+  return invoke<WatchDirConfig[]>("watch_dir_get");
 }
 
 /**
- * `inbox_set_watch_dir { path, name, description? }` → `WatchDirConfig`。
+ * `watch_dir_set { path, name, description? }` → `WatchDirConfig`。
  * 路径校验：必须为绝对路径。
  */
 export async function inboxSetWatchDir(input: WatchDirConfig): Promise<WatchDirConfig> {
   if (MOCK) return mockInboxApi.inbox_set_watch_dir(input);
-  return invoke<WatchDirConfig>("inbox_set_watch_dir", { ...input });
+  return invoke<WatchDirConfig>("watch_dir_set", { input });
 }
 
 /**
- * `inbox_unset_watch_dir { path }` → `WatchDirConfig`。
+ * `watch_dir_unset { path }` → `WatchDirConfig`。
  */
 export async function inboxUnsetWatchDir(input: { path: string }): Promise<WatchDirConfig> {
   if (MOCK) return mockInboxApi.inbox_unset_watch_dir(input);
-  return invoke<WatchDirConfig>("inbox_unset_watch_dir", { ...input });
+  return invoke<WatchDirConfig>("watch_dir_unset", { path: input.path });
 }
