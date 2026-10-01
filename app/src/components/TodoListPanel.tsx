@@ -43,6 +43,7 @@ import {
   todoUpdate,
   toApiError,
 } from "../api";
+import { ReferencePicker } from "./ReferencePicker";
 
 const { Text } = Typography;
 
@@ -116,9 +117,6 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
     dueAt?: { unix(): number } | null;
     status: TodoStatus;
   }>();
-
-  /** 挂载资源 */
-  const [attachRefId, setAttachRefId] = useState<string>("");
 
   const [messageApi, messageContextHolder] = message.useMessage();
 
@@ -246,7 +244,6 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
     setDetailId(null);
     setDetail(null);
     detailForm.resetFields();
-    setAttachRefId("");
   }
 
   async function handleDetailSave() {
@@ -296,12 +293,11 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
 
   /* ---------------- 挂载 / 卸载引用 ---------------- */
 
-  async function handleAttachRef() {
-    if (!detailId || !attachRefId.trim()) return;
+  async function handleAttachRef(ref: Reference) {
+    if (!detailId) return;
     try {
-      await todoLinkRef({ todoId: detailId, refId: attachRefId.trim() });
-      messageApi.success({ content: "已挂载", duration: 1.5 });
-      setAttachRefId("");
+      await todoLinkRef({ todoId: detailId, refId: ref.id });
+      messageApi.success({ content: `已挂载「${ref.name}」`, duration: 1.5 });
       await reloadDetail(detailId);
       await fetchTodos();
     } catch (err) {
@@ -594,19 +590,14 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
                   )}
                 />
               )}
-              <AntSpace.Compact style={{ width: "100%", marginTop: 8 }}>
-                <Input
-                  placeholder="输入引用 ID 挂载（高级）"
-                  value={attachRefId}
-                  onChange={(e) => setAttachRefId(e.target.value)}
-                  onPressEnter={() => void handleAttachRef()}
+              <div style={{ marginTop: 8 }}>
+                <ReferencePicker
+                  attachedRefIds={detail.refs.map((r) => r.id)}
+                  onSelect={(ref) => void handleAttachRef(ref)}
                 />
-                <Button onClick={() => void handleAttachRef()} disabled={!attachRefId.trim()}>
-                  挂载
-                </Button>
-              </AntSpace.Compact>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                提示：在资源详情面板使用「挂到待办」更直观。
+              </div>
+              <Text type="secondary" style={{ fontSize: 12, display: "block", marginTop: 4 }}>
+                点击资源即挂载；也可在资源详情面板反向操作「挂到待办」。
               </Text>
             </div>
 
