@@ -357,9 +357,12 @@ export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace }: DashboardPa
                           <div
                             style={{
                               fontWeight: 500,
+                              display: "-webkit-box",
+                              WebkitBoxOrient: "vertical",
+                              WebkitLineClamp: 2,
                               overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              whiteSpace: "nowrap",
+                              wordBreak: "break-all",
+                              lineHeight: 1.4,
                             }}
                             title={item.refName}
                           >
