@@ -351,8 +351,8 @@ export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace }: DashboardPa
                       style={{ padding: "8px 0", cursor: "pointer", display: "block" }}
                       onClick={() => void handleOpenRecent(item)}
                     >
-                      <AntSpace size={8} style={{ display: "flex", width: "100%" }}>
-                        {refTypeIcon(item.refType)}
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: 8, width: "100%", overflow: "hidden" }}>
+                        <span style={{ flexShrink: 0, marginTop: 2 }}>{refTypeIcon(item.refType)}</span>
                         <div style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
                           <div
                             style={{
@@ -369,25 +369,32 @@ export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace }: DashboardPa
                             {item.refName}
                           </div>
                           {path && (
-                            <Text
-                              type="secondary"
+                            <div
                               style={{
                                 fontSize: 12,
-                                display: "block",
+                                color: "rgba(0, 0, 0, 0.45)",
                                 overflow: "hidden",
                                 textOverflow: "ellipsis",
                                 whiteSpace: "nowrap",
+                                marginTop: 2,
                               }}
                               title={path}
                             >
                               {path}
-                            </Text>
+                            </div>
                           )}
                         </div>
-                        <Text type="secondary" style={{ fontSize: 12, flexShrink: 0 }}>
+                        <span
+                          style={{
+                            fontSize: 12,
+                            color: "rgba(0, 0, 0, 0.45)",
+                            flexShrink: 0,
+                            marginTop: 2,
+                          }}
+                        >
                           {formatRelativeTime(item.lastAt)}
-                        </Text>
-                      </AntSpace>
+                        </span>
+                      </div>
                     </List.Item>
                   );
                 }}
