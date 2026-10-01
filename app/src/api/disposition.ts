@@ -4,6 +4,7 @@ import type {
   DispCapabilities,
   DispDestroyResult,
   DispPreview,
+  DispUnlinkResult,
   Reference,
   UndoPlan,
 } from "./types";
@@ -57,6 +58,18 @@ export async function dispDestroy(refId: string, confirmText: string): Promise<D
     confirmText,
     confirmed: true,
   });
+}
+
+/**
+ * `disp_unlink { refId }` → `DispUnlinkResult`（m7-7.4）。
+ *
+ * 仅对 `hosting='external'` 的资源可用；managed 资源调用会返回 `COMMON_FORBIDDEN`。
+ * 仅删除 `resource_reference` 行（级联清 reference_tag / todo_ref_link / ref_access_log），
+ * **不动真实文件**；不可恢复，但可通过"创建外部引用"重新加回。
+ */
+export async function dispUnlink(refId: string): Promise<DispUnlinkResult> {
+  if (MOCK) return mockDispositionApi.disp_unlink(refId);
+  return invoke<DispUnlinkResult>("disp_unlink", { refId });
 }
 
 /** `disp_preview { refId }` → `DispPreview`（删除/销毁确认框的统计数据） */

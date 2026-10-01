@@ -33,6 +33,7 @@ import type {
   DispCapabilities,
   DispPreview,
   DispDestroyResult,
+  DispUnlinkResult,
   UndoPlan,
   InboxItem,
   InboxItemDetail,
@@ -1194,7 +1195,11 @@ function computeMockCapabilities(ref: Reference): DispCapabilities {
   const restoreFromBin = disposition === "deleted";
   if (!restoreFromBin) reason.restoreFromBin = "引用未处于回收站状态";
 
-  return { archive, softDelete, destroy, restoreFromBin, reason };
+  // m7-7.4 · unlink：仅 external 允许
+  const unlink = ref.hosting === "external";
+  if (!unlink) reason.unlink = "托管资源不允许解除关联（会留孤儿文件）";
+
+  return { archive, softDelete, destroy, restoreFromBin, unlink, reason };
 }
 
 function findMockRef(refId: string): Reference {
@@ -1313,6 +1318,23 @@ export const mockDispositionApi = {
       };
     }
     // 物理删除引用行
+    seedReferences = seedReferences.filter((r) => r.ref.id !== refId);
+    return { deletedRefId: refId };
+  },
+
+  /**
+   * m7-7.4 · disp_unlink mock：仅 external 允许；managed 抛 COMMON_FORBIDDEN。
+   * 仅删 resource_reference 行，不动文件。
+   */
+  disp_unlink(refId: string): DispUnlinkResult {
+    const ref = findMockRef(refId);
+    if (ref.hosting !== "external") {
+      throw {
+        code: "COMMON_FORBIDDEN",
+        message: "托管资源不允许解除关联（会留孤儿文件）",
+        retryable: false,
+      };
+    }
     seedReferences = seedReferences.filter((r) => r.ref.id !== refId);
     return { deletedRefId: refId };
   },
@@ -2038,5 +2060,28 @@ export const mockTodoApi = {
       return a.id.localeCompare(b.id);
     });
     return items.slice(0, 20);
+  },
+};
+
+/* ---------------- 内嵌终端 mock（M7-4） ----------------
+ *
+ * 终端无法在纯前端 mock 出真实 PTY 行为；这里仅提供占位，
+ * 所有方法抛错，提醒调用方在 mock 模式下隐藏终端 tab。
+ */
+export const mockTerminalApi = {
+  terminal_create(): never {
+    throw new Error("终端在 mock 模式下不可用");
+  },
+  terminal_write(): never {
+    throw new Error("终端在 mock 模式下不可用");
+  },
+  terminal_resize(): never {
+    throw new Error("终端在 mock 模式下不可用");
+  },
+  terminal_close(): never {
+    throw new Error("终端在 mock 模式下不可用");
+  },
+  terminal_list(): never {
+    throw new Error("终端在 mock 模式下不可用");
   },
 };

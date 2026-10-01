@@ -461,6 +461,8 @@ export interface DispReasons {
   softDelete?: string;
   destroy?: string;
   restoreFromBin?: string;
+  /** m7-7.4 · 解除关联 */
+  unlink?: string;
 }
 
 /**
@@ -472,6 +474,8 @@ export interface DispCapabilities {
   softDelete: boolean;
   destroy: boolean;
   restoreFromBin: boolean;
+  /** m7-7.4 · 解除关联（仅 external 为 true） */
+  unlink: boolean;
   reason: DispReasons;
 }
 
@@ -488,6 +492,11 @@ export interface DispPreview {
 
 /** `disp_destroy` 出参 — §2.6 二选一固化：返回被删除的 refId */
 export interface DispDestroyResult {
+  deletedRefId: string;
+}
+
+/** `disp_unlink` 出参 — m7-7.4：返回被删除的 refId */
+export interface DispUnlinkResult {
   deletedRefId: string;
 }
 
@@ -787,4 +796,34 @@ export interface UndoPlan {
   canUndo: boolean;
   /** 阻塞原因列表（中文）；空数组表示可撤销 */
   blockers: string[];
+}
+/* ---------------- 内嵌终端（M7-4 · terminal_*） ---------------- */
+
+/**
+ * 终端事件（与后端 `TerminalEvent` 对齐，snake_case tag）。
+ * 后端通过 `tauri::ipc::Channel<TerminalEvent>` 持续推送。
+ */
+export type TerminalEvent =
+  | { kind: "data"; data: string }
+  | { kind: "exited"; code: number | null };
+
+/** `terminal_create` 入参。 */
+export interface TerminalCreateInput {
+  spaceId?: string;
+  cwd?: string;
+  cols: number;
+  rows: number;
+}
+
+/** `terminal_create` 出参。 */
+export interface TerminalCreateOutput {
+  sessionId: string;
+}
+
+/** `terminal_list` 出参条目。 */
+export interface TerminalListItem {
+  sessionId: string;
+  spaceId?: string;
+  cwd: string;
+  shell: string;
 }

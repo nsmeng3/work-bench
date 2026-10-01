@@ -41,12 +41,14 @@ pub struct DispReasons {
     pub destroy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restore_from_bin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unlink: Option<String>,
 }
 
-/// `disp_get_capabilities` 出参（契约 §2.6）。
+/// `disp_get_capabilities` 出参（契约 §2.6 + m7-7.4 unlink 扩展）。
 ///
 /// 序列化为 camelCase：
-/// `{ archive, softDelete, destroy, restoreFromBin, reason }`。
+/// `{ archive, softDelete, destroy, restoreFromBin, unlink, reason }`。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DispCapabilities {
@@ -54,6 +56,8 @@ pub struct DispCapabilities {
     pub soft_delete: bool,
     pub destroy: bool,
     pub restore_from_bin: bool,
+    /// m7-7.4 · 解除关联（仅 external；managed 返回 false 并填 reason）。
+    pub unlink: bool,
     pub reason: DispReasons,
 }
 
@@ -61,18 +65,24 @@ pub struct DispCapabilities {
 // 能力计算纯函数
 // ============================================================
 
-/// 能力计算纯函数：输入 `(disposition, soft_delete_supported)`，
+/// 能力计算纯函数：输入 `(disposition, hosting, soft_delete_supported)`，
 /// 输出 `DispCapabilities`。
 ///
-/// 规则（契约 §2.6）：
+/// 规则（契约 §2.6 + m7-7.4 unlink 扩展）：
 /// - `archive`：`disposition != 'archived'` 时 true；已归档则 false 并填 reason。
 /// - `softDelete`：取决于存储源 `caps_json.softDelete`；false 时填 reason。
 /// - `destroy`：始终 true（兜底）。
 /// - `restoreFromBin`：`disposition == 'deleted'` 时 true；否则 false 并填 reason。
+/// - `unlink`：`hosting == 'external'` 时 true；managed 时 false 并填 reason
+///   （解除关联会留孤儿文件，故禁止）。
 ///
 /// `disposition` 取值集合由 schema CHECK 约束保证为 `none|archived|deleted`，
 /// 本函数对未知值按 `none` 处理（防御性兜底）。
-pub fn compute_capabilities(disposition: &str, soft_delete_supported: bool) -> DispCapabilities {
+pub fn compute_capabilities(
+    disposition: &str,
+    hosting: &str,
+    soft_delete_supported: bool,
+) -> DispCapabilities {
     let mut reason = DispReasons::default();
 
     let archive = if disposition == "archived" {
@@ -99,11 +109,20 @@ pub fn compute_capabilities(disposition: &str, soft_delete_supported: bool) -> D
         false
     };
 
+    // m7-7.4 · unlink：仅 external 允许；managed 禁止（会留孤儿文件）。
+    let unlink = if hosting == "external" {
+        true
+    } else {
+        reason.unlink = Some("托管资源不允许解除关联（会留孤儿文件）".to_string());
+        false
+    };
+
     DispCapabilities {
         archive,
         soft_delete,
         destroy,
         restore_from_bin,
+        unlink,
         reason,
     }
 }
@@ -218,7 +237,7 @@ pub async fn write_soft_delete_cap(
 /// - `COMMON_DB`：数据库或 JSON 解析失败
 pub async fn get_capabilities(pool: &SqlitePool, ref_id: String) -> CmdResult<DispCapabilities> {
     let row = sqlx::query(
-        "SELECT r.disposition AS disposition, s.caps_json AS caps_json \
+        "SELECT r.disposition AS disposition, r.hosting AS hosting, s.caps_json AS caps_json \
          FROM resource_reference r \
          JOIN storage_source s ON s.id = r.source_id \
          WHERE r.id = ?",
@@ -230,10 +249,11 @@ pub async fn get_capabilities(pool: &SqlitePool, ref_id: String) -> CmdResult<Di
     .ok_or_else(|| AppError::not_found(format!("资源引用不存在: {}", ref_id)))?;
 
     let disposition: String = row.try_get("disposition").map_err(AppError::from)?;
+    let hosting: String = row.try_get("hosting").map_err(AppError::from)?;
     let caps_json: Option<String> = row.try_get("caps_json").map_err(AppError::from)?;
 
     let soft_delete_supported = parse_soft_delete_cap(caps_json.as_deref())?;
-    Ok(compute_capabilities(&disposition, soft_delete_supported))
+    Ok(compute_capabilities(&disposition, &hosting, soft_delete_supported))
 }
 
 /// 从 `caps_json` 字符串中解析 `softDelete` 字段。
@@ -578,7 +598,7 @@ pub async fn preview(pool: &SqlitePool, ref_id: String) -> CmdResult<DispPreview
     // 1) 查 reference + storage_source.caps_json
     let row = sqlx::query(
         "SELECT r.disposition AS disposition, r.locator_json AS locator_json, \
-                s.caps_json AS caps_json \
+                r.hosting AS hosting, s.caps_json AS caps_json \
          FROM resource_reference r \
          JOIN storage_source s ON s.id = r.source_id \
          WHERE r.id = ?",
@@ -591,6 +611,7 @@ pub async fn preview(pool: &SqlitePool, ref_id: String) -> CmdResult<DispPreview
 
     let disposition: String = row.try_get("disposition").map_err(AppError::from)?;
     let locator_json: String = row.try_get("locator_json").map_err(AppError::from)?;
+    let hosting: String = row.try_get("hosting").map_err(AppError::from)?;
     let caps_json: Option<String> = row.try_get("caps_json").map_err(AppError::from)?;
 
     let target_path = parse_target_path(&locator_json)?;
@@ -611,7 +632,7 @@ pub async fn preview(pool: &SqlitePool, ref_id: String) -> CmdResult<DispPreview
 
     // 4) 能力计算（复用 4.1 纯函数）
     let soft_delete_supported = parse_soft_delete_cap(caps_json.as_deref())?;
-    let capability = compute_capabilities(&disposition, soft_delete_supported);
+    let capability = compute_capabilities(&disposition, &hosting, soft_delete_supported);
 
     // 5) 警告文案
     let warning = build_warning(is_dir, file_count, total_bytes);
@@ -992,7 +1013,7 @@ pub async fn soft_delete(
     // 2) 读 reference + caps_json
     let row = sqlx::query(
         "SELECT r.name AS name, r.disposition AS disposition, r.locator_json AS locator_json, \
-                s.caps_json AS caps_json \
+                r.hosting AS hosting, s.caps_json AS caps_json \
          FROM resource_reference r \
          JOIN storage_source s ON s.id = r.source_id \
          WHERE r.id = ?",
@@ -1006,6 +1027,7 @@ pub async fn soft_delete(
     let name: String = row.try_get("name").map_err(AppError::from)?;
     let disposition: String = row.try_get("disposition").map_err(AppError::from)?;
     let locator_json: String = row.try_get("locator_json").map_err(AppError::from)?;
+    let hosting: String = row.try_get("hosting").map_err(AppError::from)?;
     let caps_json: Option<String> = row.try_get("caps_json").map_err(AppError::from)?;
 
     // 3) 解析目标路径 + 存在性预检（提前返回 NOT_FOUND，避免 trash 内部歧义）
@@ -1019,7 +1041,7 @@ pub async fn soft_delete(
 
     // 4) 能力预检（复用 4.1 纯函数）
     let soft_delete_supported = parse_soft_delete_cap(caps_json.as_deref())?;
-    let caps = compute_capabilities(&disposition, soft_delete_supported);
+    let caps = compute_capabilities(&disposition, &hosting, soft_delete_supported);
     if !caps.soft_delete {
         return Err(AppError::new(
             "COMMON_FORBIDDEN",
@@ -1099,6 +1121,86 @@ pub async fn disp_soft_delete(
     soft_delete(&state.pool, ref_id, confirmed).await
 }
 
+// ============================================================
+// disp_unlink：解除关联（m7-7.4 · 仅 external）
+// ============================================================
+//
+// 契约：
+// - 入参：`{ refId }`
+// - 出参：`{ deletedRefId }`（与 destroy 对齐，便于前端清理缓存/路由）
+// - 错误：`COMMON_NOT_FOUND`（refId 不存在）/ `COMMON_FORBIDDEN`（hosting=managed）
+//
+// 关键约束：
+// - **仅 external**：managed 资源解除关联会留孤儿文件，禁止。
+// - **不动真实文件**：仅删 `resource_reference` 行；
+//   `reference_tag` / `todo_ref_link` / `ref_access_log` 通过外键
+//   `ON DELETE CASCADE` 自动清理（见 0001 / 0006 / 0007 迁移）。
+// - **不可恢复**：不进回收站；用户可通过"创建外部引用"重新加回同一路径。
+// - **审计**：INSERT disposition_audit（action='unlink'）与 DELETE 同事务。
+
+/// `disp_unlink` 出参。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DispUnlinkResult {
+    pub deleted_ref_id: String,
+}
+
+/// `disp_unlink` 业务函数：校验 hosting → 事务（写审计 + 删引用行）。
+pub async fn unlink(pool: &SqlitePool, ref_id: String) -> CmdResult<DispUnlinkResult> {
+    // 1) 读 reference：name / hosting / locator_json 快照
+    let row = sqlx::query(
+        "SELECT name, hosting, locator_json FROM resource_reference WHERE id = ?",
+    )
+    .bind(&ref_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from)?
+    .ok_or_else(|| AppError::not_found(format!("资源引用不存在: {}", ref_id)))?;
+
+    let name: String = row.try_get("name").map_err(AppError::from)?;
+    let hosting: String = row.try_get("hosting").map_err(AppError::from)?;
+    let locator_json: Option<String> = row.try_get("locator_json").map_err(AppError::from)?;
+
+    // 2) hosting 校验：仅 external 允许
+    if hosting != "external" {
+        return Err(AppError::new(
+            "COMMON_FORBIDDEN",
+            "托管资源不允许解除关联（会留孤儿文件）",
+        ));
+    }
+
+    // 3) 事务：INSERT audit + DELETE reference 行
+    let mut tx = pool.begin().await.map_err(AppError::from)?;
+    write_audit(
+        &mut tx,
+        &ref_id,
+        &name,
+        "unlink",
+        locator_json.as_deref(),
+        None,
+    )
+    .await?;
+    sqlx::query("DELETE FROM resource_reference WHERE id = ?")
+        .bind(&ref_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from)?;
+    tx.commit().await.map_err(AppError::from)?;
+
+    Ok(DispUnlinkResult {
+        deleted_ref_id: ref_id,
+    })
+}
+
+/// `disp_unlink` Tauri 命令。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn disp_unlink(
+    state: tauri::State<'_, crate::AppState>,
+    ref_id: String,
+) -> CmdResult<DispUnlinkResult> {
+    unlink(&state.pool, ref_id).await
+}
+
 
 
 // ============================================================
@@ -1150,13 +1252,15 @@ pub struct AuditListFilter {
     pub offset: Option<u32>,
 }
 
-/// 合法 action 集合（与 schema CHECK 约束一致；m4-4.9 加入 'undo_import'）。
-const VALID_AUDIT_ACTIONS: [&str; 5] = [
+/// 合法 action 集合（与 schema CHECK 约束一致；m4-4.9 加入 'undo_import'；
+/// m7-7.4 加入 'unlink'）。
+const VALID_AUDIT_ACTIONS: [&str; 6] = [
     "archive",
     "unarchive",
     "soft_delete",
     "destroy",
     "undo_import",
+    "unlink",
 ];
 
 /// `disp_audit_list` 业务函数：按 refId / action 过滤，按 at DESC 分页。
@@ -1172,7 +1276,7 @@ pub async fn audit_list(
     if let Some(a) = filter.action.as_deref() {
         if !VALID_AUDIT_ACTIONS.contains(&a) {
             return Err(AppError::invalid_param(format!(
-                "非法 action: {}（合法值: archive|unarchive|soft_delete|destroy|undo_import）",
+                "非法 action: {}（合法值: archive|unarchive|soft_delete|destroy|undo_import|unlink）",
                 a
             )));
         }
@@ -1698,61 +1802,68 @@ mod tests {
 
     #[test]
     fn caps_disposition_none_all_supported() {
-        let c = compute_capabilities("none", true);
+        let c = compute_capabilities("none", "external", true);
         assert!(c.archive);
         assert!(c.soft_delete);
         assert!(c.destroy);
         assert!(!c.restore_from_bin);
+        assert!(c.unlink);
         // false 项填 reason
         assert!(c.reason.restore_from_bin.is_some());
         // true 项 reason 省略
         assert!(c.reason.archive.is_none());
         assert!(c.reason.soft_delete.is_none());
         assert!(c.reason.destroy.is_none());
+        assert!(c.reason.unlink.is_none());
     }
 
     #[test]
     fn caps_disposition_archived() {
-        let c = compute_capabilities("archived", true);
+        let c = compute_capabilities("archived", "external", true);
         assert!(!c.archive);
         assert!(c.soft_delete);
         assert!(c.destroy);
         assert!(!c.restore_from_bin);
+        assert!(c.unlink);
         assert!(c.reason.archive.is_some());
         assert!(c.reason.restore_from_bin.is_some());
     }
 
     #[test]
     fn caps_disposition_deleted() {
-        let c = compute_capabilities("deleted", true);
+        let c = compute_capabilities("deleted", "external", true);
         assert!(c.archive);
         assert!(c.soft_delete);
         assert!(c.destroy);
         assert!(c.restore_from_bin);
+        assert!(c.unlink);
         // 全 true，无 reason
         assert!(c.reason.archive.is_none());
         assert!(c.reason.soft_delete.is_none());
         assert!(c.reason.destroy.is_none());
         assert!(c.reason.restore_from_bin.is_none());
+        assert!(c.reason.unlink.is_none());
     }
 
     #[test]
     fn caps_soft_delete_unsupported() {
-        let c = compute_capabilities("none", false);
+        let c = compute_capabilities("none", "external", false);
         assert!(c.archive);
         assert!(!c.soft_delete);
         assert!(c.destroy);
         assert!(!c.restore_from_bin);
+        assert!(c.unlink);
         assert!(c.reason.soft_delete.is_some());
     }
 
     #[test]
     fn caps_archived_and_soft_delete_unsupported() {
-        let c = compute_capabilities("archived", false);
+        let c = compute_capabilities("archived", "external", false);
         assert!(!c.archive);
         assert!(!c.soft_delete);
         assert!(c.destroy);
         assert!(!c.restore_from_bin);
+        assert!(c.unlink);
         assert!(c.reason.archive.is_some());
         assert!(c.reason.soft_delete.is_some());
         assert!(c.reason.restore_from_bin.is_some());
@@ -1762,32 +1873,61 @@ mod tests {
     fn caps_deleted_and_soft_delete_unsupported() {
         // 已删除 + 无回收站：仍可 restoreFromBin（数据在回收站语义由 disposition 决定），
         // 但 softDelete=false 阻止再次删除。
-        let c = compute_capabilities("deleted", false);
+        let c = compute_capabilities("deleted", "external", false);
         assert!(c.archive);
         assert!(!c.soft_delete);
         assert!(c.destroy);
         assert!(c.restore_from_bin);
+        assert!(c.unlink);
     }
 
     #[test]
     fn caps_unknown_disposition_treated_as_none() {
         // 防御：未知 disposition 按 none 处理
-        let c = compute_capabilities("bogus", true);
+        let c = compute_capabilities("bogus", "external", true);
         assert!(c.archive);
         assert!(!c.restore_from_bin);
+        assert!(c.unlink);
+    }
+
+    // ---------- m7-7.4 · unlink 能力 ----------
+
+    #[test]
+    fn caps_unlink_external_true() {
+        let c = compute_capabilities("none", "external", true);
+        assert!(c.unlink);
+        assert!(c.reason.unlink.is_none());
+    }
+
+    #[test]
+    fn caps_unlink_managed_false_with_reason() {
+        let c = compute_capabilities("none", "managed", true);
+        assert!(!c.unlink);
+        let r = c.reason.unlink.as_ref().expect("managed unlink reason");
+        assert!(r.contains("托管资源"));
+        assert!(r.contains("孤儿文件"));
+    }
+
+    #[test]
+    fn caps_unlink_managed_false_even_when_deleted() {
+        // deleted 状态也不允许 unlink managed（防御）
+        let c = compute_capabilities("deleted", "managed", true);
+        assert!(!c.unlink);
+        assert!(c.reason.unlink.is_some());
     }
 
     // ---------- 序列化契约 ----------
 
     #[test]
     fn caps_serializes_camel_case() {
-        let c = compute_capabilities("archived", false);
+        let c = compute_capabilities("archived", "external", false);
         let v = serde_json::to_value(&c).expect("serialize");
         let obj = v.as_object().expect("object");
         assert!(obj.contains_key("archive"));
         assert!(obj.contains_key("softDelete"));
         assert!(obj.contains_key("destroy"));
         assert!(obj.contains_key("restoreFromBin"));
+        assert!(obj.contains_key("unlink"));
         assert!(obj.contains_key("reason"));
         // 不出现 snake_case
         assert!(!obj.contains_key("soft_delete"));
@@ -3052,6 +3192,231 @@ mod tests {
         assert!(!obj.contains_key("ref_id"));
         assert!(!obj.contains_key("ref_name"));
         assert!(!obj.contains_key("locator_snapshot"));
+    }
+
+    // ---------- m7-7.4 · disp_unlink ----------
+
+    /// 插入一个 reference，hosting 可指定；返回 id。
+    async fn make_reference_with_hosting(
+        pool: &SqlitePool,
+        collection_id: &str,
+        hosting: &str,
+    ) -> String {
+        let id = Uuid::new_v4().to_string();
+        let now = now_unix();
+        sqlx::query(
+            "INSERT INTO resource_reference \
+             (id, collection_id, source_id, name, type, hosting, locator_json, \
+              description, lifecycle, confidentiality, indexed, disposition, created_at, updated_at) \
+             VALUES (?, ?, ?, 'r', 'code', ?, '{\"kind\":\"path\",\"path\":\"/tmp/x\"}', \
+              NULL, 'active', 'internal', 1, 'none', ?, ?)",
+        )
+        .bind(&id)
+        .bind(collection_id)
+        .bind(DEFAULT_SOURCE_ID)
+        .bind(hosting)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert reference with hosting");
+        id
+    }
+
+    /// 统计指定表指定 ref 的行数。
+    async fn count_by_ref(pool: &SqlitePool, table: &str, column: &str, ref_id: &str) -> i64 {
+        let sql = format!("SELECT COUNT(*) FROM {} WHERE {} = ?", table, column);
+        let (n,): (i64,) = sqlx::query_as(&sql)
+            .bind(ref_id)
+            .fetch_one(pool)
+            .await
+            .expect("count");
+        n
+    }
+
+    #[tokio::test]
+    async fn unlink_err_not_found() {
+        let pool = setup().await;
+        let err = unlink(&pool, "no-such-id".into())
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn unlink_err_managed_forbidden() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference_with_hosting(&pool, &cid, "managed").await;
+
+        let err = unlink(&pool, rid.clone()).await.expect_err("should fail");
+        assert_eq!(err.code, "COMMON_FORBIDDEN");
+        assert!(err.message.contains("托管资源") || err.message.contains("孤儿文件"));
+        // 行未被删
+        assert_eq!(ref_count(&pool, &rid).await, 1);
+        // 无审计写入
+        assert_eq!(audit_count(&pool, &rid).await, 0);
+    }
+
+    #[tokio::test]
+    async fn unlink_external_ok_deletes_row_and_writes_audit() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference_with_hosting(&pool, &cid, "external").await;
+
+        let out = unlink(&pool, rid.clone()).await.expect("unlink ok");
+        assert_eq!(out.deleted_ref_id, rid);
+        // 行已删
+        assert_eq!(ref_count(&pool, &rid).await, 0);
+        // 审计写入 action='unlink'
+        assert_eq!(audit_count(&pool, &rid).await, 1);
+        let actions = audit_actions(&pool, &rid).await;
+        assert_eq!(actions, vec!["unlink"]);
+    }
+
+    #[tokio::test]
+    async fn unlink_cascades_reference_tag() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference_with_hosting(&pool, &cid, "external").await;
+
+        // 加一条 reference_tag
+        sqlx::query("INSERT INTO reference_tag (reference_id, tag) VALUES (?, 't1')")
+            .bind(&rid)
+            .execute(&pool)
+            .await
+            .expect("insert tag");
+        assert_eq!(count_by_ref(&pool, "reference_tag", "reference_id", &rid).await, 1);
+
+        unlink(&pool, rid.clone()).await.expect("unlink ok");
+        // 级联删除
+        assert_eq!(count_by_ref(&pool, "reference_tag", "reference_id", &rid).await, 0);
+    }
+
+    #[tokio::test]
+    async fn unlink_cascades_todo_ref_link() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference_with_hosting(&pool, &cid, "external").await;
+
+        // 建一个 todo + 关联
+        let todo_id = Uuid::new_v4().to_string();
+        let now = now_unix();
+        sqlx::query(
+            "INSERT INTO todo (id, title, status, priority, sort_order, created_at, updated_at) \
+             VALUES (?, 't', 'pending', 0, 0, ?, ?)",
+        )
+        .bind(&todo_id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert todo");
+        sqlx::query("INSERT INTO todo_ref_link (todo_id, ref_id, created_at) VALUES (?, ?, ?)")
+            .bind(&todo_id)
+            .bind(&rid)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("insert link");
+        assert_eq!(count_by_ref(&pool, "todo_ref_link", "ref_id", &rid).await, 1);
+
+        unlink(&pool, rid.clone()).await.expect("unlink ok");
+        assert_eq!(count_by_ref(&pool, "todo_ref_link", "ref_id", &rid).await, 0);
+        // todo 本体保留（仅链接被级联）
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM todo WHERE id = ?")
+            .bind(&todo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count todo");
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn unlink_cascades_ref_access_log() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference_with_hosting(&pool, &cid, "external").await;
+
+        // 加一条 ref_access_log
+        let log_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO ref_access_log (id, ref_id, action, at) VALUES (?, ?, 'open', ?)")
+            .bind(&log_id)
+            .bind(&rid)
+            .bind(now_unix())
+            .execute(&pool)
+            .await
+            .expect("insert access log");
+        assert_eq!(count_by_ref(&pool, "ref_access_log", "ref_id", &rid).await, 1);
+
+        unlink(&pool, rid.clone()).await.expect("unlink ok");
+        assert_eq!(count_by_ref(&pool, "ref_access_log", "ref_id", &rid).await, 0);
+    }
+
+    #[tokio::test]
+    async fn unlink_does_not_touch_real_file() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("keep.txt");
+        std::fs::write(&file, b"keep").expect("write");
+
+        // 插入 external 引用，locator 指向真实文件
+        let rid = {
+            let id = Uuid::new_v4().to_string();
+            let now = now_unix();
+            let locator_json = serde_json::json!({
+                "kind": "path",
+                "path": file.to_string_lossy(),
+            })
+            .to_string();
+            sqlx::query(
+                "INSERT INTO resource_reference \
+                 (id, collection_id, source_id, name, type, hosting, locator_json, \
+                  description, lifecycle, confidentiality, indexed, disposition, created_at, updated_at) \
+                 VALUES (?, ?, ?, 'r', 'code', 'external', ?, \
+                  NULL, 'active', 'internal', 1, 'none', ?, ?)",
+            )
+            .bind(&id)
+            .bind(&cid)
+            .bind(DEFAULT_SOURCE_ID)
+            .bind(&locator_json)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("insert external ref");
+            id
+        };
+
+        unlink(&pool, rid.clone()).await.expect("unlink ok");
+        // 文件仍在
+        assert!(file.exists());
+        let content = std::fs::read_to_string(&file).expect("read");
+        assert_eq!(content, "keep");
+    }
+
+    #[tokio::test]
+    async fn audit_list_accepts_unlink_action() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = make_reference_with_hosting(&pool, &cid, "external").await;
+        unlink(&pool, rid.clone()).await.expect("unlink ok");
+
+        // audit_list 用 action='unlink' 过滤应能查到
+        let items = audit_list(
+            &pool,
+            AuditListFilter {
+                ref_id: Some(rid.clone()),
+                action: Some("unlink".into()),
+                limit: None,
+                offset: None,
+            },
+        )
+        .await
+        .expect("audit_list ok");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action, "unlink");
     }
 
     // ---------- m4-4.9 · ref_undo_import ----------

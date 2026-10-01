@@ -47,6 +47,11 @@ glob = "0.3.4"
 # m6-6.2 · watch 调度器：目录树遍历（walkdir）
 # 版本：2.4.0（cargo add walkdir 当前稳定版；语义化版本约束 "2.4.0" 兼容 2.x 后续 patch）
 walkdir = "2.4.0"
+# m7-7.4 · 内嵌终端：跨平台 PTY（ConPTY / Unix PTY）
+# 版本：0.8（任务包锁定）
+portable-pty = "0.8"
+# m7-7.4 · 内嵌终端：默认 cwd 回退（dirs::home_dir）
+dirs = "5"
 
 [dev-dependencies]
 tempfile = "3"

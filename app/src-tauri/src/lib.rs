@@ -15,6 +15,7 @@ mod sensitive;
 mod settings;
 mod space;
 mod tag;
+mod terminal;
 mod todo;
 mod types;
 mod watch;
@@ -57,6 +58,9 @@ pub fn run() {
             }
 
             app.manage(AppState { pool });
+
+            // m7-7.4 · 内嵌终端：全局 PTY 会话表
+            app.manage(terminal::TerminalState::new());
 
             // m5-5.1 · 启动目录监听器（详细设计 §5.2）。
             // 事件通道先建 256 缓冲；上层消费者（5.2 忽略规则 / 5.3 聚合窗口）后续接入。
@@ -156,6 +160,7 @@ pub fn run() {
             disposition::disp_destroy,
             disposition::disp_soft_delete,
             disposition::disp_audit_list,
+            disposition::disp_unlink,
             disposition::ref_undo_import,
             inbox::inbox_list,
             inbox::inbox_get,
@@ -178,7 +183,21 @@ pub fn run() {
             todo::todo_unlink_ref,
             todo::todo_list_by_ref,
             todo::todo_today,
+            terminal::terminal_create,
+            terminal::terminal_write,
+            terminal::terminal_resize,
+            terminal::terminal_close,
+            terminal::terminal_list,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // m7-7.4 · 应用退出时回收所有 PTY 子进程
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                use tauri::Manager;
+                if let Some(state) = app_handle.try_state::<terminal::TerminalState>() {
+                    terminal::kill_all(state.inner());
+                }
+            }
+        });
 }

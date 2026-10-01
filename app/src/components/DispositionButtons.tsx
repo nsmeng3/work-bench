@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Button, Space as AntSpace, Tooltip } from "antd";
 import {
   DeleteOutlined,
+  DisconnectOutlined,
   InboxOutlined,
   RollbackOutlined,
   WarningOutlined,
@@ -16,11 +17,12 @@ import { dispGetCapabilities, toApiError } from "../api";
  * - 归档 / 恢复：`Button type="default"`（蓝色系）
  * - 删除（回收站）：`Button danger`（黄色预警）
  * - 销毁：`Button type="primary" danger`（红色高危）
+ * - 解除关联（m7-7.4，仅 external）：`Button type="default"` + DisconnectOutlined
  *
  * 可用性：按 `disp_get_capabilities` 返回渲染；不可用项 `disabled` + tooltip 显示 `reason`。
  */
 
-export type DispositionAction = "archive" | "unarchive" | "softDelete" | "destroy";
+export type DispositionAction = "archive" | "unarchive" | "softDelete" | "destroy" | "unlink";
 
 interface DispositionButtonsProps {
   /** 目标引用 */
@@ -129,9 +131,24 @@ export function DispositionButtons({
     </Tooltip>
   );
 
+  // m7-7.4 · 解除关联（仅 external 显示）
+  const unlinkBtn = caps.unlink ? (
+    <Tooltip key="unlink" title="仅从工作台移除此引用，不会删除原文件">
+      <Button
+        size={size}
+        type="default"
+        icon={<DisconnectOutlined />}
+        onClick={() => onAction("unlink")}
+      >
+        解除关联
+      </Button>
+    </Tooltip>
+  ) : null;
+
   return (
     <AntSpace size={4} wrap>
       {archiveBtn}
+      {unlinkBtn}
       {deleteBtn}
       {destroyBtn}
     </AntSpace>
