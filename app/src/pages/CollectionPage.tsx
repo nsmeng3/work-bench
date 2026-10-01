@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback } from "react";
-import { Button, Modal, Segmented, Space as AntSpace, Table, Tag, Tooltip, message } from "antd";
+import { Button, Modal, Segmented, Space as AntSpace, Table, Tabs, Tag, Tooltip, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { ArrowLeftOutlined, PlusOutlined } from "@ant-design/icons";
 import type { Collection, Space } from "../api";
 import { collectionList, collectionArchive, collectionRestore, toApiError } from "../api";
 import { CollectionDialog } from "../components/CollectionDialog";
+import { TodoListPanel } from "../components/TodoListPanel";
 
 type StatusFilter = "active" | "archived";
 
@@ -24,6 +25,8 @@ export function CollectionPage({ space, onBack, onEnterCollection }: CollectionP
   const [collections, setCollections] = useState<Collection[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("active");
+  /** M7-2 · 顶部 Tabs：资源集（默认）/ 待办 */
+  const [tab, setTab] = useState<"collections" | "todos">("collections");
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingCollection, setEditingCollection] = useState<Collection | undefined>(undefined);
@@ -208,45 +211,66 @@ export function CollectionPage({ space, onBack, onEnterCollection }: CollectionP
             返回空间
           </Button>
           <h1 style={{ fontSize: 20, margin: 0 }}>
-            {space.name} · 资源集
+            {space.name}
           </h1>
         </AntSpace>
         <AntSpace>
-          <Segmented
-            value={statusFilter}
-            onChange={(v) => setStatusFilter(v as StatusFilter)}
-            options={[
-              { label: "活跃", value: "active" },
-              { label: "已归档", value: "archived" },
-            ]}
-          />
-          <Button
-            type="primary"
-            icon={<PlusOutlined />}
-            onClick={handleCreate}
-            disabled={space.status === "archived"}
-          >
-            创建资源集
-          </Button>
+          {tab === "collections" && (
+            <>
+              <Segmented
+                value={statusFilter}
+                onChange={(v) => setStatusFilter(v as StatusFilter)}
+                options={[
+                  { label: "活跃", value: "active" },
+                  { label: "已归档", value: "archived" },
+                ]}
+              />
+              <Button
+                type="primary"
+                icon={<PlusOutlined />}
+                onClick={handleCreate}
+                disabled={space.status === "archived"}
+              >
+                创建资源集
+              </Button>
+            </>
+          )}
         </AntSpace>
       </div>
 
-      <Table<Collection>
-        rowKey="id"
-        loading={loading}
-        dataSource={collections}
-        columns={columns}
-        pagination={false}
-        onRow={(record) => ({
-          onClick: () => onEnterCollection(record),
-          style: { cursor: "pointer" },
-        })}
-        locale={{
-          emptyText:
-            statusFilter === "active"
-              ? "暂无活跃资源集，点击上方按钮创建。"
-              : "暂无已归档资源集。",
-        }}
+      <Tabs
+        activeKey={tab}
+        onChange={(k) => setTab(k as "collections" | "todos")}
+        items={[
+          {
+            key: "collections",
+            label: "资源集",
+            children: (
+              <Table<Collection>
+                rowKey="id"
+                loading={loading}
+                dataSource={collections}
+                columns={columns}
+                pagination={false}
+                onRow={(record) => ({
+                  onClick: () => onEnterCollection(record),
+                  style: { cursor: "pointer" },
+                })}
+                locale={{
+                  emptyText:
+                    statusFilter === "active"
+                      ? "暂无活跃资源集，点击上方按钮创建。"
+                      : "暂无已归档资源集。",
+                }}
+              />
+            ),
+          },
+          {
+            key: "todos",
+            label: "待办",
+            children: <TodoListPanel spaceId={space.id} />,
+          },
+        ]}
       />
 
       <CollectionDialog
