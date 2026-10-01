@@ -291,28 +291,31 @@ export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace }: DashboardPa
                   const priorityMeta = PRIORITY_META[todo.priority] ?? PRIORITY_META[0];
                   return (
                     <List.Item style={{ padding: "8px 0", display: "block" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", overflow: "hidden", flexWrap: "wrap" }}>
-                        <span
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: 8, width: "100%", overflow: "hidden" }}>
+                        <div
                           style={{
                             fontWeight: 500,
-                            flex: "0 1 auto",
+                            flex: 1,
                             minWidth: 0,
+                            display: "-webkit-box",
+                            WebkitBoxOrient: "vertical",
+                            WebkitLineClamp: 2,
                             overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
+                            wordBreak: "break-all",
+                            lineHeight: 1.4,
                           }}
                           title={todo.title}
                         >
                           {todo.title}
-                        </span>
+                        </div>
                         {todo.priority > 0 && (
-                          <Tag color={priorityMeta.color} style={{ marginInlineEnd: 0, flexShrink: 0 }}>
+                          <Tag color={priorityMeta.color} style={{ marginInlineEnd: 0, flexShrink: 0, marginTop: 2 }}>
                             {priorityMeta.label}
                           </Tag>
                         )}
-                        {todo.status === "doing" && <Tag color="processing" style={{ flexShrink: 0 }}>进行中</Tag>}
+                        {todo.status === "doing" && <Tag color="processing" style={{ flexShrink: 0, marginTop: 2 }}>进行中</Tag>}
                         {todo.dueAt && (
-                          <span style={{ fontSize: 12, color: "rgba(0, 0, 0, 0.45)", flexShrink: 0 }}>
+                          <span style={{ fontSize: 12, color: "rgba(0, 0, 0, 0.45)", flexShrink: 0, marginTop: 2 }}>
                             <ClockCircleOutlined /> {formatRelativeTime(todo.dueAt)}
                           </span>
                         )}
