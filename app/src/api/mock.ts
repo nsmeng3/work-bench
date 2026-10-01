@@ -12,6 +12,7 @@ import type {
   CollectionDetail,
   ManagedPlan,
   OpenResult,
+  RecentRef,
   RefAccessAction,
   Reference,
   ReferenceType,
@@ -47,6 +48,9 @@ import type {
   StorageSourceUpdateInput,
   DefaultAppConfig,
   DefaultAppSetInput,
+  DefaultHome,
+  DefaultHomeConfig,
+  UserNameConfig,
   SettingsChangeRootDirInput,
   ChangeRootResult,
   MigrationPlan,
@@ -606,6 +610,12 @@ let mockStorageSource: StorageSourceInfo = {
 /** mock 默认程序配置：内存存储 */
 const mockDefaultApps: Record<string, DefaultAppConfig> = {};
 
+/** mock 启动默认页：内存存储；缺省 "dashboard"（与后端一致） */
+let mockDefaultHome: DefaultHome = "dashboard";
+
+/** mock 用户名：内存存储；缺省 undefined（前端显示"朋友"） */
+let mockUserName: string | undefined = undefined;
+
 export const mockSettingsApi = {
   settings_get_root_dir(): RootDirStatus {
     if (mockRootDir === null) return { initialized: false };
@@ -713,6 +723,33 @@ export const mockSettingsApi = {
     // migrate：mock 直接成功
     mockRootDir = newRootDir;
     return { migrated: [], failed: [] };
+  },
+
+  /* ---------------- M7-3 · 启动默认页 ---------------- */
+
+  settings_get_default_home(): DefaultHomeConfig {
+    return { home: mockDefaultHome };
+  },
+
+  settings_set_default_home(home: DefaultHome): DefaultHomeConfig {
+    if (home !== "dashboard" && home !== "spaces") {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: `非法 home: ${home}`,
+        retryable: false,
+      };
+    }
+    mockDefaultHome = home;
+    return { home: mockDefaultHome };
+  },
+
+  settings_get_user_name(): UserNameConfig {
+    return mockUserName ? { userName: mockUserName } : {};
+  },
+
+  /** 测试辅助：手动设置 mock 用户名（不暴露给后端契约） */
+  __setUserName(name: string | undefined): void {
+    mockUserName = name;
   },
 };
 
@@ -1050,6 +1087,38 @@ export const mockReferenceApi = {
       action,
       at: unixNow(),
     });
+  },
+
+  /**
+   * M7-3 · mock ref_recent_access。
+   * 按 refId 去重取最近一次，按 at DESC 排序；过滤 disposition='deleted'。
+   */
+  ref_recent_access(limit?: number): RecentRef[] {
+    const lim = Math.max(1, Math.min(100, limit ?? 10));
+    // 按 refId 分组，保留 at 最大的一条
+    const latestByRef = new Map<string, { action: RefAccessAction; at: number }>();
+    for (const log of mockAccessLog) {
+      const cur = latestByRef.get(log.refId);
+      if (!cur || log.at > cur.at) {
+        latestByRef.set(log.refId, { action: log.action, at: log.at });
+      }
+    }
+    const items: RecentRef[] = [];
+    for (const [refId, last] of latestByRef.entries()) {
+      const item = seedReferences.find((r) => r.ref.id === refId);
+      if (!item) continue;
+      if (item.ref.disposition === "deleted") continue;
+      items.push({
+        refId,
+        refName: item.ref.name,
+        refType: item.ref.type,
+        lastAction: last.action,
+        lastAt: last.at,
+        locatorJson: JSON.stringify(item.ref.locator),
+      });
+    }
+    items.sort((a, b) => b.lastAt - a.lastAt);
+    return items.slice(0, lim);
   },
 };
 
@@ -1951,5 +2020,23 @@ export const mockTodoApi = {
     return mockTodoStore
       .filter((t) => ids.includes(t.id))
       .sort((a, b) => b.createdAt - a.createdAt);
+  },
+
+  /**
+   * M7-3 · mock todo_today。
+   * status IN ('pending','doing')，按 priority DESC, dueAt IS NULL, dueAt ASC, createdAt ASC。
+   */
+  todo_today(): Todo[] {
+    const items = mockTodoStore.filter((t) => t.status === "pending" || t.status === "doing");
+    items.sort((a, b) => {
+      if (a.priority !== b.priority) return b.priority - a.priority;
+      const aNull = a.dueAt === undefined || a.dueAt === null;
+      const bNull = b.dueAt === undefined || b.dueAt === null;
+      if (aNull !== bNull) return aNull ? 1 : -1;
+      if (!aNull && !bNull && a.dueAt !== b.dueAt) return (a.dueAt as number) - (b.dueAt as number);
+      if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
+      return a.id.localeCompare(b.id);
+    });
+    return items.slice(0, 20);
   },
 };

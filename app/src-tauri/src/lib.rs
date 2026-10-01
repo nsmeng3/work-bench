@@ -139,10 +139,14 @@ pub fn run() {
             fs_ops::ref_open,
             fs_ops::ref_reveal_in_finder,
             fs_ops::ref_log_access,
+            fs_ops::ref_recent_access,
             settings::settings_get_root_dir,
             settings::settings_init_root_dir,
             settings::settings_get_default_app,
             settings::settings_set_default_app,
+            settings::settings_get_default_home,
+            settings::settings_set_default_home,
+            settings::settings_get_user_name,
             disposition::disp_get_capabilities,
             settings::settings_change_root_dir,
             disposition::disp_archive,
@@ -173,6 +177,7 @@ pub fn run() {
             todo::todo_link_ref,
             todo::todo_unlink_ref,
             todo::todo_list_by_ref,
+            todo::todo_today,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

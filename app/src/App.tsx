@@ -6,13 +6,14 @@ import {
   AuditOutlined,
   CheckSquareOutlined,
   FilterOutlined,
+  HomeOutlined,
   InboxOutlined,
   SettingOutlined,
-  FolderOutlined,
 } from "@ant-design/icons";
 import { AppShell } from "./components/AppShell";
 import type { NavItem } from "./components/AppShell";
 import { InboxNotification } from "./components/InboxNotification";
+import { DashboardPage } from "./pages/DashboardPage";
 import { SpacePage } from "./pages/SpacePage";
 import { CollectionPage } from "./pages/CollectionPage";
 import { CollectionDetailPage } from "./pages/CollectionDetailPage";
@@ -22,18 +23,18 @@ import { AuditPage } from "./pages/AuditPage";
 import { InboxPage } from "./pages/InboxPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { TodoPage } from "./pages/TodoPage";
-import { settingsGetRootDir, toApiError } from "./api";
+import { settingsGetDefaultHome, settingsGetRootDir, toApiError } from "./api";
 import type { Collection, Space } from "./api";
 import { useInboxStats } from "./hooks/useInboxStats";
 import "./styles/theme.css";
 
 const navItems: NavItem[] = [
-  { key: "spaces", label: "空间", icon: <AppstoreOutlined />, enabled: true },
+  { key: "dashboard", label: "工作台", icon: <HomeOutlined />, enabled: true },
   { key: "todo", label: "待办", icon: <CheckSquareOutlined />, enabled: true },
+  { key: "spaces", label: "空间", icon: <AppstoreOutlined />, enabled: true },
   { key: "filter", label: "筛选", icon: <FilterOutlined />, enabled: true },
-  { key: "audit", label: "审计", icon: <AuditOutlined />, enabled: true },
   { key: "inbox", label: "收件箱", icon: <InboxOutlined />, enabled: true },
-  { key: "collections", label: "资源集", icon: <FolderOutlined />, enabled: false },
+  { key: "audit", label: "审计", icon: <AuditOutlined />, enabled: true },
   { key: "settings", label: "设置", icon: <SettingOutlined />, enabled: true },
 ];
 
@@ -45,7 +46,7 @@ type BootstrapPhase =
 
 function App() {
   const [phase, setPhase] = useState<BootstrapPhase>({ kind: "loading" });
-  const [activeNav, setActiveNav] = useState("spaces");
+  const [activeNav, setActiveNav] = useState("dashboard");
   /** 当前下钻进入的空间；null 表示在空间列表页 */
   const [currentSpace, setCurrentSpace] = useState<Space | null>(null);
   /** 当前下钻进入的资源集；null 表示在资源集列表页 */
@@ -75,6 +76,9 @@ function App() {
    * 首启检测：调 settings_get_root_dir。
    * initialized=false 时强制渲染初始化向导（等效于路由 /init），
    * 主界面其它入口隐藏；初始化成功后切回主界面。
+   *
+   * M7-3：初始化完成后再读 settings_get_default_home，决定启动默认页
+   * （dashboard / spaces）。读取失败静默回退 dashboard。
    */
   useEffect(() => {
     let cancelled = false;
@@ -83,6 +87,16 @@ function App() {
         const status = await settingsGetRootDir();
         if (cancelled) return;
         setPhase({ kind: "ready", initialized: status.initialized });
+        if (status.initialized) {
+          // 读启动默认页（失败静默 → dashboard）
+          try {
+            const home = await settingsGetDefaultHome();
+            if (!cancelled) setActiveNav(home.home === "spaces" ? "spaces" : "dashboard");
+          } catch (err) {
+            console.warn("[App] 读取启动默认页失败，回退 dashboard", err);
+            if (!cancelled) setActiveNav("dashboard");
+          }
+        }
       } catch (err) {
         if (cancelled) return;
         const apiErr = toApiError(err);
@@ -107,6 +121,7 @@ function App() {
   }
 
   function handleEnterSpace(space: Space) {
+    setActiveNav("spaces");
     setCurrentSpace(space);
     setCurrentCollection(null);
   }
@@ -114,7 +129,7 @@ function App() {
   function handleInitialized(_rootDir: string) {
     // 初始化成功后切回主界面（等效于已初始化状态）
     setPhase({ kind: "ready", initialized: true });
-    setActiveNav("spaces");
+    setActiveNav("dashboard");
     setCurrentSpace(null);
     setCurrentCollection(null);
   }
@@ -182,6 +197,13 @@ function App() {
               prevPending={inboxPrevPending}
               onGoInbox={() => handleNavChange("inbox")}
             />
+            {activeNav === "dashboard" && (
+              <DashboardPage
+                onGoTodo={() => handleNavChange("todo")}
+                onGoInbox={() => handleNavChange("inbox")}
+                onEnterSpace={handleEnterSpace}
+              />
+            )}
             {activeNav === "spaces" &&
               (currentSpace && currentCollection ? (
                 <CollectionDetailPage

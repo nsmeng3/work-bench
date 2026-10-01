@@ -556,6 +556,34 @@ pub async fn list_by_ref(pool: &SqlitePool, ref_id: String) -> CmdResult<Vec<Tod
 }
 
 // ============================================================
+// m7-7.3 · todo_today（Dashboard 今日待办）
+// ============================================================
+
+/// `todo_today`：返回 status IN ('pending','doing') 的 todo，
+/// 按 priority DESC, due_at IS NULL, due_at ASC, created_at ASC 排序。
+///
+/// 与 `todo_list` 的差异：
+/// - 固定 status 过滤（不支持自定义）；
+/// - 固定排序规则（面向"今日该做什么"的优先级视角）；
+/// - 固定 LIMIT 20（Dashboard 首页只展示前几条，避免一次拉全量）。
+pub async fn today(pool: &SqlitePool) -> CmdResult<Vec<Todo>> {
+    let rows = sqlx::query(
+        "SELECT id, title, note, status, space_id, priority, due_at, done_at, \
+                sort_order, created_at, updated_at \
+         FROM todo \
+         WHERE status IN ('pending','doing') \
+         ORDER BY priority DESC, \
+                  due_at IS NULL, due_at ASC, \
+                  created_at ASC \
+         LIMIT 20",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::from)?;
+    rows.iter().map(row_to_todo).collect::<Result<_, _>>().map_err(AppError::from)
+}
+
+// ============================================================
 // Tauri Commands
 // ============================================================
 
@@ -632,6 +660,11 @@ pub async fn todo_list_by_ref(
     ref_id: String,
 ) -> CmdResult<Vec<Todo>> {
     list_by_ref(&state.pool, ref_id).await
+}
+
+#[tauri::command]
+pub async fn todo_today(state: tauri::State<'_, crate::AppState>) -> CmdResult<Vec<Todo>> {
+    today(&state.pool).await
 }
 
 // ============================================================
@@ -1305,5 +1338,108 @@ mod tests {
         let json_value = serde_json::json!({ "spaceId": "sp_1" });
         let patch: TodoPatch = serde_json::from_value(json_value).expect("parse");
         assert_eq!(patch.space_id, Some(Some("sp_1".into())));
+    }
+
+    // ---------- m7-7.3 · todo_today ----------
+
+    #[tokio::test]
+    async fn todo_today_returns_only_pending_and_doing() {
+        let pool = setup().await;
+        let t_pending = create(&pool, minimal_input("pending")).await.expect("c");
+        let t_doing = create(&pool, minimal_input("doing")).await.expect("c");
+        let t_done = create(&pool, minimal_input("done")).await.expect("c");
+        let t_cancelled = create(&pool, minimal_input("cancelled")).await.expect("c");
+
+        set_status(&pool, t_doing.id.clone(), "doing".into()).await.expect("doing");
+        set_status(&pool, t_done.id.clone(), "done".into()).await.expect("done");
+        set_status(&pool, t_cancelled.id.clone(), "cancelled".into())
+            .await
+            .expect("cancelled");
+
+        let list = today(&pool).await.expect("today");
+        assert_eq!(list.len(), 2, "仅 pending+doing");
+        let ids: Vec<&str> = list.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&t_pending.id.as_str()));
+        assert!(ids.contains(&t_doing.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn todo_today_orders_by_priority_desc_then_due_at() {
+        let pool = setup().await;
+        // 创建顺序故意打乱，验证排序而非插入顺序
+        let low_no_due = create(&pool, TodoCreateInput {
+            title: "低优先级无截止".into(),
+            note: None,
+            space_id: None,
+            priority: Some(0),
+            due_at: None,
+        })
+        .await
+        .expect("c");
+        let high_late_due = create(&pool, TodoCreateInput {
+            title: "高优先级晚截止".into(),
+            note: None,
+            space_id: None,
+            priority: Some(2),
+            due_at: Some(2_000_000_000),
+        })
+        .await
+        .expect("c");
+        let high_early_due = create(&pool, TodoCreateInput {
+            title: "高优先级早截止".into(),
+            note: None,
+            space_id: None,
+            priority: Some(2),
+            due_at: Some(1_000_000_000),
+        })
+        .await
+        .expect("c");
+        let high_no_due = create(&pool, TodoCreateInput {
+            title: "高优先级无截止".into(),
+            note: None,
+            space_id: None,
+            priority: Some(2),
+            due_at: None,
+        })
+        .await
+        .expect("c");
+
+        let list = today(&pool).await.expect("today");
+        assert_eq!(list.len(), 4);
+        // 期望顺序：priority=2 内部按 due_at ASC NULLS LAST，再按 created_at ASC
+        assert_eq!(list[0].id, high_early_due.id, "priority=2 + 早截止 优先");
+        assert_eq!(list[1].id, high_late_due.id, "priority=2 + 晚截止 次之");
+        assert_eq!(list[2].id, high_no_due.id, "priority=2 + 无截止 再次");
+        assert_eq!(list[3].id, low_no_due.id, "priority=0 排最后");
+    }
+
+    #[tokio::test]
+    async fn todo_today_same_priority_and_due_falls_back_to_created_at() {
+        let pool = setup().await;
+        // 同优先级同 due_at（NULL），按 created_at ASC
+        let t1 = create(&pool, minimal_input("first")).await.expect("c");
+        // 确保 created_at 不同（SQLite 秒级精度，需要手动区分）
+        sqlx::query("UPDATE todo SET created_at = created_at + 1 WHERE id = ?")
+            .bind(&t1.id)
+            .execute(&pool)
+            .await
+            .expect("bump");
+        let t2 = create(&pool, minimal_input("second")).await.expect("c");
+
+        let list = today(&pool).await.expect("today");
+        assert_eq!(list.len(), 2);
+        // t2.created_at < t1.created_at（t1 被 +1），所以 t2 排前
+        assert_eq!(list[0].id, t2.id);
+        assert_eq!(list[1].id, t1.id);
+    }
+
+    #[tokio::test]
+    async fn todo_today_empty_when_no_active() {
+        let pool = setup().await;
+        let t = create(&pool, minimal_input("x")).await.expect("c");
+        set_status(&pool, t.id.clone(), "done".into()).await.expect("done");
+
+        let list = today(&pool).await.expect("today");
+        assert!(list.is_empty(), "全部 done 时应返回空");
     }
 }

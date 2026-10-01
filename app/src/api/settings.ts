@@ -7,6 +7,9 @@ import type {
   StorageSourceUpdateInput,
   DefaultAppConfig,
   DefaultAppSetInput,
+  DefaultHomeConfig,
+  DefaultHome,
+  UserNameConfig,
   SettingsChangeRootDirInput,
   ChangeRootResult,
 } from "./types";
@@ -86,4 +89,33 @@ export async function settingsChangeRootDir(
 ): Promise<ChangeRootResult> {
   if (MOCK) return mockSettingsApi.settings_change_root_dir(input);
   return invoke<ChangeRootResult>("settings_change_root_dir", { ...input });
+}
+
+/* ---------------- M7-3 · 启动默认页 ---------------- */
+
+/**
+ * `settings_get_default_home ()` → `{ home }`。
+ * 未设置时后端返回 `{ home: "dashboard" }`。
+ */
+export async function settingsGetDefaultHome(): Promise<DefaultHomeConfig> {
+  if (MOCK) return mockSettingsApi.settings_get_default_home();
+  return invoke<DefaultHomeConfig>("settings_get_default_home");
+}
+
+/**
+ * `settings_set_default_home { home }` → `{ home }`。
+ * 非法值后端返回 COMMON_INVALID_PARAM。
+ */
+export async function settingsSetDefaultHome(home: DefaultHome): Promise<DefaultHomeConfig> {
+  if (MOCK) return mockSettingsApi.settings_set_default_home(home);
+  return invoke<DefaultHomeConfig>("settings_set_default_home", { home });
+}
+
+/**
+ * `settings_get_user_name ()` → `{ userName? }`。
+ * 未设置 / 空串时字段缺失；前端自行 fallback 显示"朋友"。
+ */
+export async function settingsGetUserName(): Promise<UserNameConfig> {
+  if (MOCK) return mockSettingsApi.settings_get_user_name();
+  return invoke<UserNameConfig>("settings_get_user_name");
 }
