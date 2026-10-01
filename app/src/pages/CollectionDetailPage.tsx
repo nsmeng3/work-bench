@@ -53,6 +53,7 @@ import {
 } from "../api";
 import { ReferenceCreateDialog } from "../components/ReferenceCreateDialog";
 import { ReferenceManagedDialog } from "../components/ReferenceManagedDialog";
+import { ReferenceTodoPanel } from "../components/ReferenceTodoPanel";
 import { DispositionButtons } from "../components/DispositionButtons";
 import type { DispositionAction } from "../components/DispositionButtons";
 import { DispositionConfirmDialog } from "../components/DispositionConfirmDialog";
@@ -645,6 +646,12 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
             <Switch />
           </Form.Item>
         </Form>
+        {/* M7-2 · 关联待办：列出挂载的 todo + 提供"挂到待办"入口 */}
+        {editingRef && (
+          <div style={{ marginTop: 16, borderTop: "1px solid #f0f0f0", paddingTop: 16 }}>
+            <ReferenceTodoPanel reference={editingRef} onChanged={fetchDetail} />
+          </div>
+        )}
       </Modal>
     </div>
   );

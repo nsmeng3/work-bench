@@ -634,9 +634,86 @@ export interface WatchEvent {
   modified?: number;
 }
 
-/* ---------------- 资源打开/操作（M7-1） ---------------- */
+/* ---------------- 待办（M7-2 · todo） ---------------- */
+
+/** 待办状态 — 与 todo.status CHECK 一致 */
+export type TodoStatus = "pending" | "doing" | "done" | "cancelled";
+
+/** 待办优先级：0 普通 / 1 重要 / 2 紧急 */
+export type TodoPriority = 0 | 1 | 2;
 
 /**
+ * 待办实体 — 任务包 m7-7.2 / 0007_todo.sql todo 表。
+ * createdAt / updatedAt / dueAt / doneAt 为 Unix 秒（number）。
+ * spaceId 为 null/undefined 表示全局 todo。
+ */
+export interface Todo {
+  id: string;
+  title: string;
+  note?: string;
+  status: TodoStatus;
+  spaceId?: string;
+  priority: TodoPriority;
+  dueAt?: number;
+  doneAt?: number;
+  sortOrder: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** todo_get 出参：Todo + 挂载的资源引用数组 */
+export interface TodoWithRefs extends Todo {
+  refs: Reference[];
+}
+
+/** todo_create 入参 */
+export interface TodoCreateInput {
+  title: string;
+  note?: string;
+  spaceId?: string;
+  priority?: TodoPriority;
+  dueAt?: number;
+}
+
+/**
+ * todo_update 入参（patch 语义）。
+ * 对可空字段（note / spaceId / dueAt）：
+ * - 字段缺失 / undefined → 不更新
+ * - 显式 null → 置空（写 NULL）
+ * - 具体值 → 更新为该值
+ */
+export interface TodoPatch {
+  title?: string;
+  note?: string | null;
+  spaceId?: string | null;
+  priority?: TodoPriority;
+  dueAt?: number | null;
+  sortOrder?: number;
+}
+
+/** todo_list 入参 */
+export interface TodoListInput {
+  /** 缺省 = 全部；传 "global" 仅返回全局 todo（space_id IS NULL） */
+  spaceId?: string;
+  /** 缺省 = 仅 pending+doing；传 "all" 返回全部；传具体状态值按该状态过滤 */
+  status?: TodoStatus | "all";
+  /** 兼容参数：true 等价于 status="all" */
+  includeDone?: boolean;
+}
+
+/** todo_set_status 入参 */
+export interface TodoSetStatusInput {
+  id: string;
+  status: TodoStatus;
+}
+
+/** todo_link_ref / todo_unlink_ref 入参 */
+export interface TodoRefLinkInput {
+  todoId: string;
+  refId: string;
+}
+
+/* ---------------- 资源打开/操作（M7-1） ---------------- *//**
  * `ref_open` 出参 — §2.5。
  * strategy 标识实际命中的打开策略：
  * - `system_default`：系统默认程序

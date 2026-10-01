@@ -50,6 +50,13 @@ import type {
   SettingsChangeRootDirInput,
   ChangeRootResult,
   MigrationPlan,
+  Todo,
+  TodoWithRefs,
+  TodoCreateInput,
+  TodoPatch,
+  TodoListInput,
+  TodoSetStatusInput,
+  TodoRefLinkInput,
 } from "./types";
 
 /**
@@ -1765,3 +1772,184 @@ if (typeof window !== "undefined") {
   (window as unknown as { __triggerInboxEvent?: (path?: string) => InboxItem }).__triggerInboxEvent =
     (path?: string) => mockInboxApi.__triggerInboxEvent(path);
 }
+
+/* ---------------- 待办 mock（M7-2 · todo） ---------------- */
+
+let mockTodoSeq = 0;
+function makeTodoId(): string {
+  return `mock-todo-${++mockTodoSeq}`;
+}
+
+/** mock todo 内存存储 + 多对多挂载关系 */
+let mockTodoStore: Todo[] = [];
+/** todoId → refId[] */
+const mockTodoRefLinks = new Map<string, string[]>();
+
+function findMockTodo(id: string): Todo {
+  const t = mockTodoStore.find((x) => x.id === id);
+  if (!t) throw { code: "COMMON_NOT_FOUND", message: "待办不存在", retryable: false };
+  return t;
+}
+
+function findMockRefById(refId: string): Reference {
+  const item = seedReferences.find((r) => r.ref.id === refId);
+  if (!item) throw { code: "COMMON_NOT_FOUND", message: "资源引用不存在", retryable: false };
+  return item.ref;
+}
+
+export const mockTodoApi = {
+  todo_list(input: TodoListInput): Todo[] {
+    let items = mockTodoStore.slice();
+    if (input.spaceId === "global") {
+      items = items.filter((t) => !t.spaceId);
+    } else if (input.spaceId) {
+      items = items.filter((t) => t.spaceId === input.spaceId);
+    }
+    const statusFilter = input.status;
+    const includeDone = input.includeDone === true;
+    if (statusFilter === "all" || (statusFilter === undefined && includeDone)) {
+      // 不过滤
+    } else if (statusFilter === undefined) {
+      items = items.filter((t) => t.status === "pending" || t.status === "doing");
+    } else {
+      items = items.filter((t) => t.status === statusFilter);
+    }
+    items.sort((a, b) => {
+      if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+      if (a.createdAt !== b.createdAt) return b.createdAt - a.createdAt;
+      return a.id.localeCompare(b.id);
+    });
+    return items;
+  },
+
+  todo_get(id: string): TodoWithRefs {
+    const todo = findMockTodo(id);
+    const refIds = mockTodoRefLinks.get(id) ?? [];
+    const refs = refIds
+      .map((rid) => seedReferences.find((r) => r.ref.id === rid)?.ref)
+      .filter((r): r is Reference => r !== undefined);
+    return { ...todo, refs };
+  },
+
+  todo_create(input: TodoCreateInput): Todo {
+    if (!input.title || input.title.trim() === "") {
+      throw { code: "COMMON_INVALID_PARAM", message: "待办标题不能为空", retryable: false };
+    }
+    if (input.title.trim().length > 200) {
+      throw { code: "COMMON_INVALID_PARAM", message: "待办标题超长（>200 字符）", retryable: false };
+    }
+    if (input.priority !== undefined && ![0, 1, 2].includes(input.priority)) {
+      throw { code: "COMMON_INVALID_PARAM", message: `非法 priority: ${input.priority}`, retryable: false };
+    }
+    if (input.spaceId) {
+      const sp = store.find((s) => s.id === input.spaceId);
+      if (!sp) throw { code: "COMMON_NOT_FOUND", message: "空间不存在", retryable: false };
+    }
+    const now = unixNow();
+    const todo: Todo = {
+      id: makeTodoId(),
+      title: input.title.trim(),
+      note: input.note,
+      status: "pending",
+      spaceId: input.spaceId,
+      priority: input.priority ?? 0,
+      dueAt: input.dueAt,
+      sortOrder: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    mockTodoStore = [...mockTodoStore, todo];
+    return todo;
+  },
+
+  todo_update(id: string, patch: TodoPatch): Todo {
+    const idx = mockTodoStore.findIndex((t) => t.id === id);
+    if (idx === -1) throw { code: "COMMON_NOT_FOUND", message: "待办不存在", retryable: false };
+    const cur = mockTodoStore[idx];
+    if (patch.title !== undefined) {
+      if (!patch.title || patch.title.trim() === "") {
+        throw { code: "COMMON_INVALID_PARAM", message: "待办标题不能为空", retryable: false };
+      }
+    }
+    if (patch.priority !== undefined && ![0, 1, 2].includes(patch.priority)) {
+      throw { code: "COMMON_INVALID_PARAM", message: `非法 priority: ${patch.priority}`, retryable: false };
+    }
+    if (patch.spaceId !== undefined && patch.spaceId !== null) {
+      const sp = store.find((s) => s.id === patch.spaceId);
+      if (!sp) throw { code: "COMMON_NOT_FOUND", message: "空间不存在", retryable: false };
+    }
+    const updated: Todo = {
+      ...cur,
+      title: patch.title !== undefined ? patch.title.trim() : cur.title,
+      note: patch.note === undefined ? cur.note : (patch.note ?? undefined),
+      spaceId: patch.spaceId === undefined ? cur.spaceId : (patch.spaceId ?? undefined),
+      priority: patch.priority ?? cur.priority,
+      dueAt: patch.dueAt === undefined ? cur.dueAt : (patch.dueAt ?? undefined),
+      sortOrder: patch.sortOrder ?? cur.sortOrder,
+      updatedAt: unixNow(),
+    };
+    mockTodoStore = [...mockTodoStore.slice(0, idx), updated, ...mockTodoStore.slice(idx + 1)];
+    return updated;
+  },
+
+  todo_set_status(input: TodoSetStatusInput): Todo {
+    const idx = mockTodoStore.findIndex((t) => t.id === input.id);
+    if (idx === -1) throw { code: "COMMON_NOT_FOUND", message: "待办不存在", retryable: false };
+    const cur = mockTodoStore[idx];
+    const from = cur.status;
+    const to = input.status;
+    const allowed =
+      (from === "pending" && ["pending", "doing", "done", "cancelled"].includes(to)) ||
+      (from === "doing" && ["pending", "doing", "done", "cancelled"].includes(to)) ||
+      (from === "done" && ["pending", "done"].includes(to)) ||
+      (from === "cancelled" && ["pending", "cancelled"].includes(to));
+    if (!allowed) {
+      throw {
+        code: "COMMON_CONFLICT",
+        message: `非法状态迁移: ${from} → ${to}`,
+        retryable: false,
+      };
+    }
+    const now = unixNow();
+    const doneAt = to === "done" ? now : from === "done" ? undefined : cur.doneAt;
+    const updated: Todo = { ...cur, status: to, doneAt, updatedAt: now };
+    mockTodoStore = [...mockTodoStore.slice(0, idx), updated, ...mockTodoStore.slice(idx + 1)];
+    return updated;
+  },
+
+  todo_delete(id: string): void {
+    const idx = mockTodoStore.findIndex((t) => t.id === id);
+    if (idx === -1) throw { code: "COMMON_NOT_FOUND", message: "待办不存在", retryable: false };
+    mockTodoStore = [...mockTodoStore.slice(0, idx), ...mockTodoStore.slice(idx + 1)];
+    mockTodoRefLinks.delete(id);
+  },
+
+  todo_link_ref(input: TodoRefLinkInput): void {
+    findMockTodo(input.todoId);
+    findMockRefById(input.refId);
+    const cur = mockTodoRefLinks.get(input.todoId) ?? [];
+    if (!cur.includes(input.refId)) {
+      mockTodoRefLinks.set(input.todoId, [...cur, input.refId]);
+    }
+  },
+
+  todo_unlink_ref(input: TodoRefLinkInput): void {
+    findMockTodo(input.todoId);
+    const cur = mockTodoRefLinks.get(input.todoId) ?? [];
+    mockTodoRefLinks.set(
+      input.todoId,
+      cur.filter((x) => x !== input.refId),
+    );
+  },
+
+  todo_list_by_ref(refId: string): Todo[] {
+    findMockRefById(refId);
+    const ids: string[] = [];
+    for (const [todoId, refIds] of mockTodoRefLinks.entries()) {
+      if (refIds.includes(refId)) ids.push(todoId);
+    }
+    return mockTodoStore
+      .filter((t) => ids.includes(t.id))
+      .sort((a, b) => b.createdAt - a.createdAt);
+  },
+};

@@ -4,6 +4,7 @@ import zhCN from "antd/locale/zh_CN";
 import {
   AppstoreOutlined,
   AuditOutlined,
+  CheckSquareOutlined,
   FilterOutlined,
   InboxOutlined,
   SettingOutlined,
@@ -20,6 +21,7 @@ import { InitWizardPage } from "./pages/InitWizardPage";
 import { AuditPage } from "./pages/AuditPage";
 import { InboxPage } from "./pages/InboxPage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { TodoPage } from "./pages/TodoPage";
 import { settingsGetRootDir, toApiError } from "./api";
 import type { Collection, Space } from "./api";
 import { useInboxStats } from "./hooks/useInboxStats";
@@ -27,6 +29,7 @@ import "./styles/theme.css";
 
 const navItems: NavItem[] = [
   { key: "spaces", label: "空间", icon: <AppstoreOutlined />, enabled: true },
+  { key: "todo", label: "待办", icon: <CheckSquareOutlined />, enabled: true },
   { key: "filter", label: "筛选", icon: <FilterOutlined />, enabled: true },
   { key: "audit", label: "审计", icon: <AuditOutlined />, enabled: true },
   { key: "inbox", label: "收件箱", icon: <InboxOutlined />, enabled: true },
@@ -198,6 +201,7 @@ function App() {
             {activeNav === "filter" && <FilterPage onJumpToCollection={handleJumpToCollection} />}
             {activeNav === "audit" && <AuditPage />}
             {activeNav === "inbox" && <InboxPage />}
+            {activeNav === "todo" && <TodoPage />}
             {activeNav === "settings" && <SettingsPage />}
           </AppShell>
         )}

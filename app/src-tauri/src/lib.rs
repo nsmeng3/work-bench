@@ -15,6 +15,7 @@ mod sensitive;
 mod settings;
 mod space;
 mod tag;
+mod todo;
 mod types;
 mod watch;
 mod dispatch;
@@ -163,6 +164,15 @@ pub fn run() {
             inbox::watch_dir_set,
             inbox::watch_dir_unset,
             dispatch::watch_dir_event,
+            todo::todo_list,
+            todo::todo_get,
+            todo::todo_create,
+            todo::todo_update,
+            todo::todo_set_status,
+            todo::todo_delete,
+            todo::todo_link_ref,
+            todo::todo_unlink_ref,
+            todo::todo_list_by_ref,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
