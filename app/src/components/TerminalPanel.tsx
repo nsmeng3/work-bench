@@ -221,7 +221,14 @@ export function TerminalPanel({ spaceId, spaceName }: TerminalPanelProps) {
   );
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: 520 }}>
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        height: "calc(100vh - 220px)",
+        minHeight: 400,
+      }}
+    >
       {messageContextHolder}
       <div
         style={{
