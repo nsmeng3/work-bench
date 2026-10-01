@@ -8,3 +8,4 @@ export * from "./settings";
 export * from "./disposition";
 export * from "./inbox";
 export * from "./todo";
+export * from "./terminal";

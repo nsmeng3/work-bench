@@ -16,6 +16,7 @@ import {
   dispPreview,
   dispSoftDelete,
   dispUnarchive,
+  dispUnlink,
   toApiError,
 } from "../api";
 import type { DispositionAction } from "./DispositionButtons";
@@ -180,6 +181,47 @@ export function DispositionConfirmDialog({
       setSubmitting(false);
     }
   };
+
+  const handleUnlink = async () => {
+    setSubmitting(true);
+    try {
+      await dispUnlink(reference.id);
+      messageApi.success({ content: "已解除关联", duration: 2 });
+      onSuccess();
+      onClose();
+    } catch (err) {
+      showError(err);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  /* ---------------- 解除关联（m7-7.4 · 轻量） ---------------- */
+  if (action === "unlink") {
+    return (
+      <>
+        {messageContextHolder}
+        <Modal
+          title="解除关联"
+          open
+          onOk={handleUnlink}
+          onCancel={handleCancel}
+          confirmLoading={submitting}
+          okText="解除关联"
+          cancelText="取消"
+        >
+          <AntSpace direction="vertical" size={12} style={{ width: "100%" }}>
+            <Paragraph style={{ marginBottom: 0 }}>
+              仅从工作台移除此引用，不会删除原文件。
+              <br />
+              可通过"创建外部引用"重新加回。
+            </Paragraph>
+            <Text type="secondary">目标引用：{reference.name}</Text>
+          </AntSpace>
+        </Modal>
+      </>
+    );
+  }
 
   /* ---------------- 归档（轻量） ---------------- */
   if (action === "archive") {
