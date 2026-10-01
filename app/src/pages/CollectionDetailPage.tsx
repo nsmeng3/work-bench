@@ -20,8 +20,12 @@ import {
 } from "antd";
 import {
   ArrowLeftOutlined,
+  CopyOutlined,
   DownOutlined,
   EditOutlined,
+  ExportOutlined,
+  FolderOpenOutlined,
+  PlayCircleOutlined,
   PlusOutlined,
   ReloadOutlined,
   RollbackOutlined,
@@ -37,7 +41,16 @@ import type {
   ReferenceWithHealth,
   Space,
 } from "../api";
-import { collectionGet, refUpdate, toApiError } from "../api";
+import {
+  collectionGet,
+  refCopyPath,
+  refLogAccessSafe,
+  refOpen,
+  refOpenWith,
+  refRevealInFinder,
+  refUpdate,
+  toApiError,
+} from "../api";
 import { ReferenceCreateDialog } from "../components/ReferenceCreateDialog";
 import { ReferenceManagedDialog } from "../components/ReferenceManagedDialog";
 import { DispositionButtons } from "../components/DispositionButtons";
@@ -192,6 +205,79 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
     setUndoRef(null);
   };
 
+  /* ---------------- M7-1 · 资源打开/操作 ---------------- */
+
+  /**
+   * 打开引用（默认策略：appOverride > 类型默认 > 系统默认）。
+   * 成功后埋点 action="open"。
+   */
+  const handleOpen = async (ref: Reference) => {
+    try {
+      await refOpen(ref.id);
+      void refLogAccessSafe(ref.id, "open");
+    } catch (err) {
+      const apiErr = toApiError(err);
+      messageApi.error({
+        content: `打开失败：${apiErr.message}`,
+        duration: 3,
+      });
+    }
+  };
+
+  /** 在文件管理器中显示。成功后埋点 action="reveal"。 */
+  const handleReveal = async (ref: Reference) => {
+    try {
+      await refRevealInFinder(ref.id);
+      void refLogAccessSafe(ref.id, "reveal");
+    } catch (err) {
+      const apiErr = toApiError(err);
+      messageApi.error({
+        content: `定位失败：${apiErr.message}`,
+        duration: 3,
+      });
+    }
+  };
+
+  /** 复制路径到剪贴板。成功后埋点 action="copy_path"。 */
+  const handleCopyPath = async (ref: Reference) => {
+    try {
+      await refCopyPath(ref);
+      messageApi.success({ content: "路径已复制", duration: 2 });
+      void refLogAccessSafe(ref.id, "copy_path");
+    } catch (err) {
+      const apiErr = toApiError(err);
+      messageApi.error({
+        content: `复制失败：${apiErr.message}`,
+        duration: 3,
+      });
+    }
+  };
+
+  /**
+   * 用其他程序打开：调 Tauri dialog 让用户选 .app，再调 refOpenWith。
+   * 成功后埋点 action="open_with"。
+   * 在非 Tauri 环境（如纯浏览器 mock）dialog 会抛错，降级提示用户。
+   */
+  const handleOpenWith = async (ref: Reference) => {
+    try {
+      const dialog = await import("@tauri-apps/plugin-dialog");
+      const selected = await dialog.open({
+        directory: false,
+        multiple: false,
+        title: "选择用于打开的应用",
+      });
+      if (typeof selected !== "string" || !selected) return; // 用户取消
+      await refOpenWith(ref.id, selected);
+      void refLogAccessSafe(ref.id, "open_with");
+    } catch (err) {
+      const apiErr = toApiError(err);
+      messageApi.error({
+        content: `打开失败：${apiErr.message}`,
+        duration: 3,
+      });
+    }
+  };
+
   const handleSave = async () => {
     if (!editingRef) return;
     let values: RefEditFormValues;
@@ -252,63 +338,114 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
             dataSource={items}
             renderItem={({ ref, health }) => {
               const meta = HEALTH_META[health];
+              const isPathLocator = ref.locator.kind === "path";
+              const contextMenuItems = [
+                { key: "open", label: "打开", icon: <PlayCircleOutlined /> },
+                {
+                  key: "reveal",
+                  label: "访达中显示",
+                  icon: <FolderOpenOutlined />,
+                  disabled: !isPathLocator,
+                },
+                {
+                  key: "copy_path",
+                  label: "复制路径",
+                  icon: <CopyOutlined />,
+                  disabled: !isPathLocator,
+                },
+                { type: "divider" as const },
+                {
+                  key: "open_with",
+                  label: "用其他程序打开…",
+                  icon: <ExportOutlined />,
+                  disabled: !isPathLocator,
+                },
+              ];
+              const handleMenuClick = ({ key }: { key: string }) => {
+                if (key === "open") void handleOpen(ref);
+                else if (key === "reveal") void handleReveal(ref);
+                else if (key === "copy_path") void handleCopyPath(ref);
+                else if (key === "open_with") void handleOpenWith(ref);
+              };
               return (
-                <List.Item
+                <Dropdown
                   key={ref.id}
-                  actions={[
-                    <Button
-                      key="edit"
-                      type="text"
-                      size="small"
-                      icon={<EditOutlined />}
-                      onClick={() => openEditModal(ref)}
-                    >
-                      编辑
-                    </Button>,
-                    ...(canShowUndoButton(ref)
-                      ? [
-                          <Button
-                            key="undo"
-                            type="text"
-                            size="small"
-                            icon={<RollbackOutlined />}
-                            onClick={() => openUndoDialog(ref)}
-                          >
-                            撤销导入
-                          </Button>,
-                        ]
-                      : []),
-                    <DispositionButtons
-                      key="disposition"
-                      reference={ref}
-                      size="small"
-                      onAction={(action) => openDispositionDialog(ref, action)}
-                    />,
-                  ]}
+                  menu={{ items: contextMenuItems, onClick: handleMenuClick }}
+                  trigger={["contextMenu"]}
                 >
-                  <List.Item.Meta
-                    title={
-                      <AntSpace size={8} wrap>
-                        <span style={{ fontWeight: 600 }}>{ref.name}</span>
-                        <Badge status={meta.color as "success" | "error" | "default"} text={meta.text} />
-                        <Tag>{LIFECYCLE_LABEL[ref.lifecycle] ?? ref.lifecycle}</Tag>
-                        <Tag color="blue">
-                          {CONFIDENTIALITY_LABEL[ref.confidentiality] ?? ref.confidentiality}
-                        </Tag>
-                      </AntSpace>
-                    }
-                    description={
-                      <AntSpace direction="vertical" size={2} style={{ width: "100%" }}>
-                        <Text type="secondary" style={{ fontFamily: "monospace", fontSize: 12 }}>
-                          {locatorText(ref)}
-                        </Text>
-                        <Text type="secondary" style={{ fontSize: 12 }}>
-                          创建时间：{formatUnixSeconds(ref.createdAt)}
-                        </Text>
-                      </AntSpace>
-                    }
-                  />
-                </List.Item>
+                  <div
+                    onDoubleClick={() => {
+                      if (isPathLocator) void handleOpen(ref);
+                    }}
+                    style={{ cursor: isPathLocator ? "pointer" : "default" }}
+                  >
+                    <List.Item
+                      actions={[
+                        <Button
+                          key="open"
+                          type="text"
+                          size="small"
+                          icon={<PlayCircleOutlined />}
+                          disabled={!isPathLocator}
+                          onClick={() => void handleOpen(ref)}
+                        >
+                          打开
+                        </Button>,
+                        <Button
+                          key="edit"
+                          type="text"
+                          size="small"
+                          icon={<EditOutlined />}
+                          onClick={() => openEditModal(ref)}
+                        >
+                          编辑
+                        </Button>,
+                        ...(canShowUndoButton(ref)
+                          ? [
+                              <Button
+                                key="undo"
+                                type="text"
+                                size="small"
+                                icon={<RollbackOutlined />}
+                                onClick={() => openUndoDialog(ref)}
+                              >
+                                撤销导入
+                              </Button>,
+                            ]
+                          : []),
+                        <DispositionButtons
+                          key="disposition"
+                          reference={ref}
+                          size="small"
+                          onAction={(action) => openDispositionDialog(ref, action)}
+                        />,
+                      ]}
+                    >
+                      <List.Item.Meta
+                        title={
+                          <AntSpace size={8} wrap>
+                            <span style={{ fontWeight: 600 }}>{ref.name}</span>
+                            <Badge status={meta.color as "success" | "error" | "default"} text={meta.text} />
+                            <Tag>{LIFECYCLE_LABEL[ref.lifecycle] ?? ref.lifecycle}</Tag>
+                            <Tag color="blue">
+                              {CONFIDENTIALITY_LABEL[ref.confidentiality] ?? ref.confidentiality}
+                            </Tag>
+                          </AntSpace>
+                        }
+                        description={
+                          <AntSpace direction="vertical" size={2} style={{ width: "100%" }}>
+                            <Text type="secondary" style={{ fontFamily: "monospace", fontSize: 12 }}>
+                              {locatorText(ref)}
+                            </Text>
+                            <Text type="secondary" style={{ fontSize: 12 }}>
+                              创建时间：{formatUnixSeconds(ref.createdAt)}
+                            </Text>
+                          </AntSpace>
+                        }
+                      />
+                    </List.Item>
+                  </div>
+                </Dropdown>
               );
             }}
           />

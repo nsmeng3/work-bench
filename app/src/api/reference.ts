@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ManagedPlan,
+  OpenResult,
+  RefAccessAction,
   RefCreateExternalInput,
   RefCreateManagedInput,
   Reference,
@@ -51,4 +53,72 @@ export async function refCreateManaged(input: RefCreateManagedInput): Promise<Ma
       : mockReferenceApi.ref_create_managed_plan(input);
   }
   return invoke<ManagedPlan | Reference>("ref_create_managed", { ...input });
+}
+
+/* ---------------- M7-1 · 资源打开/操作 ---------------- */
+
+/**
+ * `ref_open { id, appOverride? }` → `OpenResult`。
+ *
+ * 三级策略（§5.3）：appOverride > 类型默认 > 系统默认。
+ * 调用方通常使用 `refOpen(refId)` 或 `refOpenWith(refId, appPath)`。
+ */
+export async function refOpen(refId: string, appOverride?: string): Promise<OpenResult> {
+  if (MOCK) return mockReferenceApi.ref_open(refId, appOverride);
+  return invoke<OpenResult>("ref_open", { id: refId, appOverride });
+}
+
+/** `ref_reveal_in_finder { id }` → void。在系统文件管理器中显示并选中。 */
+export async function refRevealInFinder(refId: string): Promise<void> {
+  if (MOCK) return mockReferenceApi.ref_reveal_in_finder(refId);
+  return invoke<void>("ref_reveal_in_finder", { id: refId });
+}
+
+/**
+ * 复制引用路径到剪贴板 — 纯前端动作，无需后端命令。
+ * 仅在 locator.kind === "path" 时可用；其他形态抛 COMMON_INVALID_PARAM。
+ *
+ * 注意：调用方应在成功后自行调 `refLogAccess(refId, "copy_path")` 埋点。
+ */
+export async function refCopyPath(ref: Reference): Promise<void> {
+  if (ref.locator.kind !== "path") {
+    throw {
+      code: "COMMON_INVALID_PARAM",
+      message: `引用 ${ref.name} 的定位非 path 形态，无法复制路径`,
+      retryable: false,
+    };
+  }
+  await navigator.clipboard.writeText(ref.locator.path);
+}
+
+/**
+ * `ref_open` 带 appOverride — 等价于 `refOpen(refId, appPath)`。
+ * 单独导出仅为语义清晰（UI 上"用其他程序打开…"）。
+ */
+export async function refOpenWith(refId: string, appPath: string): Promise<OpenResult> {
+  return refOpen(refId, appPath);
+}
+
+/**
+ * `ref_log_access { refId, action }` → void。
+ *
+ * 埋点命令：前端在 open/reveal/copy_path/open_with 成功后调用。
+ * 失败语义：调用方应 `await` 但捕获错误仅 `console.warn`，不影响主流程。
+ */
+export async function refLogAccess(refId: string, action: RefAccessAction): Promise<void> {
+  if (MOCK) return mockReferenceApi.ref_log_access(refId, action);
+  return invoke<void>("ref_log_access", { refId, action });
+}
+
+/**
+ * 埋点安全调用 — 吞掉错误仅 console.warn。
+ * 供 UI 层"成功后埋点"使用，避免埋点失败影响主流程。
+ */
+export async function refLogAccessSafe(refId: string, action: RefAccessAction): Promise<void> {
+  try {
+    await refLogAccess(refId, action);
+  } catch (err) {
+    // 埋点失败可接受，不打断用户操作
+    console.warn("[ref_log_access] 埋点失败", action, refId, err);
+  }
 }

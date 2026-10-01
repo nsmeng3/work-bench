@@ -323,6 +323,59 @@ pub async fn reveal_in_finder(pool: &SqlitePool, id: String) -> CmdResult<()> {
 }
 
 // ============================================================
+// m7-7.1 · ref_log_access（访问埋点）
+// ============================================================
+
+/// `ref_log_access` 允许的 action 取值。
+/// 与 `0006_ref_access_log.sql` 的 CHECK 约束保持一致。
+const VALID_ACCESS_ACTIONS: &[&str] = &["open", "reveal", "copy_path", "open_with"];
+
+/// `ref_log_access`：写入一条 `ref_access_log` 记录。
+///
+/// 校验：
+/// - `action` 必须在白名单内，否则 `COMMON_INVALID_PARAM`；
+/// - `ref_id` 必须存在，否则 `COMMON_NOT_FOUND`（外键约束兜底，但提前查更友好）。
+///
+/// 失败语义：调用方（前端）应 `await` 但捕获错误仅 `console.warn`，
+/// 不影响主流程 —— 埋点丢失可接受，用户体验优先。
+pub async fn log_access(pool: &SqlitePool, ref_id: String, action: String) -> CmdResult<()> {
+    let action_trimmed = action.trim();
+    if !VALID_ACCESS_ACTIONS.contains(&action_trimmed) {
+        return Err(AppError::invalid_param(format!(
+            "非法 action: {}（允许值: {}）",
+            action_trimmed,
+            VALID_ACCESS_ACTIONS.join(", ")
+        )));
+    }
+
+    // 提前校验 ref_id 存在，给出友好错误码（而不是 FOREIGN KEY constraint failed）。
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM resource_reference WHERE id = ?")
+            .bind(&ref_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(AppError::from)?;
+    if exists.is_none() {
+        return Err(AppError::not_found(format!(
+            "资源引用不存在: {}",
+            ref_id
+        )));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let at = time::OffsetDateTime::now_utc().unix_timestamp();
+    sqlx::query("INSERT INTO ref_access_log (id, ref_id, action, at) VALUES (?, ?, ?, ?)")
+        .bind(&id)
+        .bind(&ref_id)
+        .bind(action_trimmed)
+        .bind(at)
+        .execute(pool)
+        .await
+        .map_err(AppError::from)?;
+    Ok(())
+}
+
+// ============================================================
 // 平台分支：起子进程（绝不拼接 shell 字符串）
 // ============================================================
 
@@ -440,6 +493,15 @@ pub async fn ref_reveal_in_finder(
     id: String,
 ) -> CmdResult<()> {
     reveal_in_finder(&state.pool, id).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn ref_log_access(
+    state: tauri::State<'_, crate::AppState>,
+    ref_id: String,
+    action: String,
+) -> CmdResult<()> {
+    log_access(&state.pool, ref_id, action).await
 }
 
 // ============================================================
@@ -942,5 +1004,72 @@ mod tests {
         assert_eq!(s_code.app_path(), Some("/Applications/VSCode.app"));
         assert_eq!(s_doc.app_path(), Some("/Applications/Typora.app"));
         assert_eq!(s_media, OpenStrategy::SystemDefault);
+    }
+
+    // ---------- m7-7.1 · ref_log_access ----------
+
+    #[tokio::test]
+    async fn log_access_writes_row() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = insert_reference(&pool, &cid, "/tmp/x").await;
+
+        log_access(&pool, rid.clone(), "open".into())
+            .await
+            .expect("log ok");
+
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT ref_id, action, at FROM ref_access_log WHERE ref_id = ?",
+        )
+        .bind(&rid)
+        .fetch_all(&pool)
+        .await
+        .expect("select");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, rid);
+        assert_eq!(rows[0].1, "open");
+        assert!(rows[0].2 > 0, "at 应为 unix 秒");
+    }
+
+    #[tokio::test]
+    async fn log_access_rejects_invalid_action() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = insert_reference(&pool, &cid, "/tmp/x").await;
+
+        let err = log_access(&pool, rid, "delete".into())
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn log_access_rejects_unknown_ref() {
+        let pool = setup().await;
+        let err = log_access(&pool, "no-such-ref".into(), "open".into())
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn log_access_accepts_all_valid_actions() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = insert_reference(&pool, &cid, "/tmp/x").await;
+
+        for action in ["open", "reveal", "copy_path", "open_with"] {
+            log_access(&pool, rid.clone(), action.into())
+                .await
+                .unwrap_or_else(|e| panic!("action {} 应成功: {}", action, e));
+        }
+
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM ref_access_log WHERE ref_id = ?")
+                .bind(&rid)
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(n, 4);
     }
 }

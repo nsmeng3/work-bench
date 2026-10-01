@@ -634,6 +634,29 @@ export interface WatchEvent {
   modified?: number;
 }
 
+/* ---------------- 资源打开/操作（M7-1） ---------------- */
+
+/**
+ * `ref_open` 出参 — §2.5。
+ * strategy 标识实际命中的打开策略：
+ * - `system_default`：系统默认程序
+ * - `app`           ：类型默认程序（settings.default_app_{type}）
+ * - `custom`        ：本次调用显式 appOverride
+ */
+export interface OpenResult {
+  opened: boolean;
+  strategy: "system_default" | "app" | "custom";
+}
+
+/**
+ * `ref_log_access` 入参 action — 与 0006_ref_access_log.sql CHECK 约束一致。
+ * - `open`      ：默认打开
+ * - `reveal`    ：在文件管理器中显示
+ * - `copy_path` ：复制路径到剪贴板
+ * - `open_with` ：用其他程序打开
+ */
+export type RefAccessAction = "open" | "reveal" | "copy_path" | "open_with";
+
 /* ---------------- 导入撤销（m4-4.9 · ref_undo_import） ---------------- */
 
 /**

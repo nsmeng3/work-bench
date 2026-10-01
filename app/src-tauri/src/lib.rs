@@ -137,6 +137,7 @@ pub fn run() {
             fs_ops::ref_check_health,
             fs_ops::ref_open,
             fs_ops::ref_reveal_in_finder,
+            fs_ops::ref_log_access,
             settings::settings_get_root_dir,
             settings::settings_init_root_dir,
             settings::settings_get_default_app,
