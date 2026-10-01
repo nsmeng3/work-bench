@@ -290,9 +290,21 @@ export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace }: DashboardPa
                 renderItem={(todo) => {
                   const priorityMeta = PRIORITY_META[todo.priority] ?? PRIORITY_META[0];
                   return (
-                    <List.Item style={{ padding: "8px 0" }}>
-                      <AntSpace size={8} wrap style={{ flex: 1 }}>
-                        <span style={{ fontWeight: 500 }}>{todo.title}</span>
+                    <List.Item style={{ padding: "8px 0", display: "block" }}>
+                      <AntSpace size={8} wrap style={{ display: "flex", width: "100%" }}>
+                        <span
+                          style={{
+                            fontWeight: 500,
+                            maxWidth: "100%",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                            display: "inline-block",
+                          }}
+                          title={todo.title}
+                        >
+                          {todo.title}
+                        </span>
                         {todo.priority > 0 && (
                           <Tag color={priorityMeta.color} style={{ marginInlineEnd: 0 }}>
                             {priorityMeta.label}
@@ -336,13 +348,21 @@ export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace }: DashboardPa
                   const path = locatorPathOf(item.locatorJson);
                   return (
                     <List.Item
-                      style={{ padding: "8px 0", cursor: "pointer" }}
+                      style={{ padding: "8px 0", cursor: "pointer", display: "block" }}
                       onClick={() => void handleOpenRecent(item)}
                     >
-                      <AntSpace size={8} style={{ flex: 1, minWidth: 0 }}>
+                      <AntSpace size={8} style={{ display: "flex", width: "100%" }}>
                         {refTypeIcon(item.refType)}
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        <div style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
+                          <div
+                            style={{
+                              fontWeight: 500,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                            title={item.refName}
+                          >
                             {item.refName}
                           </div>
                           {path && (
@@ -355,6 +375,7 @@ export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace }: DashboardPa
                                 textOverflow: "ellipsis",
                                 whiteSpace: "nowrap",
                               }}
+                              title={path}
                             >
                               {path}
                             </Text>
