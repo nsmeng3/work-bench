@@ -11,6 +11,8 @@ import type {
   CollectionListInput,
   CollectionDetail,
   ManagedPlan,
+  OpenResult,
+  RefAccessAction,
   Reference,
   ReferenceType,
   ReferenceWithHealth,
@@ -715,6 +717,15 @@ function makeRefId(): string {
   return `mock-ref-${++mockRefSeq}`;
 }
 
+/** M7-1 mock 访问日志内存表 — 仅用于联调验证，不持久化 */
+let mockAccessLogSeq = 0;
+const mockAccessLog: Array<{ id: string; refId: string; action: RefAccessAction; at: number }> = [];
+
+// 暴露到 window 便于控制台查看（仅 mock 模式）
+if (typeof window !== "undefined") {
+  (window as unknown as { __mockAccessLog?: typeof mockAccessLog }).__mockAccessLog = mockAccessLog;
+}
+
 export const mockReferenceApi = {
   /**
    * 仅关联创建引用 — §2.5 ref_create_external。
@@ -955,6 +966,83 @@ export const mockReferenceApi = {
     };
     seedReferences = [...seedReferences, { ref, health: "ok" }];
     return ref;
+  },
+
+  /* ---------------- M7-1 · 资源打开/操作 mock ---------------- */
+
+  /**
+   * mock ref_open：不真正打开文件，仅按引用类型模拟策略命中。
+   * - 若传入 appOverride → strategy="custom"
+   * - 否则若 mockDefaultApps[ref.type] 配置 strategy="app" 且 appPath 非空 → strategy="app"
+   * - 否则 → strategy="system_default"
+   *
+   * 路径含 "missing" → FS_PATH_NOT_FOUND（便于联调错误分支）。
+   */
+  ref_open(refId: string, appOverride?: string): OpenResult {
+    const item = seedReferences.find((r) => r.ref.id === refId);
+    if (!item) throw { code: "COMMON_NOT_FOUND", message: "资源引用不存在", retryable: false };
+    const ref = item.ref;
+    if (ref.locator.kind !== "path") {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: `引用 ${refId} 的 locator 非 path 形态，无法打开`,
+        retryable: false,
+      };
+    }
+    if (ref.locator.path.includes("missing")) {
+      throw {
+        code: "FS_PATH_NOT_FOUND",
+        message: `目标路径不存在：${ref.locator.path}`,
+        details: { path: ref.locator.path },
+        retryable: false,
+      };
+    }
+    if (appOverride && appOverride.trim()) {
+      return { opened: true, strategy: "custom" };
+    }
+    const cfg = mockDefaultApps[ref.type];
+    if (cfg && cfg.strategy === "app" && cfg.appPath && cfg.appPath.trim()) {
+      return { opened: true, strategy: "app" };
+    }
+    return { opened: true, strategy: "system_default" };
+  },
+
+  /** mock ref_reveal_in_finder：不真正调起 Finder，仅校验引用存在。 */
+  ref_reveal_in_finder(refId: string): void {
+    const item = seedReferences.find((r) => r.ref.id === refId);
+    if (!item) throw { code: "COMMON_NOT_FOUND", message: "资源引用不存在", retryable: false };
+    const ref = item.ref;
+    if (ref.locator.kind === "path" && ref.locator.path.includes("missing")) {
+      throw {
+        code: "FS_PATH_NOT_FOUND",
+        message: `目标路径不存在：${ref.locator.path}`,
+        details: { path: ref.locator.path },
+        retryable: false,
+      };
+    }
+  },
+
+  /**
+   * mock ref_log_access：内存数组记录，便于联调时 console 验证。
+   * action 非法 → COMMON_INVALID_PARAM（与后端 CHECK 对齐）。
+   */
+  ref_log_access(refId: string, action: RefAccessAction): void {
+    const VALID: RefAccessAction[] = ["open", "reveal", "copy_path", "open_with"];
+    if (!VALID.includes(action)) {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: `非法 action: ${action}`,
+        retryable: false,
+      };
+    }
+    const item = seedReferences.find((r) => r.ref.id === refId);
+    if (!item) throw { code: "COMMON_NOT_FOUND", message: "资源引用不存在", retryable: false };
+    mockAccessLog.push({
+      id: `mock-access-${++mockAccessLogSeq}`,
+      refId,
+      action,
+      at: unixNow(),
+    });
   },
 };
 

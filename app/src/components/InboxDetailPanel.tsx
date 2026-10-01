@@ -17,8 +17,11 @@ import {
 import {
   CheckOutlined,
   ClockCircleOutlined,
+  CopyOutlined,
   DeleteOutlined,
   DownOutlined,
+  FolderOpenOutlined,
+  PlayCircleOutlined,
 } from "@ant-design/icons";
 import type { MenuProps } from "antd";
 import type {
@@ -173,6 +176,50 @@ export function InboxDetailPanel({
     }
   }
 
+  /* ---------------- M7-1 · 收件箱条目直接按 path 操作 ----------------
+   *
+   * 注意：inbox 条目尚未转为 resource_reference，没有 ref_id，
+   * 因此不能调 ref_open / ref_reveal_in_finder（它们按 ref_id 查 locator）。
+   * 这里直接用 @tauri-apps/plugin-opener 的 openPath / revealItemInDir
+   * 按 detail.path 操作系统文件。
+   *
+   * 不写 ref_access_log：外键约束要求 ref_id 存在于 resource_reference，
+   * inbox 条目不在该表。M7-3 Dashboard 的"最近资源"仅统计正式引用。
+   */
+
+  async function handleOpenPath() {
+    if (!detail) return;
+    try {
+      const opener = await import("@tauri-apps/plugin-opener");
+      await opener.openPath(detail.path);
+    } catch (err) {
+      console.warn("openPath 失败：", err);
+      message.error(`打开失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async function handleRevealPath() {
+    if (!detail) return;
+    try {
+      const opener = await import("@tauri-apps/plugin-opener");
+      await opener.revealItemInDir(detail.path);
+    } catch (err) {
+      console.warn("revealItemInDir 失败：", err);
+      message.error(`定位失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async function handleCopyPath() {
+    if (!detail) return;
+    try {
+      await navigator.clipboard.writeText(detail.path);
+      message.success("路径已复制");
+    } catch (err) {
+      console.warn("复制路径失败：", err);
+      message.error("复制失败");
+    }
+  }
+
   const ignoreMenu: MenuProps["items"] = (
     ["once", "by_ext", "by_name", "by_dir"] as InboxIgnoreRuleKind[]
   ).map((kind) => ({
@@ -273,7 +320,7 @@ export function InboxDetailPanel({
         )}
 
         {/* 操作按钮 */}
-        <AntSpace>
+        <AntSpace wrap>
           <Button
             type="primary"
             icon={<CheckOutlined />}
@@ -301,6 +348,16 @@ export function InboxDetailPanel({
               忽略 <DownOutlined />
             </Button>
           </Dropdown>
+          {/* M7-1 · 文件操作（按 path 直接操作，与是否已处理无关） */}
+          <Button icon={<PlayCircleOutlined />} onClick={() => void handleOpenPath()}>
+            打开
+          </Button>
+          <Button icon={<FolderOpenOutlined />} onClick={() => void handleRevealPath()}>
+            定位
+          </Button>
+          <Button icon={<CopyOutlined />} onClick={() => void handleCopyPath()}>
+            复制路径
+          </Button>
         </AntSpace>
       </AntSpace>
 

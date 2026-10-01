@@ -146,6 +146,7 @@ mod tests {
             "disposition_audit",
             "ignore_rule",
             "inbox_item",
+            "ref_access_log",
             "reference_tag",
             "resource_reference",
             "settings",
