@@ -291,32 +291,32 @@ export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace }: DashboardPa
                   const priorityMeta = PRIORITY_META[todo.priority] ?? PRIORITY_META[0];
                   return (
                     <List.Item style={{ padding: "8px 0", display: "block" }}>
-                      <AntSpace size={8} wrap style={{ display: "flex", width: "100%" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", overflow: "hidden", flexWrap: "wrap" }}>
                         <span
                           style={{
                             fontWeight: 500,
-                            maxWidth: "100%",
+                            flex: "0 1 auto",
+                            minWidth: 0,
                             overflow: "hidden",
                             textOverflow: "ellipsis",
                             whiteSpace: "nowrap",
-                            display: "inline-block",
                           }}
                           title={todo.title}
                         >
                           {todo.title}
                         </span>
                         {todo.priority > 0 && (
-                          <Tag color={priorityMeta.color} style={{ marginInlineEnd: 0 }}>
+                          <Tag color={priorityMeta.color} style={{ marginInlineEnd: 0, flexShrink: 0 }}>
                             {priorityMeta.label}
                           </Tag>
                         )}
-                        {todo.status === "doing" && <Tag color="processing">进行中</Tag>}
+                        {todo.status === "doing" && <Tag color="processing" style={{ flexShrink: 0 }}>进行中</Tag>}
                         {todo.dueAt && (
-                          <Text type="secondary" style={{ fontSize: 12 }}>
+                          <span style={{ fontSize: 12, color: "rgba(0, 0, 0, 0.45)", flexShrink: 0 }}>
                             <ClockCircleOutlined /> {formatRelativeTime(todo.dueAt)}
-                          </Text>
+                          </span>
                         )}
-                      </AntSpace>
+                      </div>
                     </List.Item>
                   );
                 }}
