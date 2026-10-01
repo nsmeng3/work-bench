@@ -1067,6 +1067,28 @@ export const mockReferenceApi = {
     }
   },
 
+  /** mock ref_open_in_terminal：不真正唤起终端，仅校验引用存在 + locator 形态。 */
+  ref_open_in_terminal(refId: string): void {
+    const item = seedReferences.find((r) => r.ref.id === refId);
+    if (!item) throw { code: "COMMON_NOT_FOUND", message: "资源引用不存在", retryable: false };
+    const ref = item.ref;
+    if (ref.locator.kind !== "path") {
+      throw {
+        code: "COMMON_INVALID_PARAM",
+        message: `引用 ${ref.name} 的 locator 非 path 形态，无法在终端打开`,
+        retryable: false,
+      };
+    }
+    if (ref.locator.path.includes("missing")) {
+      throw {
+        code: "FS_PATH_NOT_FOUND",
+        message: `目标路径不存在：${ref.locator.path}`,
+        details: { path: ref.locator.path },
+        retryable: false,
+      };
+    }
+  },
+
   /**
    * mock ref_log_access：内存数组记录，便于联调时 console 验证。
    * action 非法 → COMMON_INVALID_PARAM（与后端 CHECK 对齐）。

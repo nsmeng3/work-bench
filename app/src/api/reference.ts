@@ -76,6 +76,18 @@ export async function refRevealInFinder(refId: string): Promise<void> {
 }
 
 /**
+ * `ref_open_in_terminal { id }` → void。唤起系统终端并 cd 到资源目录。
+ *
+ * - 资源是文件 → cd 到父目录
+ * - 资源是文件夹 → cd 到它本身
+ * - macOS 默认 Terminal.app；Windows cmd；Linux 按顺序回退 gnome-terminal/konsole/xfce4-terminal/xterm
+ */
+export async function refOpenInTerminal(refId: string): Promise<void> {
+  if (MOCK) return mockReferenceApi.ref_open_in_terminal(refId);
+  return invoke<void>("ref_open_in_terminal", { id: refId });
+}
+
+/**
  * 复制引用路径到剪贴板 — 纯前端动作，无需后端命令。
  * 仅在 locator.kind === "path" 时可用；其他形态抛 COMMON_INVALID_PARAM。
  *

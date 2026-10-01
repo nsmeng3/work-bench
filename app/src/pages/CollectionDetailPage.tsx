@@ -20,6 +20,7 @@ import {
 } from "antd";
 import {
   ArrowLeftOutlined,
+  CodeOutlined,
   CopyOutlined,
   DownOutlined,
   EditOutlined,
@@ -48,6 +49,7 @@ import {
   refOpen,
   refOpenWith,
   refRevealInFinder,
+  refOpenInTerminal,
   refUpdate,
   toApiError,
 } from "../api";
@@ -239,6 +241,24 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
     }
   };
 
+  /**
+   * 唤起系统终端并 cd 到资源目录（m7-7.5）。
+   * - 文件 → cd 到父目录；目录 → cd 到它本身
+   * - 成功后埋点 action="open"（复用现有枚举，本质是"打开"的一种形态）
+   */
+  const handleOpenInTerminal = async (ref: Reference) => {
+    try {
+      await refOpenInTerminal(ref.id);
+      void refLogAccessSafe(ref.id, "open");
+    } catch (err) {
+      const apiErr = toApiError(err);
+      messageApi.error({
+        content: `在终端打开失败：${apiErr.message}`,
+        duration: 3,
+      });
+    }
+  };
+
   /** 复制路径到剪贴板。成功后埋点 action="copy_path"。 */
   const handleCopyPath = async (ref: Reference) => {
     try {
@@ -349,6 +369,12 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
                   disabled: !isPathLocator,
                 },
                 {
+                  key: "open_in_terminal",
+                  label: "在终端中打开",
+                  icon: <CodeOutlined />,
+                  disabled: !isPathLocator,
+                },
+                {
                   key: "copy_path",
                   label: "复制路径",
                   icon: <CopyOutlined />,
@@ -365,6 +391,7 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
               const handleMenuClick = ({ key }: { key: string }) => {
                 if (key === "open") void handleOpen(ref);
                 else if (key === "reveal") void handleReveal(ref);
+                else if (key === "open_in_terminal") void handleOpenInTerminal(ref);
                 else if (key === "copy_path") void handleCopyPath(ref);
                 else if (key === "open_with") void handleOpenWith(ref);
               };
