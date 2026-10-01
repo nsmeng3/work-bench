@@ -323,6 +323,95 @@ pub async fn reveal_in_finder(pool: &SqlitePool, id: String) -> CmdResult<()> {
 }
 
 // ============================================================
+// m7-7.5 · ref_open_in_terminal（在系统终端中打开）
+// ============================================================
+
+/// `ref_open_in_terminal`：唤起系统终端，cd 到资源目录。
+///
+/// - 资源是文件 → cd 到父目录
+/// - 资源是文件夹 → cd 到它本身
+///
+/// 平台支持：
+/// - macOS：`open -a Terminal <dir>`（Terminal.app 会自动以该目录为 cwd 打开新窗口）
+/// - Windows：`cmd /c start cmd /k "cd /d <dir>"`
+/// - Linux：尝试常见终端模拟器（gnome-terminal / konsole / xterm），按顺序回退
+pub async fn open_in_terminal(pool: &SqlitePool, id: String) -> CmdResult<()> {
+    let locator = fetch_locator(pool, &id).await?;
+    let path = extract_path(&locator).ok_or_else(|| {
+        AppError::invalid_param(format!("引用 {} 的 locator 非 path 形态，无法在终端打开", id))
+    })?;
+
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(AppError::new(
+            "FS_PATH_NOT_FOUND",
+            format!("目标路径不存在: {}", path),
+        ));
+    }
+
+    // 文件 → 父目录；目录 → 本身
+    let dir = if p.is_dir() {
+        p.to_path_buf()
+    } else {
+        p.parent()
+            .ok_or_else(|| AppError::invalid_param(format!("路径无父目录: {}", path)))?
+            .to_path_buf()
+    };
+
+    spawn_terminal(&dir.to_string_lossy())
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_terminal(dir: &str) -> CmdResult<()> {
+    // `open -a Terminal <dir>`：Terminal.app 会以 dir 为 cwd 开新窗口。
+    // 不用 osascript，避免依赖 AppleScript 权限。
+    std::process::Command::new("open")
+        .arg("-a")
+        .arg("Terminal")
+        .arg(dir)
+        .spawn()
+        .map_err(|e| AppError::io(format!("启动 Terminal 失败: {}", e)))?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_terminal(dir: &str) -> CmdResult<()> {
+    // `cmd /c start cmd /k "cd /d <dir>"`：开启新 cmd 窗口并 cd。
+    // start 的第一个引号参数是窗口标题（空），第二个是要执行的命令。
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", "cmd", "/k", "cd", "/d", dir])
+        .spawn()
+        .map_err(|e| AppError::io(format!("启动 cmd 失败: {}", e)))?;
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_terminal(dir: &str) -> CmdResult<()> {
+    // Linux：按顺序尝试常见终端模拟器。每个都用 `spawn` 立即返回（成功与否由用户视觉判断），
+    // 全部失败则返回错误。
+    let candidates: &[(&str, &[&str])] = &[
+        ("gnome-terminal", &["--working-directory", dir]),
+        ("konsole", &["--workdir", dir]),
+        ("xfce4-terminal", &["--working-directory", dir]),
+        ("xterm", &["-e", "cd", dir]),  // xterm 的 -e 后面接管子命令
+    ];
+    let mut last_err: Option<String> = None;
+    for (prog, args) in candidates {
+        match std::process::Command::new(prog).args(*args).spawn() {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = Some(format!("{}: {}", prog, e));
+                continue;
+            }
+        }
+    }
+    Err(AppError::io(format!(
+        "未找到可用终端模拟器（已尝试 gnome-terminal/konsole/xfce4-terminal/xterm）；最后错误: {}",
+        last_err.unwrap_or_else(|| "无".into())
+    )))
+}
+
+// ============================================================
 // m7-7.1 · ref_log_access（访问埋点）
 // ============================================================
 
@@ -493,6 +582,14 @@ pub async fn ref_reveal_in_finder(
     id: String,
 ) -> CmdResult<()> {
     reveal_in_finder(&state.pool, id).await
+}
+
+#[tauri::command]
+pub async fn ref_open_in_terminal(
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+) -> CmdResult<()> {
+    open_in_terminal(&state.pool, id).await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1286,5 +1383,76 @@ mod tests {
         assert!(obj.contains_key("lastAt"));
         assert!(obj.contains_key("locatorJson"));
         assert!(!obj.contains_key("ref_id"));
+    }
+
+    // ---------- m7-7.5 · open_in_terminal ----------
+
+    /// 创建一个临时目录作为托管路径，返回 (tempdir_guard, path)。
+    /// tempfile 在 dev-dependencies 中，且此前测试已用。
+    fn make_temp_dir() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn open_in_terminal_err_not_found() {
+        let pool = setup().await;
+        let err = open_in_terminal(&pool, "no-such-ref".into())
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.code, "COMMON_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn open_in_terminal_err_non_path_locator() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = insert_reference_with_locator(
+            &pool,
+            &cid,
+            serde_json::json!({"kind": "repo", "url": "https://x"}),
+        )
+        .await;
+
+        let err = open_in_terminal(&pool, rid).await.expect_err("should fail");
+        assert_eq!(err.code, "COMMON_INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn open_in_terminal_err_path_not_exists() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = insert_reference(&pool, &cid, "/definitely/not/exists/path-xyz").await;
+
+        let err = open_in_terminal(&pool, rid).await.expect_err("should fail");
+        assert_eq!(err.code, "FS_PATH_NOT_FOUND");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn open_in_terminal_ok_dir_on_macos() {
+        // macOS 上 spawn Terminal 不阻塞，open -a 立即返回；只验证不报错。
+        // 真实"弹出 Terminal 窗口"无法在无 GUI 的 CI 验证，靠手动验收。
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let (_guard, dir_path) = make_temp_dir();
+        let rid = insert_reference(&pool, &cid, &dir_path).await;
+
+        open_in_terminal(&pool, rid).await.expect("open ok");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn open_in_terminal_ok_file_resolves_parent_on_macos() {
+        // 文件 → 应该 cd 到父目录。无法直接断言 cwd，但验证调用成功即可。
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let (_guard, dir_path) = make_temp_dir();
+        let file_path = format!("{}/a.txt", dir_path);
+        std::fs::write(&file_path, b"x").expect("write");
+        let rid = insert_reference(&pool, &cid, &file_path).await;
+
+        open_in_terminal(&pool, rid).await.expect("open ok");
     }
 }
