@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ManagedPlan,
   OpenResult,
+  RecentRef,
   RefAccessAction,
   RefCreateExternalInput,
   RefCreateManagedInput,
@@ -121,4 +122,19 @@ export async function refLogAccessSafe(refId: string, action: RefAccessAction): 
     // 埋点失败可接受，不打断用户操作
     console.warn("[ref_log_access] 埋点失败", action, refId, err);
   }
+}
+
+/* ---------------- M7-3 · Dashboard 最近资源 ---------------- */
+
+/**
+ * `ref_recent_access { limit? }` → `RecentRef[]`。
+ *
+ * 按 refId 去重，取每个 ref 最近一次 access_log；按 at DESC 排序。
+ * 已删除（disposition='deleted'）的引用被后端过滤。
+ *
+ * @param limit 缺省 10，上限 100
+ */
+export async function refRecentAccess(limit?: number): Promise<RecentRef[]> {
+  if (MOCK) return mockReferenceApi.ref_recent_access(limit);
+  return invoke<RecentRef[]>("ref_recent_access", { limit });
 }

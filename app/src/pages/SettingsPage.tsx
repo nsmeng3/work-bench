@@ -8,6 +8,7 @@ import {
   List,
   Modal,
   Radio,
+  Select,
   Space,
   Tag,
   Typography,
@@ -24,6 +25,7 @@ import type {
   RootDirStatus,
   StorageSourceInfo,
   DefaultAppConfig,
+  DefaultHome,
   ReferenceType,
 } from "../api";
 import {
@@ -35,6 +37,8 @@ import {
   settingsUpdateSource,
   settingsGetDefaultApp,
   settingsSetDefaultApp,
+  settingsGetDefaultHome,
+  settingsSetDefaultHome,
   toApiError,
 } from "../api";
 import { RootDirPicker } from "../components/RootDirPicker";
@@ -90,6 +94,11 @@ export function SettingsPage() {
   const [appModalOpen, setAppModalOpen] = useState(false);
   const [editingAppType, setEditingAppType] = useState<ReferenceType | null>(null);
   const [appForm] = Form.useForm();
+
+  // ---------- 通用（启动默认页）状态（M7-3） ----------
+  const [defaultHome, setDefaultHome] = useState<DefaultHome>("dashboard");
+  const [defaultHomeLoading, setDefaultHomeLoading] = useState(false);
+  const [defaultHomeSaving, setDefaultHomeSaving] = useState(false);
 
   // ---------- 加载数据 ----------
 
@@ -150,12 +159,26 @@ export function SettingsPage() {
     }
   }, []);
 
+  const loadDefaultHome = useCallback(async () => {
+    setDefaultHomeLoading(true);
+    try {
+      const cfg = await settingsGetDefaultHome();
+      setDefaultHome(cfg.home);
+    } catch (err) {
+      const apiErr = toApiError(err);
+      message.error(`加载启动默认页失败：${apiErr.message}`);
+    } finally {
+      setDefaultHomeLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     void loadDirs();
     void loadRootDir();
     void loadSources();
     void loadDefaultApps();
-  }, [loadDirs, loadRootDir, loadSources, loadDefaultApps]);
+    void loadDefaultHome();
+  }, [loadDirs, loadRootDir, loadSources, loadDefaultApps, loadDefaultHome]);
 
   // ---------- 监控目录操作 ----------
 
@@ -246,6 +269,22 @@ export function SettingsPage() {
     setAppModalOpen(true);
   }
 
+  // ---------- 通用（启动默认页）操作（M7-3） ----------
+
+  async function handleDefaultHomeChange(value: DefaultHome) {
+    setDefaultHomeSaving(true);
+    try {
+      const cfg = await settingsSetDefaultHome(value);
+      setDefaultHome(cfg.home);
+      message.success("启动默认页已更新，重启应用后生效");
+    } catch (err) {
+      const apiErr = toApiError(err);
+      message.error(`设置失败：${apiErr.message}`);
+    } finally {
+      setDefaultHomeSaving(false);
+    }
+  }
+
   async function handleAppSubmit() {
     try {
       const values = await appForm.validateFields();
@@ -276,6 +315,28 @@ export function SettingsPage() {
   return (
     <div style={{ maxWidth: 800, margin: "0 auto" }}>
       <Typography.Title level={3}>设置</Typography.Title>
+
+      {/* 通用分区（M7-3 · 启动默认页） */}
+      <Card title="通用" style={{ marginBottom: 16 }} loading={defaultHomeLoading}>
+        <Space direction="vertical" size={8} style={{ width: "100%" }}>
+          <Space align="center" style={{ width: "100%", justifyContent: "space-between" }}>
+            <Typography.Text>启动时打开</Typography.Text>
+            <Select<DefaultHome>
+              value={defaultHome}
+              onChange={(v) => void handleDefaultHomeChange(v)}
+              loading={defaultHomeSaving}
+              style={{ minWidth: 160 }}
+              options={[
+                { value: "dashboard", label: "工作台" },
+                { value: "spaces", label: "空间" },
+              ]}
+            />
+          </Space>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            应用启动后默认展示的页面；修改后下次启动生效。
+          </Typography.Text>
+        </Space>
+      </Card>
 
       {/* 根目录分区 */}
       <Card

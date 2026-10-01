@@ -63,6 +63,17 @@ export async function todoListByRef(refId: string): Promise<Todo[]> {
   return invoke<Todo[]>("todo_list_by_ref", { refId });
 }
 
+/**
+ * `todo_today ()` → `Todo[]`（M7-3 Dashboard 今日待办）。
+ *
+ * 后端固定：status IN ('pending','doing')，
+ * 按 priority DESC, due_at IS NULL, due_at ASC, created_at ASC 排序，LIMIT 20。
+ */
+export async function todoToday(): Promise<Todo[]> {
+  if (MOCK) return mockTodoApi.todo_today();
+  return invoke<Todo[]>("todo_today");
+}
+
 /** 便捷封装：切换 done / pending */
 export async function todoToggleDone(todo: Todo): Promise<Todo> {
   const next: TodoStatus = todo.status === "done" ? "pending" : "done";

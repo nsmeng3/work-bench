@@ -954,6 +954,146 @@ pub async fn settings_set_default_app(
 }
 
 // ============================================================
+// m7-7.3 · settings_get_default_home / settings_set_default_home
+// ============================================================
+//
+// 启动默认页配置（Dashboard 首页 vs 空间页）。
+// 存储：复用 settings 表，key = "default_home"，value 为 JSON string。
+// 合法值："dashboard" | "spaces"。默认 "dashboard"。
+
+/// `settings` 表中启动默认页键名。
+const DEFAULT_HOME_KEY: &str = "default_home";
+
+/// 合法启动默认页取值。
+const VALID_DEFAULT_HOMES: &[&str] = &["dashboard", "spaces"];
+
+/// `settings_get_default_home` 出参。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DefaultHomeConfig {
+    /// "dashboard" | "spaces"
+    pub home: String,
+}
+
+/// 读取启动默认页；未设置时返回 "dashboard"。
+pub async fn get_default_home(pool: &SqlitePool) -> CmdResult<DefaultHomeConfig> {
+    let row = sqlx::query("SELECT value_json FROM settings WHERE key = ?")
+        .bind(DEFAULT_HOME_KEY)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::from)?;
+    match row {
+        None => Ok(DefaultHomeConfig {
+            home: "dashboard".to_string(),
+        }),
+        Some(r) => {
+            let value_json: String = r.try_get("value_json").map_err(AppError::from)?;
+            let v: serde_json::Value = serde_json::from_str(&value_json).map_err(|e| {
+                AppError::db(format!("settings.{} 反序列化失败: {}", DEFAULT_HOME_KEY, e))
+            })?;
+            let s = v
+                .as_str()
+                .ok_or_else(|| AppError::db(format!("settings.{} 非字符串", DEFAULT_HOME_KEY)))?;
+            // 容错：若数据库存了非法值（例如旧版本写入），回退到默认
+            let home = if VALID_DEFAULT_HOMES.contains(&s) {
+                s.to_string()
+            } else {
+                "dashboard".to_string()
+            };
+            Ok(DefaultHomeConfig { home })
+        }
+    }
+}
+
+/// 写入启动默认页。非法值返回 COMMON_INVALID_PARAM。
+pub async fn set_default_home(pool: &SqlitePool, home: String) -> CmdResult<DefaultHomeConfig> {
+    let trimmed = home.trim();
+    if !VALID_DEFAULT_HOMES.contains(&trimmed) {
+        return Err(AppError::invalid_param(format!(
+            "非法 home: {}（允许值: {}）",
+            trimmed,
+            VALID_DEFAULT_HOMES.join(", ")
+        )));
+    }
+    let value_json = serde_json::to_string(&serde_json::Value::String(trimmed.to_string()))
+        .map_err(|e| AppError::db(format!("settings.{} 序列化失败: {}", DEFAULT_HOME_KEY, e)))?;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    sqlx::query(
+        "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+    )
+    .bind(DEFAULT_HOME_KEY)
+    .bind(&value_json)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(AppError::from)?;
+    Ok(DefaultHomeConfig {
+        home: trimmed.to_string(),
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn settings_get_default_home(
+    state: tauri::State<'_, crate::AppState>,
+) -> CmdResult<DefaultHomeConfig> {
+    get_default_home(&state.pool).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn settings_set_default_home(
+    state: tauri::State<'_, crate::AppState>,
+    home: String,
+) -> CmdResult<DefaultHomeConfig> {
+    set_default_home(&state.pool, home).await
+}
+
+// ============================================================
+// m7-7.3 · settings_get_user_name（Dashboard 问候语）
+// ============================================================
+//
+// 任务包仅要求"读取 user_name，没有就显示'朋友'"，未要求设置 UI。
+// 为保持命令职责单一，新增独立的只读命令。
+
+/// `settings` 表中用户名键名。
+const USER_NAME_KEY: &str = "user_name";
+
+/// `settings_get_user_name` 出参。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserNameConfig {
+    /// 用户名；未设置时为 None（前端显示"朋友"）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+}
+
+/// 读取用户名；未设置 / 空串 / 非法 JSON 均返回 None（前端自行 fallback）。
+pub async fn get_user_name(pool: &SqlitePool) -> CmdResult<UserNameConfig> {
+    let row = sqlx::query("SELECT value_json FROM settings WHERE key = ?")
+        .bind(USER_NAME_KEY)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::from)?;
+    let Some(r) = row else {
+        return Ok(UserNameConfig { user_name: None });
+    };
+    let value_json: String = r.try_get("value_json").map_err(AppError::from)?;
+    let v: serde_json::Value = serde_json::from_str(&value_json)
+        .map_err(|e| AppError::db(format!("settings.{} 反序列化失败: {}", USER_NAME_KEY, e)))?;
+    let s = v.as_str().map(str::trim).filter(|s| !s.is_empty());
+    Ok(UserNameConfig {
+        user_name: s.map(str::to_string),
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn settings_get_user_name(
+    state: tauri::State<'_, crate::AppState>,
+) -> CmdResult<UserNameConfig> {
+    get_user_name(&state.pool).await
+}
+
+// ============================================================
 // 单元测试
 // ============================================================
 
@@ -2162,6 +2302,180 @@ mod tests {
             let obj2 = v2.as_object().expect("object");
             assert!(!obj2.contains_key("appPath"));
             assert_eq!(obj2["strategy"].as_str(), Some("system_default"));
+        }
+    }
+
+    // ============================================================
+    // m7-7.3 · settings_get/set_default_home
+    // ============================================================
+
+    mod default_home_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn default_home_returns_dashboard_when_unset() {
+            let pool = setup().await;
+            let cfg = get_default_home(&pool).await.expect("get ok");
+            assert_eq!(cfg.home, "dashboard", "未设置时应回退到 dashboard");
+        }
+
+        #[tokio::test]
+        async fn set_then_get_default_home_roundtrip() {
+            let pool = setup().await;
+            let r = set_default_home(&pool, "spaces".into()).await.expect("set ok");
+            assert_eq!(r.home, "spaces");
+
+            let cfg = get_default_home(&pool).await.expect("get ok");
+            assert_eq!(cfg.home, "spaces");
+
+            // 改回 dashboard
+            set_default_home(&pool, "dashboard".into()).await.expect("set2 ok");
+            let cfg2 = get_default_home(&pool).await.expect("get2 ok");
+            assert_eq!(cfg2.home, "dashboard");
+        }
+
+        #[tokio::test]
+        async fn set_default_home_rejects_invalid_value() {
+            let pool = setup().await;
+            let err = set_default_home(&pool, "weird".into())
+                .await
+                .expect_err("should fail");
+            assert_eq!(err.code, "COMMON_INVALID_PARAM");
+
+            let err = set_default_home(&pool, "".into())
+                .await
+                .expect_err("empty should fail");
+            assert_eq!(err.code, "COMMON_INVALID_PARAM");
+
+            // 大小写敏感：Dashboard 不合法
+            let err = set_default_home(&pool, "Dashboard".into())
+                .await
+                .expect_err("case sensitive");
+            assert_eq!(err.code, "COMMON_INVALID_PARAM");
+        }
+
+        #[tokio::test]
+        async fn default_home_persists_across_pool_reopen() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let db_path = tmp.path().join("test.db");
+
+            {
+                let pool = crate::db::init_pool_with_file(&db_path)
+                    .await
+                    .expect("init pool");
+                set_default_home(&pool, "spaces".into()).await.expect("set ok");
+                pool.close().await;
+            }
+
+            let pool2 = crate::db::init_pool_with_file(&db_path)
+                .await
+                .expect("reopen pool");
+            let cfg = get_default_home(&pool2).await.expect("get ok");
+            assert_eq!(cfg.home, "spaces");
+        }
+
+        #[tokio::test]
+        async fn default_home_falls_back_on_invalid_db_value() {
+            let pool = setup().await;
+            // 直接写入非法值（模拟旧版本/外部修改）
+            let value_json = serde_json::to_string(&serde_json::Value::String("bogus".into()))
+                .expect("serialize");
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            sqlx::query(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('default_home', ?, ?)",
+            )
+            .bind(&value_json)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("insert bogus");
+
+            let cfg = get_default_home(&pool).await.expect("get ok");
+            assert_eq!(cfg.home, "dashboard", "非法存量值应回退到默认");
+        }
+
+        #[test]
+        fn default_home_config_serializes_camel_case() {
+            let c = DefaultHomeConfig {
+                home: "dashboard".into(),
+            };
+            let v = serde_json::to_value(&c).expect("serialize");
+            let obj = v.as_object().expect("object");
+            assert!(obj.contains_key("home"));
+            assert_eq!(obj["home"].as_str(), Some("dashboard"));
+        }
+    }
+
+    // ============================================================
+    // m7-7.3 · settings_get_user_name
+    // ============================================================
+
+    mod user_name_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn user_name_returns_none_when_unset() {
+            let pool = setup().await;
+            let cfg = get_user_name(&pool).await.expect("get ok");
+            assert_eq!(cfg.user_name, None);
+        }
+
+        #[tokio::test]
+        async fn user_name_returns_value_when_set() {
+            let pool = setup().await;
+            let value_json = serde_json::to_string(&serde_json::Value::String("lazyegg".into()))
+                .expect("serialize");
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            sqlx::query(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('user_name', ?, ?)",
+            )
+            .bind(&value_json)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("insert");
+
+            let cfg = get_user_name(&pool).await.expect("get ok");
+            assert_eq!(cfg.user_name.as_deref(), Some("lazyegg"));
+        }
+
+        #[tokio::test]
+        async fn user_name_returns_none_for_empty_or_whitespace() {
+            let pool = setup().await;
+            for v in ["", "   "] {
+                let value_json =
+                    serde_json::to_string(&serde_json::Value::String(v.into())).expect("ser");
+                let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                sqlx::query(
+                    "INSERT INTO settings (key, value_json, updated_at) VALUES ('user_name', ?, ?) \
+                     ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                )
+                .bind(&value_json)
+                .bind(now)
+                .execute(&pool)
+                .await
+                .expect("upsert");
+
+                let cfg = get_user_name(&pool).await.expect("get ok");
+                assert_eq!(cfg.user_name, None, "empty/whitespace 应回退 None");
+            }
+        }
+
+        #[test]
+        fn user_name_config_serializes_camel_case() {
+            let c = UserNameConfig {
+                user_name: Some("x".into()),
+            };
+            let v = serde_json::to_value(&c).expect("serialize");
+            let obj = v.as_object().expect("object");
+            assert!(obj.contains_key("userName"));
+            assert!(!obj.contains_key("user_name"));
+
+            // None 时被 skip
+            let c2 = UserNameConfig { user_name: None };
+            let v2 = serde_json::to_value(&c2).expect("serialize");
+            let obj2 = v2.as_object().expect("object");
+            assert!(!obj2.contains_key("userName"));
         }
     }
 }

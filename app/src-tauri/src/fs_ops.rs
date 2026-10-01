@@ -505,6 +505,78 @@ pub async fn ref_log_access(
 }
 
 // ============================================================
+// m7-7.3 · ref_recent_access（Dashboard 最近资源）
+// ============================================================
+
+/// `ref_recent_access` 出参条目（任务包 m7-7.3 §后端新增命令）。
+///
+/// 按 ref_id 去重，取每个 ref 最近一次 access_log，按 at DESC 排序。
+/// 过滤 `disposition='deleted'` 的引用（已删除资源不应出现在最近列表）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentRef {
+    pub ref_id: String,
+    pub ref_name: String,
+    /// 引用类型：'code' | 'document' | ...
+    pub ref_type: String,
+    /// 最近一次动作：'open' | 'reveal' | 'copy_path' | 'open_with'
+    pub last_action: String,
+    /// 最近一次访问时间（Unix 秒）
+    pub last_at: i64,
+    /// 透传 resource_reference.locator_json（前端展示路径用）
+    pub locator_json: String,
+}
+
+/// `ref_recent_access`：返回最近访问的资源列表（按 ref 去重）。
+///
+/// SQL 思路：
+/// 1. 子查询对每个 ref_id 取 MAX(at)；
+/// 2. JOIN resource_reference 取名称/类型/locator；
+/// 3. 过滤 disposition='deleted'；
+/// 4. 按 at DESC 排序，LIMIT ?。
+///
+/// `limit` 缺省 10，上限 100（防止前端误传超大值拖慢查询）。
+pub async fn recent_access(pool: &SqlitePool, limit: Option<i64>) -> CmdResult<Vec<RecentRef>> {
+    let limit = limit.unwrap_or(10).clamp(1, 100);
+    let rows = sqlx::query(
+        "SELECT r.id AS ref_id, r.name AS ref_name, r.type AS ref_type, \
+                r.locator_json AS locator_json, l.action AS last_action, l.at AS last_at \
+         FROM ref_access_log l \
+         JOIN resource_reference r ON r.id = l.ref_id \
+         WHERE l.at = (SELECT MAX(at) FROM ref_access_log WHERE ref_id = l.ref_id) \
+           AND r.disposition != 'deleted' \
+         GROUP BY l.ref_id \
+         ORDER BY l.at DESC \
+         LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::from)?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(RecentRef {
+            ref_id: row.try_get("ref_id").map_err(AppError::from)?,
+            ref_name: row.try_get("ref_name").map_err(AppError::from)?,
+            ref_type: row.try_get("ref_type").map_err(AppError::from)?,
+            last_action: row.try_get("last_action").map_err(AppError::from)?,
+            last_at: row.try_get("last_at").map_err(AppError::from)?,
+            locator_json: row.try_get("locator_json").map_err(AppError::from)?,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn ref_recent_access(
+    state: tauri::State<'_, crate::AppState>,
+    limit: Option<i64>,
+) -> CmdResult<Vec<RecentRef>> {
+    recent_access(&state.pool, limit).await
+}
+
+// ============================================================
 // 单元测试
 // ============================================================
 
@@ -1071,5 +1143,148 @@ mod tests {
                 .await
                 .expect("count");
         assert_eq!(n, 4);
+    }
+
+    // ---------- m7-7.3 · ref_recent_access ----------
+
+    /// 直接 INSERT 一条 ref_access_log（便于控制 at 时间戳）。
+    async fn insert_access_log(pool: &SqlitePool, ref_id: &str, action: &str, at: i64) {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO ref_access_log (id, ref_id, action, at) VALUES (?, ?, ?, ?)")
+            .bind(&id)
+            .bind(ref_id)
+            .bind(action)
+            .bind(at)
+            .execute(pool)
+            .await
+            .expect("insert access_log");
+    }
+
+    #[tokio::test]
+    async fn recent_access_empty_when_no_logs() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let _rid = insert_reference(&pool, &cid, "/tmp/x").await;
+
+        let list = recent_access(&pool, None).await.expect("recent ok");
+        assert!(list.is_empty(), "无 access_log 时应返回空");
+    }
+
+    #[tokio::test]
+    async fn recent_access_dedupes_by_ref_and_returns_latest() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = insert_reference(&pool, &cid, "/tmp/x").await;
+
+        // 同一 ref 三条日志，时间递增
+        insert_access_log(&pool, &rid, "open", 1000).await;
+        insert_access_log(&pool, &rid, "reveal", 2000).await;
+        insert_access_log(&pool, &rid, "copy_path", 3000).await;
+
+        let list = recent_access(&pool, None).await.expect("recent ok");
+        assert_eq!(list.len(), 1, "同一 ref 应去重为 1 条");
+        assert_eq!(list[0].ref_id, rid);
+        assert_eq!(list[0].last_action, "copy_path", "应返回最近一次动作");
+        assert_eq!(list[0].last_at, 3000);
+    }
+
+    #[tokio::test]
+    async fn recent_access_orders_by_last_at_desc() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid_a = insert_reference(&pool, &cid, "/tmp/a").await;
+        let rid_b = insert_reference(&pool, &cid, "/tmp/b").await;
+        let rid_c = insert_reference(&pool, &cid, "/tmp/c").await;
+
+        // a 最新，b 次之，c 最旧
+        insert_access_log(&pool, &rid_c, "open", 1000).await;
+        insert_access_log(&pool, &rid_a, "open", 3000).await;
+        insert_access_log(&pool, &rid_b, "open", 2000).await;
+
+        let list = recent_access(&pool, None).await.expect("recent ok");
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].ref_id, rid_a, "最新访问的应排第一");
+        assert_eq!(list[1].ref_id, rid_b);
+        assert_eq!(list[2].ref_id, rid_c);
+    }
+
+    #[tokio::test]
+    async fn recent_access_respects_limit() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let mut rids = Vec::new();
+        for i in 0..5 {
+            let rid = insert_reference(&pool, &cid, &format!("/tmp/r{}", i)).await;
+            insert_access_log(&pool, &rid, "open", 1000 + i as i64).await;
+            rids.push(rid);
+        }
+
+        let list = recent_access(&pool, Some(3)).await.expect("recent ok");
+        assert_eq!(list.len(), 3, "limit=3 应只返回 3 条");
+        // 最近 3 条应是 rids[4], rids[3], rids[2]
+        assert_eq!(list[0].ref_id, rids[4]);
+        assert_eq!(list[1].ref_id, rids[3]);
+        assert_eq!(list[2].ref_id, rids[2]);
+    }
+
+    #[tokio::test]
+    async fn recent_access_excludes_deleted_disposition() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid_alive = insert_reference(&pool, &cid, "/tmp/alive").await;
+        let rid_deleted = insert_reference(&pool, &cid, "/tmp/deleted").await;
+
+        insert_access_log(&pool, &rid_alive, "open", 1000).await;
+        insert_access_log(&pool, &rid_deleted, "open", 2000).await;
+
+        // 把 deleted 的 disposition 置为 deleted
+        sqlx::query("UPDATE resource_reference SET disposition = 'deleted' WHERE id = ?")
+            .bind(&rid_deleted)
+            .execute(&pool)
+            .await
+            .expect("update disposition");
+
+        let list = recent_access(&pool, None).await.expect("recent ok");
+        assert_eq!(list.len(), 1, "deleted 资源不应出现在最近列表");
+        assert_eq!(list[0].ref_id, rid_alive);
+    }
+
+    #[tokio::test]
+    async fn recent_access_returns_full_fields() {
+        let pool = setup().await;
+        let cid = make_collection(&pool).await;
+        let rid = insert_reference(&pool, &cid, "/tmp/full").await;
+        insert_access_log(&pool, &rid, "reveal", 1234).await;
+
+        let list = recent_access(&pool, None).await.expect("recent ok");
+        assert_eq!(list.len(), 1);
+        let item = &list[0];
+        assert_eq!(item.ref_id, rid);
+        assert_eq!(item.ref_name, "r", "insert_reference 默认 name='r'");
+        assert_eq!(item.ref_type, "code");
+        assert_eq!(item.last_action, "reveal");
+        assert_eq!(item.last_at, 1234);
+        assert!(item.locator_json.contains("/tmp/full"));
+    }
+
+    #[tokio::test]
+    async fn recent_access_serializes_camel_case() {
+        let item = RecentRef {
+            ref_id: "r1".into(),
+            ref_name: "name".into(),
+            ref_type: "code".into(),
+            last_action: "open".into(),
+            last_at: 1000,
+            locator_json: "{}".into(),
+        };
+        let v = serde_json::to_value(&item).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert!(obj.contains_key("refId"));
+        assert!(obj.contains_key("refName"));
+        assert!(obj.contains_key("refType"));
+        assert!(obj.contains_key("lastAction"));
+        assert!(obj.contains_key("lastAt"));
+        assert!(obj.contains_key("locatorJson"));
+        assert!(!obj.contains_key("ref_id"));
     }
 }

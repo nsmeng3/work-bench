@@ -734,6 +734,39 @@ export interface OpenResult {
  */
 export type RefAccessAction = "open" | "reveal" | "copy_path" | "open_with";
 
+/* ---------------- Dashboard（M7-3） ---------------- */
+
+/**
+ * `ref_recent_access` 出参条目 — 任务包 m7-7.3。
+ * 按 refId 去重，每个 ref 仅保留最近一次 access_log。
+ */
+export interface RecentRef {
+  refId: string;
+  refName: string;
+  /** 引用类型：'code' | 'document' | ... */
+  refType: ReferenceType | string;
+  /** 最近一次动作 */
+  lastAction: RefAccessAction;
+  /** Unix 秒 */
+  lastAt: number;
+  /** 透传 resource_reference.locator_json（前端展示路径用） */
+  locatorJson: string;
+}
+
+/** `settings_get_default_home` / `settings_set_default_home` 出参 */
+export interface DefaultHomeConfig {
+  /** "dashboard" | "spaces" */
+  home: DefaultHome;
+}
+
+export type DefaultHome = "dashboard" | "spaces";
+
+/** `settings_get_user_name` 出参（M7-3 Dashboard 问候语） */
+export interface UserNameConfig {
+  /** 用户名；未设置时字段缺失（前端显示"朋友"） */
+  userName?: string;
+}
+
 /* ---------------- 导入撤销（m4-4.9 · ref_undo_import） ---------------- */
 
 /**
