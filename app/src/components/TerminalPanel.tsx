@@ -225,7 +225,7 @@ export function TerminalPanel({ spaceId, spaceName }: TerminalPanelProps) {
       style={{
         display: "flex",
         flexDirection: "column",
-        height: "calc(100vh - 220px)",
+        height: "calc(100vh - 140px)",
         minHeight: 400,
       }}
     >
