@@ -335,8 +335,10 @@ pub async fn reveal_in_finder(pool: &SqlitePool, id: String) -> CmdResult<()> {
 /// - macOS：`open -a Terminal <dir>`（Terminal.app 会自动以该目录为 cwd 打开新窗口）
 /// - Windows：`cmd /c start cmd /k "cd /d <dir>"`
 /// - Linux：尝试常见终端模拟器（gnome-terminal / konsole / xterm），按顺序回退
-pub async fn open_in_terminal(pool: &SqlitePool, id: String) -> CmdResult<()> {
-    let locator = fetch_locator(pool, &id).await?;
+/// 解析引用的"终端工作目录"：文件 → 父目录；目录 → 本身。
+/// 供系统终端（open_in_terminal）与内嵌终端（ref_terminal_dir）共用。
+async fn resolve_ref_dir(pool: &SqlitePool, id: &str) -> CmdResult<std::path::PathBuf> {
+    let locator = fetch_locator(pool, id).await?;
     let path = extract_path(&locator).ok_or_else(|| {
         AppError::invalid_param(format!("引用 {} 的 locator 非 path 形态，无法在终端打开", id))
     })?;
@@ -349,15 +351,18 @@ pub async fn open_in_terminal(pool: &SqlitePool, id: String) -> CmdResult<()> {
         ));
     }
 
-    // 文件 → 父目录；目录 → 本身
-    let dir = if p.is_dir() {
-        p.to_path_buf()
+    if p.is_dir() {
+        Ok(p.to_path_buf())
     } else {
-        p.parent()
+        Ok(p
+            .parent()
             .ok_or_else(|| AppError::invalid_param(format!("路径无父目录: {}", path)))?
-            .to_path_buf()
-    };
+            .to_path_buf())
+    }
+}
 
+pub async fn open_in_terminal(pool: &SqlitePool, id: String) -> CmdResult<()> {
+    let dir = resolve_ref_dir(pool, &id).await?;
     spawn_terminal(&dir.to_string_lossy())
 }
 
@@ -590,6 +595,17 @@ pub async fn ref_open_in_terminal(
     id: String,
 ) -> CmdResult<()> {
     open_in_terminal(&state.pool, id).await
+}
+
+/// m7-7.6 · `ref_terminal_dir`：返回引用的终端工作目录（文件→父目录）。
+/// 供前端"在内嵌终端打开"：拿到 dir 后作为 `terminal_create` 的 cwd。
+#[tauri::command]
+pub async fn ref_terminal_dir(
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+) -> CmdResult<String> {
+    let dir = resolve_ref_dir(&state.pool, &id).await?;
+    Ok(dir.to_string_lossy().to_string())
 }
 
 #[tauri::command(rename_all = "camelCase")]

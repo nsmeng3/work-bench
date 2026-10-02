@@ -50,6 +50,7 @@ import {
   refOpenWith,
   refRevealInFinder,
   refOpenInTerminal,
+  refTerminalDir,
   refUpdate,
   toApiError,
 } from "../api";
@@ -127,6 +128,8 @@ interface CollectionDetailPageProps {
   space: Space;
   collection: Collection;
   onBack: () => void;
+  /** m7-7.6 · "在内嵌终端打开"：参数为已解析好的资源目录，由 App 跳转到终端页 */
+  onOpenEmbeddedTerminal?: (cwd: string) => void;
 }
 
 /** 编辑表单字段 — §2.5 ref_update 仅允许管理属性 */
@@ -139,7 +142,7 @@ interface RefEditFormValues {
   indexed: boolean;
 }
 
-export function CollectionDetailPage({ space, collection, onBack }: CollectionDetailPageProps) {
+export function CollectionDetailPage({ space, collection, onBack, onOpenEmbeddedTerminal }: CollectionDetailPageProps) {
   const [detail, setDetail] = useState<CollectionDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
@@ -246,6 +249,22 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
    * - 文件 → cd 到父目录；目录 → cd 到它本身
    * - 成功后埋点 action="open"（复用现有枚举，本质是"打开"的一种形态）
    */
+  /** m7-7.6 · 在内嵌终端打开：先解析目录，再交给 App 跳终端页 */
+  const handleOpenEmbeddedTerminal = async (ref: Reference) => {
+    if (!onOpenEmbeddedTerminal) return;
+    try {
+      const dir = await refTerminalDir(ref.id);
+      void refLogAccessSafe(ref.id, "open");
+      onOpenEmbeddedTerminal(dir);
+    } catch (err) {
+      const apiErr = toApiError(err);
+      messageApi.error({
+        content: `在内嵌终端打开失败：${apiErr.message}`,
+        duration: 3,
+      });
+    }
+  };
+
   const handleOpenInTerminal = async (ref: Reference) => {
     try {
       await refOpenInTerminal(ref.id);
@@ -369,8 +388,14 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
                   disabled: !isPathLocator,
                 },
                 {
+                  key: "open_in_embedded_terminal",
+                  label: "在内嵌终端打开",
+                  icon: <CodeOutlined />,
+                  disabled: !isPathLocator || !onOpenEmbeddedTerminal,
+                },
+                {
                   key: "open_in_terminal",
-                  label: "在终端中打开",
+                  label: "在系统终端中打开",
                   icon: <CodeOutlined />,
                   disabled: !isPathLocator,
                 },
@@ -391,6 +416,7 @@ export function CollectionDetailPage({ space, collection, onBack }: CollectionDe
               const handleMenuClick = ({ key }: { key: string }) => {
                 if (key === "open") void handleOpen(ref);
                 else if (key === "reveal") void handleReveal(ref);
+                else if (key === "open_in_embedded_terminal") void handleOpenEmbeddedTerminal(ref);
                 else if (key === "open_in_terminal") void handleOpenInTerminal(ref);
                 else if (key === "copy_path") void handleCopyPath(ref);
                 else if (key === "open_with") void handleOpenWith(ref);

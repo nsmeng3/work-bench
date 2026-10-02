@@ -14,6 +14,7 @@ mod reference;
 mod sensitive;
 mod settings;
 mod space;
+mod stats;
 mod tag;
 mod terminal;
 mod todo;
@@ -143,6 +144,8 @@ pub fn run() {
             fs_ops::ref_open,
             fs_ops::ref_reveal_in_finder,
             fs_ops::ref_open_in_terminal,
+            fs_ops::ref_terminal_dir,
+            stats::stats_overview,
             fs_ops::ref_log_access,
             fs_ops::ref_recent_access,
             settings::settings_get_root_dir,

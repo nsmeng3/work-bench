@@ -4,7 +4,9 @@ import zhCN from "antd/locale/zh_CN";
 import {
   AppstoreOutlined,
   AuditOutlined,
+  BarChartOutlined,
   CheckSquareOutlined,
+  CodeOutlined,
   FilterOutlined,
   HomeOutlined,
   InboxOutlined,
@@ -22,6 +24,9 @@ import { InitWizardPage } from "./pages/InitWizardPage";
 import { AuditPage } from "./pages/AuditPage";
 import { InboxPage } from "./pages/InboxPage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { TerminalPage } from "./pages/TerminalPage";
+import { StatsPage } from "./pages/StatsPage";
+import type { TerminalOpenRequest } from "./components/TerminalPanel";
 import { TodoPage } from "./pages/TodoPage";
 import { settingsGetDefaultHome, settingsGetRootDir, toApiError } from "./api";
 import type { Collection, Space } from "./api";
@@ -34,6 +39,8 @@ const navItems: NavItem[] = [
   { key: "spaces", label: "空间", icon: <AppstoreOutlined />, enabled: true },
   { key: "filter", label: "筛选", icon: <FilterOutlined />, enabled: true },
   { key: "inbox", label: "收件箱", icon: <InboxOutlined />, enabled: true },
+  { key: "terminal", label: "终端", icon: <CodeOutlined />, enabled: true },
+  { key: "stats", label: "统计", icon: <BarChartOutlined />, enabled: true },
   { key: "audit", label: "审计", icon: <AuditOutlined />, enabled: true },
   { key: "settings", label: "设置", icon: <SettingOutlined />, enabled: true },
 ];
@@ -51,6 +58,8 @@ function App() {
   const [currentSpace, setCurrentSpace] = useState<Space | null>(null);
   /** 当前下钻进入的资源集；null 表示在资源集列表页 */
   const [currentCollection, setCurrentCollection] = useState<Collection | null>(null);
+  /** m7-7.6 · 待终端页消费的打开请求（资源"在内嵌终端打开"带 cwd） */
+  const [terminalRequest, setTerminalRequest] = useState<TerminalOpenRequest | null>(null);
 
   /** 收件箱统计：5s 轮询；同时驱动角标与合并通知（m5-5.8） */
   const statsReady = phase.kind === "ready" && phase.initialized;
@@ -135,6 +144,17 @@ function App() {
   }
 
   /**
+   * m7-7.6 · 资源"在内嵌终端打开"：跳到终端页并请求按该目录新建会话。
+   * cwd 由调用方（CollectionDetailPage）先经 ref_terminal_dir 解析好。
+   */
+  function handleOpenEmbeddedTerminal(cwd: string) {
+    setActiveNav("terminal");
+    setCurrentSpace(null);
+    setCurrentCollection(null);
+    setTerminalRequest({ cwd, nonce: Date.now() });
+  }
+
+  /**
    * 筛选页「跳转到资源集」（m5-filter-jump）：
    * 切到 spaces 主导航并下钻到指定 space/collection。
    */
@@ -210,6 +230,7 @@ function App() {
                   space={currentSpace}
                   collection={currentCollection}
                   onBack={() => setCurrentCollection(null)}
+                  onOpenEmbeddedTerminal={handleOpenEmbeddedTerminal}
                 />
               ) : currentSpace ? (
                 <CollectionPage
@@ -224,6 +245,8 @@ function App() {
             {activeNav === "audit" && <AuditPage />}
             {activeNav === "inbox" && <InboxPage />}
             {activeNav === "todo" && <TodoPage />}
+            {activeNav === "terminal" && <TerminalPage openRequest={terminalRequest} />}
+            {activeNav === "stats" && <StatsPage />}
             {activeNav === "settings" && <SettingsPage />}
           </AppShell>
         )}

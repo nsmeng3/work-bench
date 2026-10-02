@@ -88,6 +88,18 @@ export async function refOpenInTerminal(refId: string): Promise<void> {
 }
 
 /**
+ * m7-7.6 · `ref_terminal_dir { id }` → 目录路径字符串。
+ * 返回引用的终端工作目录（文件 → 父目录；目录 → 本身），
+ * 供"在内嵌终端打开"作为 `terminalCreate` 的 cwd。
+ * locator 非 path 或路径不存在时报错。
+ */
+export async function refTerminalDir(refId: string): Promise<string> {
+  // mock 模式下无法解析真实路径，返回根目录兜底
+  if (MOCK) return "/";
+  return invoke<string>("ref_terminal_dir", { id: refId });
+}
+
+/**
  * 复制引用路径到剪贴板 — 纯前端动作，无需后端命令。
  * 仅在 locator.kind === "path" 时可用；其他形态抛 COMMON_INVALID_PARAM。
  *
