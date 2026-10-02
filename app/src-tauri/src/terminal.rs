@@ -5,11 +5,13 @@
 //!
 //! 关键设计：
 //! - 每个会话一个 PTY 子进程，shell 取 `$SHELL`，fallback `/bin/zsh`。
-//! - cwd 解析：显式 `cwd` 入参 > 空间 root（当前 space 表无 root_path 字段，
-//!   退回 `dirs::home_dir()`）。
+//! - cwd 解析：显式 `cwd` 入参 > 资源根目录（settings.root_dir）>
+//!   `dirs::home_dir()`。space 表当前无 root_path 字段，暂用全局根目录
+//!   作为"项目上下文"的近似。
 //! - 输出通过 `tauri::ipc::Channel<TerminalEvent>` 推送（Data / Exited）。
-//! - reader task 用 `tokio::task::spawn_blocking` 循环 read，按 16ms / 8KB
-//!   批量 flush，避免高频小帧。
+//! - reader 拆两段：producer 线程阻塞 read → mpsc；flusher 用
+//!   `recv_timeout(16ms)` 批量聚合，**空闲超时也 flush**，保证 shell
+//!   静默前不足 8KB 的尾部输出（如提示符）不会被滞留。
 //! - 退出清理：`terminal_close` 主动 kill；`child.wait()` 在独立 task，
 //!   退出后自动从 sessions 表移除并推 `Exited`；应用退出时由 lib.rs
 //!   遍历 sessions 全部 kill。
@@ -19,7 +21,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 use tauri::ipc::Channel;
 use uuid::Uuid;
 
@@ -118,15 +121,14 @@ fn resolve_shell() -> String {
         .unwrap_or_else(|| "/bin/zsh".to_string())
 }
 
-/// 解析 cwd：显式入参 > 空间 root（当前 schema 无 root_path，跳过）> home。
-fn resolve_cwd(cwd: Option<String>, _space_id: Option<&str>) -> PathBuf {
-    if let Some(c) = cwd {
-        let p = PathBuf::from(&c);
+/// 解析 cwd：显式入参 > 资源根目录（settings.root_dir）> home。
+fn resolve_cwd(cwd: Option<String>, root_dir: Option<&str>) -> PathBuf {
+    for candidate in [cwd, root_dir.map(|s| s.to_string())].into_iter().flatten() {
+        let p = PathBuf::from(&candidate);
         if p.is_dir() {
             return p;
         }
     }
-    // TODO(m7-7.4): 若后续 space 表加 root_path 字段，在此查询。
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
@@ -177,28 +179,40 @@ fn spawn_session(
     let master_arc: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
     let writer_arc: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(writer));
 
-    // ---- reader task：阻塞 read + 批量 flush ----
+    // ---- reader：producer（阻塞 read → mpsc）+ flusher（超时也 flush）----
+    // 旧实现只在新数据到达时才检查 flush 条件，导致 shell 静默前不足
+    // FLUSH_THRESHOLD_BYTES 的尾部输出（典型：命令执行完回到提示符）
+    // 被滞留到下一次输出才推送，体感"慢一拍"。现拆成两段：
+    // producer 只负责读，flusher 用 recv_timeout 在空闲 16ms 后也 flush。
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let channel_for_reader = channel.clone();
-    let reader_task = tauri::async_runtime::spawn_blocking(move || {
+    std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let reader_task = tauri::async_runtime::spawn_blocking(move || {
         let mut pending: Vec<u8> = Vec::with_capacity(FLUSH_THRESHOLD_BYTES * 2);
         let mut last_flush = std::time::Instant::now();
         loop {
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    // EOF
-                    if !pending.is_empty() {
-                        let _ = channel_for_reader.send(TerminalEvent::Data {
-                            data: String::from_utf8_lossy(&pending).to_string(),
-                        });
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    pending.extend_from_slice(&buf[..n]);
-                    let should_flush = pending.len() >= FLUSH_THRESHOLD_BYTES
-                        || last_flush.elapsed().as_millis() as u64 >= FLUSH_INTERVAL_MS;
-                    if should_flush {
+            match rx.recv_timeout(Duration::from_millis(FLUSH_INTERVAL_MS)) {
+                Ok(chunk) => {
+                    pending.extend_from_slice(&chunk);
+                    // 持续输出（如 zsh 每次按键重绘）时按时间上限 flush，
+                    // 否则只能攒满 8KB 才推，回显成批跳动，体感"卡住"
+                    if pending.len() >= FLUSH_THRESHOLD_BYTES
+                        || last_flush.elapsed() >= Duration::from_millis(FLUSH_INTERVAL_MS)
+                    {
                         let _ = channel_for_reader.send(TerminalEvent::Data {
                             data: String::from_utf8_lossy(&pending).to_string(),
                         });
@@ -206,7 +220,18 @@ fn spawn_session(
                         last_flush = std::time::Instant::now();
                     }
                 }
-                Err(_) => {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // 空闲超时：把滞留的尾部输出推出去
+                    if !pending.is_empty() {
+                        let _ = channel_for_reader.send(TerminalEvent::Data {
+                            data: String::from_utf8_lossy(&pending).to_string(),
+                        });
+                        pending.clear();
+                        last_flush = std::time::Instant::now();
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // producer 结束（EOF / 读错误）：flush 残余后退出
                     if !pending.is_empty() {
                         let _ = channel_for_reader.send(TerminalEvent::Data {
                             data: String::from_utf8_lossy(&pending).to_string(),
@@ -258,6 +283,7 @@ pub fn create(
     state: &TerminalState,
     space_id: Option<String>,
     cwd: Option<String>,
+    root_dir: Option<String>,
     cols: u16,
     rows: u16,
     channel: Channel<TerminalEvent>,
@@ -267,7 +293,7 @@ pub fn create(
     }
     let session_id = Uuid::new_v4().to_string();
     let shell = resolve_shell();
-    let cwd_path = resolve_cwd(cwd, space_id.as_deref());
+    let cwd_path = resolve_cwd(cwd, root_dir.as_deref());
 
     let session = spawn_session(
         session_id.clone(),
@@ -370,6 +396,7 @@ pub fn kill_all(state: &TerminalState) {
 #[tauri::command]
 pub async fn terminal_create(
     state: tauri::State<'_, TerminalState>,
+    app_state: tauri::State<'_, crate::AppState>,
     space_id: Option<String>,
     cwd: Option<String>,
     cols: u16,
@@ -377,8 +404,11 @@ pub async fn terminal_create(
     on_event: Channel<TerminalEvent>,
 ) -> CmdResult<TerminalCreateOutput> {
     let state_inner = state.inner();
+    // cwd 兜底链：显式 cwd > settings.root_dir > home
+    let root_dir = crate::settings::load_root_dir(&app_state.pool).await?;
     // PTY spawn 是阻塞操作，丢到 blocking 池
-    let sid = session_id_for_spawn(state_inner, space_id, cwd, cols, rows, on_event).await?;
+    let sid =
+        session_id_for_spawn(state_inner, space_id, cwd, root_dir, cols, rows, on_event).await?;
     Ok(sid)
 }
 
@@ -386,6 +416,7 @@ async fn session_id_for_spawn(
     state: &TerminalState,
     space_id: Option<String>,
     cwd: Option<String>,
+    root_dir: Option<String>,
     cols: u16,
     rows: u16,
     channel: Channel<TerminalEvent>,
@@ -395,7 +426,7 @@ async fn session_id_for_spawn(
     let sessions = state.sessions.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let tmp_state = TerminalState { sessions };
-        create(&tmp_state, space_id, cwd, cols, rows, channel)
+        create(&tmp_state, space_id, cwd, root_dir, cols, rows, channel)
     })
     .await
     .map_err(|e| AppError::io(format!("spawn_blocking 失败: {}", e)))?
@@ -566,5 +597,24 @@ mod tests {
         let p = resolve_cwd(Some("/nonexistent-xyz-123".into()), None);
         assert!(p.is_dir());
         assert_ne!(p.to_string_lossy(), "/nonexistent-xyz-123");
+    }
+
+    /// resolve_cwd：显式 cwd 优先于 root_dir；显式非法时用 root_dir。
+    #[test]
+    fn cwd_root_dir_priority() {
+        let root = std::env::temp_dir();
+        let root_str = root.to_string_lossy().to_string();
+
+        // 显式合法 → 用显式
+        let explicit = dirs::home_dir().unwrap();
+        let p = resolve_cwd(
+            Some(explicit.to_string_lossy().to_string()),
+            Some(&root_str),
+        );
+        assert_eq!(p, explicit);
+
+        // 显式非法 + root_dir 合法 → 用 root_dir（而非 home）
+        let p = resolve_cwd(Some("/nonexistent-xyz-123".into()), Some(&root_str));
+        assert_eq!(p, root);
     }
 }

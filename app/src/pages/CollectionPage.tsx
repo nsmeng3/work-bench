@@ -6,7 +6,6 @@ import type { Collection, Space } from "../api";
 import { collectionList, collectionArchive, collectionRestore, toApiError } from "../api";
 import { CollectionDialog } from "../components/CollectionDialog";
 import { TodoListPanel } from "../components/TodoListPanel";
-import { TerminalPanel } from "../components/TerminalPanel";
 
 type StatusFilter = "active" | "archived";
 
@@ -26,8 +25,8 @@ export function CollectionPage({ space, onBack, onEnterCollection }: CollectionP
   const [collections, setCollections] = useState<Collection[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("active");
-  /** M7-2 · 顶部 Tabs：资源集（默认）/ 待办 / 终端（M7-4） */
-  const [tab, setTab] = useState<"collections" | "todos" | "terminal">("collections");
+  /** M7-2 · 顶部 Tabs：资源集（默认）/ 待办 */
+  const [tab, setTab] = useState<"collections" | "todos">("collections");
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingCollection, setEditingCollection] = useState<Collection | undefined>(undefined);
@@ -241,7 +240,7 @@ export function CollectionPage({ space, onBack, onEnterCollection }: CollectionP
 
       <Tabs
         activeKey={tab}
-        onChange={(k) => setTab(k as "collections" | "todos" | "terminal")}
+        onChange={(k) => setTab(k as "collections" | "todos")}
         items={[
           {
             key: "collections",
@@ -270,13 +269,6 @@ export function CollectionPage({ space, onBack, onEnterCollection }: CollectionP
             key: "todos",
             label: "待办",
             children: <TodoListPanel spaceId={space.id} />,
-          },
-          {
-            key: "terminal",
-            label: "终端",
-            // M7-4 · 终端面板：forceRender 保证切走时不销毁 PTY 会话
-            forceRender: true,
-            children: <TerminalPanel spaceId={space.id} spaceName={space.name} />,
           },
         ]}
       />

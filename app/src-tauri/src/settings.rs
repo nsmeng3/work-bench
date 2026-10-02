@@ -53,7 +53,7 @@ pub struct InitRootDirResult {
 // ============================================================
 
 /// 从 `settings` 表读取根目录路径。
-async fn load_root_dir(pool: &SqlitePool) -> CmdResult<Option<String>> {
+pub(crate) async fn load_root_dir(pool: &SqlitePool) -> CmdResult<Option<String>> {
     let row = sqlx::query("SELECT value_json FROM settings WHERE key = ?")
         .bind(ROOT_DIR_KEY)
         .fetch_optional(pool)
