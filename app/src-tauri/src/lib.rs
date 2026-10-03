@@ -34,6 +34,25 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // m8-8.1 · 全局快捷键（快速记录 todo）
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    use tauri::{Emitter, Manager};
+                    use tauri_plugin_global_shortcut::ShortcutState;
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    // 唤起主窗口并通知前端打开快速记录弹窗
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.show();
+                        let _ = win.unminimize();
+                        let _ = win.set_focus();
+                    }
+                    let _ = app.emit("quick-capture", ());
+                })
+                .build(),
+        )
         .setup(|app| {
             use tauri::Manager;
 
@@ -62,6 +81,20 @@ pub fn run() {
 
             // m7-7.4 · 内嵌终端：全局 PTY 会话表
             app.manage(terminal::TerminalState::new());
+
+            // m8-8.1 · 注册全局快捷键 Cmd/Ctrl+Shift+T。
+            // 被占用或平台不支持时仅告警，应用照常可用（应用内按钮兜底）。
+            {
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+                match "CmdOrControl+Shift+T".parse::<Shortcut>() {
+                    Ok(shortcut) => {
+                        if let Err(e) = app.global_shortcut().register(shortcut) {
+                            eprintln!("[startup] 注册全局快捷键失败: {}", e);
+                        }
+                    }
+                    Err(e) => eprintln!("[startup] 快捷键解析失败: {}", e),
+                }
+            }
 
             // m5-5.1 · 启动目录监听器（详细设计 §5.2）。
             // 事件通道先建 256 缓冲；上层消费者（5.2 忽略规则 / 5.3 聚合窗口）后续接入。

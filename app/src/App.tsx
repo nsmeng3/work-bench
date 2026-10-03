@@ -15,6 +15,8 @@ import {
 import { AppShell } from "./components/AppShell";
 import type { NavItem } from "./components/AppShell";
 import { InboxNotification } from "./components/InboxNotification";
+import { QuickCaptureDialog } from "./components/QuickCaptureDialog";
+import { listen } from "@tauri-apps/api/event";
 import { DashboardPage } from "./pages/DashboardPage";
 import { SpacePage } from "./pages/SpacePage";
 import { CollectionPage } from "./pages/CollectionPage";
@@ -60,6 +62,8 @@ function App() {
   const [currentCollection, setCurrentCollection] = useState<Collection | null>(null);
   /** m7-7.6 · 待终端页消费的打开请求（资源"在内嵌终端打开"带 cwd） */
   const [terminalRequest, setTerminalRequest] = useState<TerminalOpenRequest | null>(null);
+  /** m8-8.1 · 快速记录弹窗（全局快捷键唤起） */
+  const [quickCaptureOpen, setQuickCaptureOpen] = useState(false);
 
   /** 收件箱统计：5s 轮询；同时驱动角标与合并通知（m5-5.8） */
   const statsReady = phase.kind === "ready" && phase.initialized;
@@ -89,6 +93,14 @@ function App() {
    * M7-3：初始化完成后再读 settings_get_default_home，决定启动默认页
    * （dashboard / spaces）。读取失败静默回退 dashboard。
    */
+  // m8-8.1 · 全局快捷键 → 打开快速记录弹窗
+  useEffect(() => {
+    const unlisten = listen("quick-capture", () => setQuickCaptureOpen(true));
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -216,6 +228,10 @@ function App() {
               pending={inboxPending}
               prevPending={inboxPrevPending}
               onGoInbox={() => handleNavChange("inbox")}
+            />
+            <QuickCaptureDialog
+              open={quickCaptureOpen}
+              onClose={() => setQuickCaptureOpen(false)}
             />
             {activeNav === "dashboard" && (
               <DashboardPage
