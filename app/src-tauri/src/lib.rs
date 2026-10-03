@@ -67,10 +67,6 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
 
-            // 纯菜单栏应用：隐藏 Dock 图标与 Cmd+Tab 入口（窗口显隐走托盘）。
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-
             // 状态栏驻留：托盘图标 + 精简菜单（显示主窗口 / 退出），失败降级为「无托盘」。
             if let Err(e) = tray::setup_tray(app) {
                 eprintln!("[startup] 创建系统托盘失败: {}", e);
@@ -324,6 +320,12 @@ pub fn run() {
                             let _ = w.hide();
                         }
                     }
+                }
+                // macOS：窗口隐藏后点击 Dock 图标 → 重新显示主窗口
+                // （Dock 图标可见时的必备配套，否则点了没反应；变体仅 macOS 存在）
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen { .. } => {
+                    tray::show_main_window(app_handle);
                 }
                 // m7-7.4 · 应用退出时回收所有 PTY 子进程
                 tauri::RunEvent::ExitRequested { .. } => {
