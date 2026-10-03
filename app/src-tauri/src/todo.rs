@@ -45,6 +45,9 @@ pub struct Todo {
     /// NULL 表示全局 todo
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_id: Option<String>,
+    /// m8-8.5 · NULL 表示不属于任何资源集（资源集级 todo）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collection_id: Option<String>,
     /// 0 普通 / 1 重要 / 2 紧急
     pub priority: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,6 +77,8 @@ pub struct TodoCreateInput {
     pub title: String,
     pub note: Option<String>,
     pub space_id: Option<String>,
+    /// m8-8.5 · 资源集级 todo：挂到指定 collection
+    pub collection_id: Option<String>,
     pub priority: Option<i64>,
     pub due_at: Option<i64>,
 }
@@ -98,6 +103,9 @@ pub struct TodoPatch {
     pub note: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     pub space_id: Option<Option<String>>,
+    /// m8-8.5 · 资源集归属（Some(None) = 解除挂载）
+    #[serde(default, deserialize_with = "double_option")]
+    pub collection_id: Option<Option<String>>,
     pub priority: Option<i64>,
     #[serde(default, deserialize_with = "double_option")]
     pub due_at: Option<Option<i64>>,
@@ -167,6 +175,7 @@ fn row_to_todo(row: &sqlx::sqlite::SqliteRow) -> Result<Todo, sqlx::Error> {
         note: row.try_get("note")?,
         status: row.try_get("status")?,
         space_id: row.try_get("space_id")?,
+        collection_id: row.try_get("collection_id")?,
         priority: row.try_get("priority")?,
         due_at: row.try_get("due_at")?,
         done_at: row.try_get("done_at")?,
@@ -178,7 +187,7 @@ fn row_to_todo(row: &sqlx::sqlite::SqliteRow) -> Result<Todo, sqlx::Error> {
 
 async fn fetch_todo(pool: &SqlitePool, id: &str) -> CmdResult<Todo> {
     let row = sqlx::query(
-        "SELECT id, title, note, status, space_id, priority, due_at, done_at, \
+        "SELECT id, title, note, status, space_id, collection_id, priority, due_at, done_at, \
                 sort_order, created_at, updated_at \
          FROM todo WHERE id = ?",
     )
@@ -255,6 +264,17 @@ async fn ensure_space_exists(pool: &SqlitePool, space_id: &str) -> CmdResult<()>
     Ok(())
 }
 
+/// m8-8.5 · 校验资源集存在。
+async fn ensure_collection_exists(pool: &SqlitePool, collection_id: &str) -> CmdResult<()> {
+    sqlx::query("SELECT id FROM collection WHERE id = ?")
+        .bind(collection_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found(format!("资源集不存在: {}", collection_id)))?;
+    Ok(())
+}
+
 /// 校验引用存在。
 async fn ensure_reference_exists(pool: &SqlitePool, ref_id: &str) -> CmdResult<()> {
     sqlx::query("SELECT id FROM resource_reference WHERE id = ?")
@@ -281,6 +301,7 @@ pub async fn list(
     space_id: Option<String>,
     status: Option<String>,
     include_done: Option<bool>,
+    collection_id: Option<String>,
 ) -> CmdResult<Vec<Todo>> {
     // 解析 status 过滤
     let status_filter: Option<String> = match (status.as_deref(), include_done) {
@@ -300,7 +321,7 @@ pub async fn list(
     };
 
     let mut sql = String::from(
-        "SELECT id, title, note, status, space_id, priority, due_at, done_at, \
+        "SELECT id, title, note, status, space_id, collection_id, priority, due_at, done_at, \
                 sort_order, created_at, updated_at FROM todo WHERE 1=1",
     );
     let mut binds: Vec<String> = Vec::new();
@@ -312,6 +333,12 @@ pub async fn list(
             sql.push_str(" AND space_id = ?");
             binds.push(s.clone());
         }
+    }
+
+    // m8-8.5 · 资源集过滤（与 space 过滤可叠加）
+    if let Some(ref cid) = collection_id {
+        sql.push_str(" AND collection_id = ?");
+        binds.push(cid.clone());
     }
 
     match &status_filter {
@@ -351,18 +378,22 @@ pub async fn create(pool: &SqlitePool, input: TodoCreateInput) -> CmdResult<Todo
     if let Some(ref sid) = input.space_id {
         ensure_space_exists(pool, sid).await?;
     }
+    if let Some(ref cid) = input.collection_id {
+        ensure_collection_exists(pool, cid).await?;
+    }
 
     let id = Uuid::new_v4().to_string();
     let now = now_unix();
     sqlx::query(
-        "INSERT INTO todo (id, title, note, status, space_id, priority, due_at, \
+        "INSERT INTO todo (id, title, note, status, space_id, collection_id, priority, due_at, \
                           done_at, sort_order, created_at, updated_at) \
-         VALUES (?, ?, ?, 'pending', ?, ?, ?, NULL, 0, ?, ?)",
+         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, NULL, 0, ?, ?)",
     )
     .bind(&id)
     .bind(input.title.trim())
     .bind(&input.note)
     .bind(&input.space_id)
+    .bind(&input.collection_id)
     .bind(input.priority.unwrap_or(0))
     .bind(input.due_at)
     .bind(now)
@@ -386,6 +417,9 @@ pub async fn update(pool: &SqlitePool, id: String, patch: TodoPatch) -> CmdResul
     if let Some(Some(ref sid)) = patch.space_id {
         ensure_space_exists(pool, sid).await?;
     }
+    if let Some(Some(ref cid)) = patch.collection_id {
+        ensure_collection_exists(pool, cid).await?;
+    }
 
     let new_title = patch
         .title
@@ -401,6 +435,10 @@ pub async fn update(pool: &SqlitePool, id: String, patch: TodoPatch) -> CmdResul
         None => existing.space_id.clone(),
         Some(inner) => inner.clone(),
     };
+    let new_collection_id = match &patch.collection_id {
+        None => existing.collection_id.clone(),
+        Some(inner) => inner.clone(),
+    };
     let new_priority = patch.priority.unwrap_or(existing.priority);
     let new_due_at = match &patch.due_at {
         None => existing.due_at,
@@ -410,13 +448,14 @@ pub async fn update(pool: &SqlitePool, id: String, patch: TodoPatch) -> CmdResul
     let now = now_unix();
 
     sqlx::query(
-        "UPDATE todo SET title = ?, note = ?, space_id = ?, priority = ?, \
+        "UPDATE todo SET title = ?, note = ?, space_id = ?, collection_id = ?, priority = ?, \
                         due_at = ?, sort_order = ?, updated_at = ? \
          WHERE id = ?",
     )
     .bind(&new_title)
     .bind(&new_note)
     .bind(&new_space_id)
+    .bind(&new_collection_id)
     .bind(new_priority)
     .bind(new_due_at)
     .bind(new_sort_order)
@@ -541,7 +580,7 @@ pub async fn unlink_ref(pool: &SqlitePool, todo_id: String, ref_id: String) -> C
 pub async fn list_by_ref(pool: &SqlitePool, ref_id: String) -> CmdResult<Vec<Todo>> {
     ensure_reference_exists(pool, &ref_id).await?;
     let rows = sqlx::query(
-        "SELECT t.id, t.title, t.note, t.status, t.space_id, t.priority, t.due_at, t.done_at, \
+        "SELECT t.id, t.title, t.note, t.status, t.space_id, t.collection_id, t.priority, t.due_at, t.done_at, \
                 t.sort_order, t.created_at, t.updated_at \
          FROM todo_ref_link l \
          JOIN todo t ON t.id = l.todo_id \
@@ -568,7 +607,7 @@ pub async fn list_by_ref(pool: &SqlitePool, ref_id: String) -> CmdResult<Vec<Tod
 /// - 固定 LIMIT 20（Dashboard 首页只展示前几条，避免一次拉全量）。
 pub async fn today(pool: &SqlitePool) -> CmdResult<Vec<Todo>> {
     let rows = sqlx::query(
-        "SELECT id, title, note, status, space_id, priority, due_at, done_at, \
+        "SELECT id, title, note, status, space_id, collection_id, priority, due_at, done_at, \
                 sort_order, created_at, updated_at \
          FROM todo \
          WHERE status IN ('pending','doing') \
@@ -593,8 +632,9 @@ pub async fn todo_list(
     space_id: Option<String>,
     status: Option<String>,
     include_done: Option<bool>,
+    collection_id: Option<String>,
 ) -> CmdResult<Vec<Todo>> {
-    list(&state.pool, space_id, status, include_done).await
+    list(&state.pool, space_id, status, include_done, collection_id).await
 }
 
 #[tauri::command]
@@ -725,6 +765,7 @@ mod tests {
             title: title.to_string(),
             note: None,
             space_id: None,
+            collection_id: None,
             priority: None,
             due_at: None,
         }
@@ -754,6 +795,7 @@ mod tests {
             title: "评审 PR #42".into(),
             note: Some("关注性能".into()),
             space_id: Some(PRESET_SPACE.into()),
+            collection_id: None,
             priority: Some(2),
             due_at: Some(1_800_000_000),
         };
@@ -838,6 +880,7 @@ mod tests {
             title: "原标题".into(),
             note: Some("原备注".into()),
             space_id: Some(PRESET_SPACE.into()),
+            collection_id: None,
             priority: Some(1),
             due_at: Some(123),
         })
@@ -866,6 +909,7 @@ mod tests {
                 title: Some("new".into()),
                 note: Some(Some("备注".into())),
                 space_id: Some(Some(PRESET_SPACE.into())),
+                collection_id: None,
                 priority: Some(2),
                 due_at: Some(Some(999)),
                 sort_order: Some(5),
@@ -888,6 +932,7 @@ mod tests {
             title: "t".into(),
             note: Some("n".into()),
             space_id: Some(PRESET_SPACE.into()),
+            collection_id: None,
             priority: None,
             due_at: Some(42),
         })
@@ -901,6 +946,7 @@ mod tests {
             TodoPatch {
                 note: Some(None),
                 space_id: Some(None),
+                collection_id: None,
                 due_at: Some(None),
                 ..Default::default()
             },
@@ -1165,6 +1211,7 @@ mod tests {
             title: "x".into(),
             note: None,
             space_id: Some("sp_tmp".into()),
+            collection_id: None,
             priority: None,
             due_at: None,
         })
@@ -1240,7 +1287,7 @@ mod tests {
         let _t2 = create(&pool, minimal_input("pending-2")).await.expect("c");
         set_status(&pool, t1.id.clone(), "done".into()).await.expect("done");
 
-        let list = list(&pool, None, None, None).await.expect("list");
+        let list = list(&pool, None, None, None, None).await.expect("list");
         assert_eq!(list.len(), 1, "默认仅 pending+doing");
         assert_eq!(list[0].title, "pending-2");
     }
@@ -1252,7 +1299,7 @@ mod tests {
         let _t2 = create(&pool, minimal_input("b")).await.expect("c");
         set_status(&pool, t1.id.clone(), "done".into()).await.expect("done");
 
-        let list = list(&pool, None, Some("all".into()), None)
+        let list = list(&pool, None, Some("all".into()), None, None)
             .await
             .expect("list");
         assert_eq!(list.len(), 2);
@@ -1266,23 +1313,98 @@ mod tests {
             title: "work".into(),
             note: None,
             space_id: Some(PRESET_SPACE.into()),
+            collection_id: None,
             priority: None,
             due_at: None,
         })
         .await
         .expect("w");
 
-        let work = list(&pool, Some(PRESET_SPACE.into()), None, None)
+        let work = list(&pool, Some(PRESET_SPACE.into()), None, None, None)
             .await
             .expect("list");
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].title, "work");
 
-        let global = list(&pool, Some("global".into()), None, None)
+        let global = list(&pool, Some("global".into()), None, None, None)
             .await
             .expect("list");
         assert_eq!(global.len(), 1);
         assert_eq!(global[0].title, "global");
+    }
+
+    /// m8-8.5 · 资源集级 todo：创建 + 过滤 + 资源集删除后降级为无归属。
+    #[tokio::test]
+    async fn todo_collection_create_and_filter() {
+        let pool = setup().await;
+        insert_collection(&pool, "c1").await;
+        insert_collection(&pool, "c2").await;
+
+        create(&pool, TodoCreateInput {
+            title: "col todo".into(),
+            note: None,
+            space_id: None,
+            collection_id: Some("c1".into()),
+            priority: None,
+            due_at: None,
+        })
+        .await
+        .expect("c1 todo");
+        create(&pool, TodoCreateInput {
+            title: "other".into(),
+            note: None,
+            space_id: None,
+            collection_id: Some("c2".into()),
+            priority: None,
+            due_at: None,
+        })
+        .await
+        .expect("c2 todo");
+        create(&pool, minimal_input("no col")).await.expect("plain");
+
+        let c1_list = list(&pool, None, Some("all".into()), None, Some("c1".into()))
+            .await
+            .expect("list c1");
+        assert_eq!(c1_list.len(), 1);
+        assert_eq!(c1_list[0].title, "col todo");
+        assert_eq!(c1_list[0].collection_id.as_deref(), Some("c1"));
+
+        // 挂到不存在的资源集 → not_found
+        let err = create(&pool, TodoCreateInput {
+            title: "bad".into(),
+            note: None,
+            space_id: None,
+            collection_id: Some("no-such".into()),
+            priority: None,
+            due_at: None,
+        })
+        .await;
+        assert!(err.is_err());
+    }
+
+    /// m8-8.5 · 资源集删除时 todo.collection_id 置空（ON DELETE SET NULL）。
+    #[tokio::test]
+    async fn todo_collection_delete_sets_null() {
+        let pool = setup().await;
+        insert_collection(&pool, "c1").await;
+        let t = create(&pool, TodoCreateInput {
+            title: "col todo".into(),
+            note: None,
+            space_id: None,
+            collection_id: Some("c1".into()),
+            priority: None,
+            due_at: None,
+        })
+        .await
+        .expect("create");
+
+        sqlx::query("DELETE FROM collection WHERE id = 'c1'")
+            .execute(&pool)
+            .await
+            .expect("delete collection");
+
+        let after = get(&pool, t.id).await.expect("get").todo;
+        assert_eq!(after.collection_id, None);
     }
 
     #[tokio::test]
@@ -1292,7 +1414,7 @@ mod tests {
         let _t2 = create(&pool, minimal_input("b")).await.expect("c");
         set_status(&pool, t1.id.clone(), "done".into()).await.expect("done");
 
-        let dones = list(&pool, None, Some("done".into()), None)
+        let dones = list(&pool, None, Some("done".into()), None, None)
             .await
             .expect("list");
         assert_eq!(dones.len(), 1);
@@ -1302,7 +1424,7 @@ mod tests {
     #[tokio::test]
     async fn todo_list_err_invalid_status() {
         let pool = setup().await;
-        let err = list(&pool, None, Some("weird".into()), None)
+        let err = list(&pool, None, Some("weird".into()), None, None)
             .await
             .expect_err("invalid");
         assert_eq!(err.code, "COMMON_INVALID_PARAM");
@@ -1371,6 +1493,7 @@ mod tests {
             title: "低优先级无截止".into(),
             note: None,
             space_id: None,
+            collection_id: None,
             priority: Some(0),
             due_at: None,
         })
@@ -1380,6 +1503,7 @@ mod tests {
             title: "高优先级晚截止".into(),
             note: None,
             space_id: None,
+            collection_id: None,
             priority: Some(2),
             due_at: Some(2_000_000_000),
         })
@@ -1389,6 +1513,7 @@ mod tests {
             title: "高优先级早截止".into(),
             note: None,
             space_id: None,
+            collection_id: None,
             priority: Some(2),
             due_at: Some(1_000_000_000),
         })
@@ -1398,6 +1523,7 @@ mod tests {
             title: "高优先级无截止".into(),
             note: None,
             space_id: None,
+            collection_id: None,
             priority: Some(2),
             due_at: None,
         })

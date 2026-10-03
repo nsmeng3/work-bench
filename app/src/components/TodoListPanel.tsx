@@ -23,6 +23,7 @@ import {
   ReloadOutlined,
 } from "@ant-design/icons";
 import type {
+  Collection,
   Reference,
   Space,
   Todo,
@@ -32,6 +33,7 @@ import type {
   TodoWithRefs,
 } from "../api";
 import {
+  collectionList,
   spaceList,
   todoCreate,
   todoDelete,
@@ -87,13 +89,17 @@ function formatShortDate(ts?: number): string {
 export interface TodoListPanelProps {
   /** 锁定空间：传入时仅显示该空间 todo，新建 todo 自动带上 spaceId */
   spaceId?: string;
+  /** m8-8.5 · 锁定资源集：传入时仅显示该资源集 todo，新建自动带上 collectionId */
+  collectionId?: string;
+  /** 锁定资源集时用于行内标签展示 */
+  collectionName?: string;
   /** 可选：外部传入可选空间列表（缺省时组件自行加载） */
   spaces?: Space[];
   /** 点击引用跳转（可选） */
   onOpenReference?: (ref: Reference) => void;
 }
 
-export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: TodoListPanelProps) {
+export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: spacesProp, onOpenReference }: TodoListPanelProps) {
   const [todos, setTodos] = useState<Todo[]>([]);
   const [doneTodos, setDoneTodos] = useState<Todo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -113,10 +119,13 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
     title: string;
     note?: string;
     spaceId?: string | null;
+    collectionId?: string | null;
     priority: TodoPriority;
     dueAt?: { unix(): number } | null;
     status: TodoStatus;
   }>();
+  /** m8-8.5 · 详情抽屉的资源集选项（随所选空间联动加载） */
+  const [collectionOptions, setCollectionOptions] = useState<Collection[]>([]);
 
   const [messageApi, messageContextHolder] = message.useMessage();
 
@@ -157,8 +166,8 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
   const fetchTodos = useCallback(async () => {
     setLoading(true);
     try {
-      const active = await todoList({ spaceId: effectiveSpaceId });
-      const finished = await todoList({ spaceId: effectiveSpaceId, status: "all" });
+      const active = await todoList({ spaceId: effectiveSpaceId, collectionId });
+      const finished = await todoList({ spaceId: effectiveSpaceId, collectionId, status: "all" });
       setTodos(active);
       setDoneTodos(finished.filter((t) => t.status === "done" || t.status === "cancelled"));
     } catch (err) {
@@ -167,7 +176,7 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
     } finally {
       setLoading(false);
     }
-  }, [effectiveSpaceId, messageApi]);
+  }, [effectiveSpaceId, collectionId, messageApi]);
 
   useEffect(() => {
     fetchTodos();
@@ -186,6 +195,7 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
         spaceId:
           spaceId ??
           (spaceFilter !== "all" && spaceFilter !== "global" ? spaceFilter : undefined),
+        collectionId,
       });
       setQuickTitle("");
       messageApi.success({ content: "已添加", duration: 1.5 });
@@ -222,6 +232,7 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
         title: d.title,
         note: d.note,
         spaceId: d.spaceId ?? null,
+        collectionId: d.collectionId ?? null,
         priority: d.priority,
         dueAt: d.dueAt ? ({ unix: () => d.dueAt! } as { unix(): number }) : null,
         status: d.status,
@@ -260,6 +271,7 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
       title: values.title.trim(),
       note: values.note?.trim() ? values.note.trim() : null,
       spaceId: values.spaceId ?? null,
+      collectionId: values.collectionId ?? null,
       priority: values.priority,
       dueAt: values.dueAt ? values.dueAt.unix() : null,
       };
@@ -290,6 +302,31 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
       messageApi.error({ content: apiErr.message, duration: 3 });
     }
   }
+
+  /* ---------------- m8-8.5 · 详情抽屉资源集联动 ---------------- */
+
+  /** 表单中当前选中的空间（详情抽屉打开时生效） */
+  const formSpaceId = Form.useWatch("spaceId", detailForm);
+
+  useEffect(() => {
+    if (!detailId) return;
+    if (!formSpaceId) {
+      setCollectionOptions([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await collectionList({ spaceId: formSpaceId, status: "active" });
+        if (!cancelled) setCollectionOptions(list);
+      } catch (err) {
+        console.warn("加载资源集列表失败：", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [formSpaceId, detailId]);
 
   /* ---------------- 挂载 / 卸载引用 ---------------- */
 
@@ -383,7 +420,11 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
             </Text>
           )}
           <TodoRefCount todoId={todo.id} />
-          {spaceName ? (
+          {collectionId ? (
+            <Tag color="purple" style={{ marginInlineEnd: 0 }}>
+              {collectionName ?? "资源集"}
+            </Tag>
+          ) : spaceName ? (
             <Tag color="blue" style={{ marginInlineEnd: 0 }}>
               {spaceName}
             </Tag>
@@ -433,11 +474,13 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
       <AntSpace.Compact style={{ width: "100%", marginBottom: 12 }}>
         <Input
           placeholder={
-            spaceId
-              ? "回车快速添加（归属当前空间）"
-              : spaceFilter !== "all" && spaceFilter !== "global"
-                ? `回车快速添加到「${spaceNameById.get(spaceFilter) ?? spaceFilter}」`
-                : "回车快速添加（默认全局）"
+            collectionId
+              ? `回车快速添加（归属资源集「${collectionName ?? ""}」）`
+              : spaceId
+                ? "回车快速添加（归属当前空间）"
+                : spaceFilter !== "all" && spaceFilter !== "global"
+                  ? `回车快速添加到「${spaceNameById.get(spaceFilter) ?? spaceFilter}」`
+                  : "回车快速添加（默认全局）"
           }
           value={quickTitle}
           onChange={(e) => setQuickTitle(e.target.value)}
@@ -541,6 +584,15 @@ export function TodoListPanel({ spaceId, spaces: spacesProp, onOpenReference }: 
                   allowClear
                   placeholder="全局（不挂空间）"
                   options={spaces.map((s) => ({ value: s.id, label: s.name }))}
+                  onChange={() => detailForm.setFieldValue("collectionId", null)}
+                />
+              </Form.Item>
+              <Form.Item name="collectionId" label="所属资源集">
+                <Select
+                  allowClear
+                  placeholder={formSpaceId ? "不挂资源集" : "先选择空间"}
+                  disabled={!formSpaceId}
+                  options={collectionOptions.map((c) => ({ value: c.id, label: c.name }))}
                 />
               </Form.Item>
               <Form.Item name="dueAt" label="截止时间">

@@ -60,6 +60,7 @@ import { ReferenceTodoPanel } from "../components/ReferenceTodoPanel";
 import { DispositionButtons } from "../components/DispositionButtons";
 import type { DispositionAction } from "../components/DispositionButtons";
 import { DispositionConfirmDialog } from "../components/DispositionConfirmDialog";
+import { TodoListPanel } from "../components/TodoListPanel";
 import { UndoImportDialog } from "../components/UndoImportDialog";
 
 const { Text, Paragraph } = Typography;
@@ -625,6 +626,12 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
               (t) => (detail.referencesByType[t] ?? []).length > 0,
             )}
           />
+
+          {/* m8-8.5 · 资源集级待办 */}
+          <div style={{ marginTop: 24 }}>
+            <h2 style={{ fontSize: 16, marginBottom: 12 }}>待办</h2>
+            <TodoListPanel collectionId={collection.id} collectionName={collection.name} />
+          </div>
         </>
       ) : (
         <Empty description="未加载到资源集详情" />

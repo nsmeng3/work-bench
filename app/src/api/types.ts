@@ -662,6 +662,8 @@ export interface Todo {
   note?: string;
   status: TodoStatus;
   spaceId?: string;
+  /** m8-8.5 · 资源集级 todo：挂载的资源集 id */
+  collectionId?: string;
   priority: TodoPriority;
   dueAt?: number;
   doneAt?: number;
@@ -680,6 +682,8 @@ export interface TodoCreateInput {
   title: string;
   note?: string;
   spaceId?: string;
+  /** m8-8.5 · 挂到指定资源集 */
+  collectionId?: string;
   priority?: TodoPriority;
   dueAt?: number;
 }
@@ -695,6 +699,8 @@ export interface TodoPatch {
   title?: string;
   note?: string | null;
   spaceId?: string | null;
+  /** m8-8.5 · 资源集归属：null = 解除挂载 */
+  collectionId?: string | null;
   priority?: TodoPriority;
   dueAt?: number | null;
   sortOrder?: number;
@@ -704,6 +710,8 @@ export interface TodoPatch {
 export interface TodoListInput {
   /** 缺省 = 全部；传 "global" 仅返回全局 todo（space_id IS NULL） */
   spaceId?: string;
+  /** m8-8.5 · 按资源集过滤（与 spaceId 可叠加） */
+  collectionId?: string;
   /** 缺省 = 仅 pending+doing；传 "all" 返回全部；传具体状态值按该状态过滤 */
   status?: TodoStatus | "all";
   /** 兼容参数：true 等价于 status="all" */
