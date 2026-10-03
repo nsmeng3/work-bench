@@ -80,9 +80,10 @@ function formatShortDate(ts?: number): string {
 /**
  * 待办列表面板（受控组件）。
  *
- * - `spaceId` 传入时锁定该空间（用于空间详情页"待办" tab）；
- *   缺省时显示筛选下拉（全部 / 全局 / 各空间）。
- * - 快速输入框：回车即创建（默认全局，除非 `spaceId` 锁定）。
+ * - `spaceId` / `collectionId` 传入时锁定归属（空间/资源集详情页）；
+ *   缺省时显示筛选下拉（全部 / 全局 / 各空间 / 各资源集）。
+ * - 快速输入框：回车即创建，归属跟随锁定值或当前筛选。
+ * - 行内标签：资源集（紫）> 空间（蓝）> 全局；空间随资源集自动派生。
  * - 每行：checkbox 切 done、标题、挂载资源数 icon、所属空间 tag。
  * - 已完成 / 已取消默认收起到底部分组。
  */
@@ -104,8 +105,12 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
   const [doneTodos, setDoneTodos] = useState<Todo[]>([]);
   const [loading, setLoading] = useState(true);
   const [spaces, setSpaces] = useState<Space[]>(spacesProp ?? []);
+  /** m8-8.5 · 非锁定时加载全部资源集（筛选下拉 + 行内标签用） */
+  const [collections, setCollections] = useState<Collection[]>([]);
   /** 仅当未锁定 spaceId 时生效：筛选下拉（"all" | "global" | spaceId） */
   const [spaceFilter, setSpaceFilter] = useState<string>("all");
+  /** 仅当未锁定 collectionId 时生效：资源集筛选（"all" | collectionId） */
+  const [collectionFilter, setCollectionFilter] = useState<string>("all");
 
   const [quickTitle, setQuickTitle] = useState("");
   const [creating, setCreating] = useState(false);
@@ -139,7 +144,15 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
     (async () => {
       try {
         const list = await spaceList({ status: "active" });
-        if (!cancelled) setSpaces(list);
+        if (cancelled) return;
+        setSpaces(list);
+        // 加载资源集名（筛选下拉 + 行内标签；锁定资源集时用 collectionName 兜底）
+        if (!collectionId) {
+          const cols = await Promise.all(
+            list.map((s) => collectionList({ spaceId: s.id, status: "active" })),
+          );
+          if (!cancelled) setCollections(cols.flat());
+        }
       } catch (err) {
         console.warn("加载空间列表失败：", err);
       }
@@ -147,7 +160,7 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
     return () => {
       cancelled = true;
     };
-  }, [spacesProp]);
+  }, [spacesProp, collectionId]);
 
   const spaceNameById = useMemo(() => {
     const m = new Map<string, string>();
@@ -155,7 +168,13 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
     return m;
   }, [spaces]);
 
-  /** 当前生效的 spaceId 过滤（锁定优先） */
+  const collectionNameById = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const c of collections) m.set(c.id, c.name);
+    return m;
+  }, [collections]);
+
+  /** 当前生效的 spaceId 过滤（锁定优先；资源集筛选生效时空间由后端派生，无需传） */
   const effectiveSpaceId: string | undefined = useMemo(() => {
     if (spaceId) return spaceId;
     if (spaceFilter === "all") return undefined;
@@ -163,11 +182,17 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
     return spaceFilter;
   }, [spaceId, spaceFilter]);
 
+  /** 当前生效的 collectionId 过滤（锁定优先） */
+  const effectiveCollectionId: string | undefined = useMemo(() => {
+    if (collectionId) return collectionId;
+    return collectionFilter !== "all" ? collectionFilter : undefined;
+  }, [collectionId, collectionFilter]);
+
   const fetchTodos = useCallback(async () => {
     setLoading(true);
     try {
-      const active = await todoList({ spaceId: effectiveSpaceId, collectionId });
-      const finished = await todoList({ spaceId: effectiveSpaceId, collectionId, status: "all" });
+      const active = await todoList({ spaceId: effectiveSpaceId, collectionId: effectiveCollectionId });
+      const finished = await todoList({ spaceId: effectiveSpaceId, collectionId: effectiveCollectionId, status: "all" });
       setTodos(active);
       setDoneTodos(finished.filter((t) => t.status === "done" || t.status === "cancelled"));
     } catch (err) {
@@ -176,7 +201,7 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
     } finally {
       setLoading(false);
     }
-  }, [effectiveSpaceId, collectionId, messageApi]);
+  }, [effectiveSpaceId, effectiveCollectionId, messageApi]);
 
   useEffect(() => {
     fetchTodos();
@@ -191,11 +216,12 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
     try {
       await todoCreate({
         title,
-        // 锁定时使用锁定空间；否则使用筛选值（all → 全局；global → 全局；其他 → 该空间）
-        spaceId:
-          spaceId ??
-          (spaceFilter !== "all" && spaceFilter !== "global" ? spaceFilter : undefined),
-        collectionId,
+        // 归属：锁定的空间/资源集 > 当前筛选（选了资源集时空间由后端派生）
+        spaceId: effectiveCollectionId
+          ? undefined
+          : spaceId ??
+            (spaceFilter !== "all" && spaceFilter !== "global" ? spaceFilter : undefined),
+        collectionId: effectiveCollectionId,
       });
       setQuickTitle("");
       messageApi.success({ content: "已添加", duration: 1.5 });
@@ -427,9 +453,9 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
             </Text>
           )}
           <TodoRefCount todoId={todo.id} />
-          {collectionId ? (
+          {todo.collectionId ? (
             <Tag color="purple" style={{ marginInlineEnd: 0 }}>
-              {collectionName ?? "资源集"}
+              {collectionNameById.get(todo.collectionId) ?? collectionName ?? "资源集"}
             </Tag>
           ) : spaceName ? (
             <Tag color="blue" style={{ marginInlineEnd: 0 }}>
@@ -459,17 +485,41 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
         }}
       >
         <AntSpace>
-          {!spaceId && (
-            <Select
-              value={spaceFilter}
-              onChange={setSpaceFilter}
-              style={{ minWidth: 160 }}
-              options={[
-                { value: "all", label: "全部空间" },
-                { value: "global", label: "仅全局" },
-                ...spaces.map((s) => ({ value: s.id, label: s.name })),
-              ]}
-            />
+          {!spaceId && !collectionId && (
+            <>
+              <Select
+                value={spaceFilter}
+                onChange={(v) => {
+                  setSpaceFilter(v);
+                  // 空间筛选变化时清掉资源集筛选，避免矛盾组合
+                  setCollectionFilter("all");
+                }}
+                style={{ minWidth: 140 }}
+                options={[
+                  { value: "all", label: "全部空间" },
+                  { value: "global", label: "仅全局" },
+                  ...spaces.map((s) => ({ value: s.id, label: s.name })),
+                ]}
+              />
+              <Select
+                value={collectionFilter}
+                onChange={setCollectionFilter}
+                showSearch
+                optionFilterProp="label"
+                style={{ minWidth: 160 }}
+                options={[
+                  { value: "all", label: "全部资源集" },
+                  ...spaces
+                    .map((s) => ({
+                      label: s.name,
+                      options: collections
+                        .filter((c) => c.spaceId === s.id)
+                        .map((c) => ({ value: c.id, label: c.name })),
+                    }))
+                    .filter((g) => g.options.length > 0),
+                ]}
+              />
+            </>
           )}
           <Button icon={<ReloadOutlined />} onClick={fetchTodos} loading={loading}>
             刷新
@@ -483,11 +533,13 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
           placeholder={
             collectionId
               ? `回车快速添加（归属资源集「${collectionName ?? ""}」）`
-              : spaceId
-                ? "回车快速添加（归属当前空间）"
-                : spaceFilter !== "all" && spaceFilter !== "global"
-                  ? `回车快速添加到「${spaceNameById.get(spaceFilter) ?? spaceFilter}」`
-                  : "回车快速添加（默认全局）"
+              : effectiveCollectionId
+                ? `回车快速添加到「${collectionNameById.get(effectiveCollectionId) ?? ""}」`
+                : spaceId
+                  ? "回车快速添加（归属当前空间）"
+                  : spaceFilter !== "all" && spaceFilter !== "global"
+                    ? `回车快速添加到「${spaceNameById.get(spaceFilter) ?? spaceFilter}」`
+                    : "回车快速添加（默认全局）"
           }
           value={quickTitle}
           onChange={(e) => setQuickTitle(e.target.value)}
