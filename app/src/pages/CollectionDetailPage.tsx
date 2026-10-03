@@ -1,8 +1,7 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   Badge,
   Button,
-  Collapse,
   Descriptions,
   Dropdown,
   Empty,
@@ -148,6 +147,10 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
   const [managedOpen, setManagedOpen] = useState(false);
+  /** 资源模块左侧选中的资源类型（默认 code；详情首载后自动切到第一个非空类型） */
+  const [activeType, setActiveType] = useState<ReferenceType>("code");
+  /** 每个资源集只自动初始化一次选中类型（之后尊重用户手动切换） */
+  const activeTypeInitRef = useRef<string | null>(null);
   const [editingRef, setEditingRef] = useState<Reference | null>(null);
   const [saving, setSaving] = useState(false);
   const [dispositionAction, setDispositionAction] = useState<DispositionAction | null>(null);
@@ -175,6 +178,16 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
   useEffect(() => {
     fetchDetail();
   }, [fetchDetail]);
+
+  // 详情首载后：选中类型自动切到第一个非空类型（每个资源集仅一次）
+  useEffect(() => {
+    if (!detail || activeTypeInitRef.current === collection.id) return;
+    activeTypeInitRef.current = collection.id;
+    const firstNonEmpty = TYPE_ORDER.find(
+      (t) => (detail.referencesByType[t] ?? []).length > 0,
+    );
+    if (firstNonEmpty) setActiveType(firstNonEmpty);
+  }, [detail, collection.id]);
 
   const openEditModal = (ref: Reference) => {
     setEditingRef(ref);
@@ -353,31 +366,11 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
     }
   };
 
-  const collapseItems = TYPE_ORDER.map((type) => {
-    const items = detail?.referencesByType[type] ?? [];
-    const count = items.length;
-    return {
-      key: type,
-      label: (
-        <AntSpace>
-          <span>{TYPE_LABEL[type]}</span>
-          <Badge count={count} showZero color={count > 0 ? "#4a90d9" : "#bfbfbf"} />
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            {type}
-          </Text>
-        </AntSpace>
-      ),
-      children:
-        count === 0 ? (
-          <Empty
-            image={Empty.PRESENTED_IMAGE_SIMPLE}
-            description={`暂无${TYPE_LABEL[type]}类引用`}
-            style={{ padding: "16px 0" }}
-          />
-        ) : (
-          <List<ReferenceWithHealth>
-            dataSource={items}
-            renderItem={({ ref, health }) => {
+  /** 当前选中类型的资源列表 */
+  const activeItems = detail?.referencesByType[activeType] ?? [];
+
+  /** 资源列表条目渲染（右键菜单 / 双击打开 / 行内操作，与原手风琴内实现一致） */
+  const renderRefItem = ({ ref, health }: ReferenceWithHealth) => {
               const meta = HEALTH_META[health];
               const isPathLocator = ref.locator.kind === "path";
               const contextMenuItems = [
@@ -510,11 +503,7 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
                   </div>
                 </Dropdown>
               );
-            }}
-          />
-        ),
-    };
-  });
+  };
 
   return (
     <div style={{ maxWidth: 1080 }}>
@@ -537,26 +526,6 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
           </h1>
         </AntSpace>
         <AntSpace>
-          <Dropdown
-            menu={{
-              items: [
-                { key: "external", label: "仅关联（不改动原文件）" },
-                { key: "managed", label: "导入并托管（复制 / 移动到根目录）" },
-              ],
-              onClick: ({ key }) => {
-                if (key === "external") setCreateOpen(true);
-                if (key === "managed") setManagedOpen(true);
-              },
-            }}
-            disabled={detail?.status === "archived"}
-          >
-            <Button type="primary" icon={<PlusOutlined />}>
-              <AntSpace size={4}>
-                添加引用
-                <DownOutlined style={{ fontSize: 10 }} />
-              </AntSpace>
-            </Button>
-          </Dropdown>
           <Button icon={<ReloadOutlined />} onClick={fetchDetail} loading={loading}>
             刷新
           </Button>
@@ -628,12 +597,91 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
             ]}
           />
 
-          <Collapse
-            items={collapseItems}
-            defaultActiveKey={TYPE_ORDER.filter(
-              (t) => (detail.referencesByType[t] ?? []).length > 0,
-            )}
-          />
+          {/* 资源模块：左侧类型垂直按钮组 + 右侧选中类型资源列表 */}
+          <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
+            {/* 左：类型按钮组（单选高亮，右侧显示数量） */}
+            <div
+              style={{
+                width: 132,
+                flexShrink: 0,
+                display: "flex",
+                flexDirection: "column",
+                gap: 4,
+              }}
+            >
+              {TYPE_ORDER.map((type) => {
+                const count = (detail.referencesByType[type] ?? []).length;
+                const active = type === activeType;
+                return (
+                  <Button
+                    key={type}
+                    type={active ? "primary" : "text"}
+                    onClick={() => setActiveType(type)}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                    }}
+                  >
+                    <span>{TYPE_LABEL[type]}</span>
+                    <span style={{ fontSize: 12, opacity: active ? 0.9 : 0.45 }}>{count}</span>
+                  </Button>
+                );
+              })}
+            </div>
+
+            {/* 右：资源列表面板 */}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  marginBottom: 8,
+                }}
+              >
+                <h2 style={{ fontSize: 15, margin: 0 }}>
+                  {TYPE_LABEL[activeType]}
+                  <Text
+                    type="secondary"
+                    style={{ fontSize: 12, fontWeight: "normal", marginLeft: 8 }}
+                  >
+                    {activeType}
+                  </Text>
+                </h2>
+                {/* 添加引用：弹窗类型预选跟随左侧当前选中类型（弹窗内仍可改） */}
+                <Dropdown
+                  menu={{
+                    items: [
+                      { key: "external", label: "仅关联（不改动原文件）" },
+                      { key: "managed", label: "导入并托管（复制 / 移动到根目录）" },
+                    ],
+                    onClick: ({ key }) => {
+                      if (key === "external") setCreateOpen(true);
+                      if (key === "managed") setManagedOpen(true);
+                    },
+                  }}
+                  disabled={detail.status === "archived"}
+                >
+                  <Button type="primary" size="small" icon={<PlusOutlined />}>
+                    <AntSpace size={4}>
+                      添加引用
+                      <DownOutlined style={{ fontSize: 10 }} />
+                    </AntSpace>
+                  </Button>
+                </Dropdown>
+              </div>
+              {activeItems.length === 0 ? (
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description={`暂无${TYPE_LABEL[activeType]}类引用`}
+                  style={{ padding: "16px 0" }}
+                />
+              ) : (
+                <List<ReferenceWithHealth> dataSource={activeItems} renderItem={renderRefItem} />
+              )}
+            </div>
+          </div>
 
           {/* m8-8.5 · 资源集级待办 */}
           <div style={{ marginTop: 24 }}>
@@ -648,12 +696,14 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
       <ReferenceCreateDialog
         open={createOpen}
         collectionId={collection.id}
+        defaultType={activeType}
         onClose={() => setCreateOpen(false)}
         onCreated={fetchDetail}
       />
       <ReferenceManagedDialog
         open={managedOpen}
         collectionId={collection.id}
+        defaultType={activeType}
         onClose={() => setManagedOpen(false)}
         onCreated={fetchDetail}
       />

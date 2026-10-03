@@ -40,6 +40,8 @@ interface ReferenceCreateDialogProps {
   open: boolean;
   /** 所属资源集 id */
   collectionId: string;
+  /** 打开时「类型」字段的预选值（跟随资源模块左侧选中类型）；缺省 "document" */
+  defaultType?: ReferenceType;
   onClose: () => void;
   /** 创建成功后回调（父组件应重新拉取 collection_get） */
   onCreated: () => void;
@@ -81,6 +83,7 @@ async function pickPath(kind: "file" | "directory"): Promise<string | null> {
 export function ReferenceCreateDialog({
   open,
   collectionId,
+  defaultType,
   onClose,
   onCreated,
 }: ReferenceCreateDialogProps) {
@@ -92,7 +95,7 @@ export function ReferenceCreateDialog({
     if (open) {
       form.setFieldsValue({
         path: "",
-        type: "document",
+        type: defaultType ?? "document",
         name: "",
         description: "",
         tags: [],
@@ -102,7 +105,7 @@ export function ReferenceCreateDialog({
     } else {
       form.resetFields();
     }
-  }, [open, form]);
+  }, [open, defaultType, form]);
 
   async function handlePick(kind: "file" | "directory") {
     const path = await pickPath(kind);

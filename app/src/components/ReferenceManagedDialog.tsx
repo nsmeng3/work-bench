@@ -77,6 +77,8 @@ interface ReferenceManagedDialogProps {
   open: boolean;
   /** 所属资源集 id */
   collectionId: string;
+  /** 打开时「类型」字段的预选值（跟随资源模块左侧选中类型）；缺省 "document" */
+  defaultType?: ReferenceType;
   onClose: () => void;
   /** 创建成功后回调（父组件应重新拉取 collection_get） */
   onCreated: () => void;
@@ -111,6 +113,7 @@ type Stage = "edit" | "confirm";
 export function ReferenceManagedDialog({
   open,
   collectionId,
+  defaultType,
   onClose,
   onCreated,
   onRefIdReady,
@@ -148,7 +151,7 @@ export function ReferenceManagedDialog({
       setProgressFailed(false);
       form.setFieldsValue({
         path: "",
-        type: "document",
+        type: defaultType ?? "document",
         name: "",
         description: "",
         tags: [],
@@ -158,7 +161,7 @@ export function ReferenceManagedDialog({
     } else {
       form.resetFields();
     }
-  }, [open, form]);
+  }, [open, defaultType, form]);
 
   // 卸载时清理失败定时器
   useEffect(() => {
