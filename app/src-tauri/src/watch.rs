@@ -875,6 +875,90 @@ mod tests {
         assert!(misses.is_empty(), "以下操作丢条目: {:?}", misses);
     }
 
+    /// 回归：Chrome 下载（先建 `.crdownload` 临时文件，完成后改名正式名）。
+    ///
+    /// 历史 bug：慢速下载时 `.crdownload` 先入收件箱，改名后其 pending 条目
+    /// 残留成幽灵（消失侧事件与 Created/Modified 同秒到达被去重丢弃）；
+    /// 且临时文件本体不该出现在收件箱/通知里。
+    ///
+    /// 断言：两种下载节奏下，正式文件恰好 1 条 pending，`.crdownload` 0 条。
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "FSEvents 行为仅 macOS 本机可验")]
+    async fn e2e_chrome_download_reaches_inbox() {
+        use crate::aggregate::{aggregate_batch, EventBatch};
+
+        let pool = setup_e2e_pool().await;
+        let watched = TempDir::new().expect("watched tempdir");
+        let root = watched.path().canonicalize().expect("canonical root");
+
+        let (tx, rx) = mpsc::channel::<WatchEvent>(256);
+        let handle = WatcherHandle::new(tx);
+        add_watch(&handle, "wd_chrome".to_string(), root.clone(), true)
+            .await
+            .expect("add_watch");
+        let (ftx, mut frx) = mpsc::channel::<WatchEvent>(256);
+        // 关键：用默认忽略规则（和生产一致，含 .crdownload 过滤）
+        let rules = std::sync::Arc::new(std::sync::RwLock::new(crate::ignore::default_rules()));
+        let _filter = crate::ignore::filter_events(rx, ftx, rules);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let quiet = Duration::from_millis(800);
+        let cap = Duration::from_secs(8);
+
+        // ===== 场景 1：小文件秒下（create + rename 落在同一聚合窗口同一秒） =====
+        let fast_tmp = root.join("small.zip.crdownload");
+        let fast_final = root.join("small.zip");
+        fs::write(&fast_tmp, b"chunk1").expect("write crdownload");
+        fs::rename(&fast_tmp, &fast_final).expect("rename to final");
+        let evs = drain_events(&mut frx, quiet, cap).await;
+        dump_events("Chrome 小文件秒下", &evs);
+        let r = aggregate_batch(&pool, EventBatch { window_start: 0, window_end: 0, events: evs })
+            .await
+            .expect("agg fast");
+        eprintln!("[chrome] 小文件聚合结果: {:?}", r);
+        assert_eq!(
+            pending_count_at(&pool, &fast_final).await,
+            1,
+            "小文件秒下：正式文件应进收件箱"
+        );
+
+        // ===== 场景 2：大文件慢速下载（跨多个 5s 窗口） =====
+        let slow_tmp = root.join("big.zip.crdownload");
+        let slow_final = root.join("big.zip");
+        fs::write(&slow_tmp, b"chunk1").expect("write chunk1");
+        // 窗口 1：下载中
+        let evs = drain_events(&mut frx, quiet, cap).await;
+        dump_events("Chrome 大文件·窗口1(下载中)", &evs);
+        let r = aggregate_batch(&pool, EventBatch { window_start: 0, window_end: 0, events: evs })
+            .await
+            .expect("agg slow w1");
+        eprintln!("[chrome] 大文件窗口1 聚合: {:?}", r);
+        // 窗口 2：下载完成，改名
+        fs::rename(&slow_tmp, &slow_final).expect("rename big");
+        let evs = drain_events(&mut frx, quiet, cap).await;
+        dump_events("Chrome 大文件·窗口2(完成改名)", &evs);
+        let r = aggregate_batch(&pool, EventBatch { window_start: 0, window_end: 0, events: evs })
+            .await
+            .expect("agg slow w2");
+        eprintln!("[chrome] 大文件窗口2 聚合: {:?}", r);
+        assert_eq!(
+            pending_count_at(&pool, &slow_final).await,
+            1,
+            "大文件慢下：正式文件应进收件箱"
+        );
+
+        // .crdownload 临时文件：任何状态都不应残留收件箱
+        let (tmp_cnt,): (i64,) =
+            sqlx::query_as("SELECT COUNT(1) FROM inbox_item WHERE path LIKE '%.crdownload'")
+                .fetch_one(&pool)
+                .await
+                .expect("count tmp");
+        assert_eq!(tmp_cnt, 0, ".crdownload 临时文件不应出现在收件箱");
+
+        stop_watchers(handle).await.expect("stop");
+    }
+
     // ---------- start_watchers 故障隔离（单 watcher 失败不影响其他） ----------
 
     #[tokio::test]

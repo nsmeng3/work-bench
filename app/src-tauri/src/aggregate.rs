@@ -11,8 +11,9 @@
 //!   无已有条目但路径实际存在 → 按「出现」处理（FSEvents 把移入监控目录
 //!   报成无目标路径的 Renamed/Any，路径是目标路径，以磁盘状态裁决）
 //! - `Created` / `Modified`：同路径已有未处理 `inbox_item`（`status='pending'`）
-//!   → UPDATE mtime/event_kind，不新建；否则新建前 stat：路径已不存在
-//!   （窗口内消失的临时文件）→ 丢弃，存在 → 新建 `inbox_item`
+//!   → 以磁盘状态裁决：文件仍在则 UPDATE mtime/event_kind，已消失则标记 stale
+//!   （消失侧事件在同秒去重中丢失时避免幽灵 pending 残留）；无已有条目则新建前
+//!   stat：路径已不存在（窗口内消失的临时文件）→ 丢弃，存在 → 新建 `inbox_item`
 //!
 //! 聚合窗口为纯函数（除 DB / stat IO 外），单测覆盖（§6 性能要求）。
 
@@ -96,7 +97,11 @@ fn lower_ext(path: &std::path::Path) -> Option<String> {
         .map(|s| s.to_lowercase())
 }
 
-/// 同路径去重：保留 `at` 最新的一条。
+/// 同路径去重：保留 `at` 最新的一条；`at` 并列（同一秒内多事件）时保留**后到达**的。
+///
+/// 并列时取后到的理由：浏览器下载、编辑器原子保存等场景里，同一路径的
+/// `Created` 与 `Renamed`/`Removed` 常落在同一秒，后到达的事件携带更新的
+/// 文件状态（如「已改名消失」），保留先到者会把幽灵 Created 留给落账阶段。
 ///
 /// 返回 (去重后事件列表, 重复丢弃数)。顺序不保证。
 fn dedup_by_path(events: Vec<WatchEvent>) -> (Vec<WatchEvent>, usize) {
@@ -104,10 +109,11 @@ fn dedup_by_path(events: Vec<WatchEvent>) -> (Vec<WatchEvent>, usize) {
     let total = events.len();
     for ev in events {
         match map.get(&ev.path) {
-            Some(existing) if existing.at >= ev.at => {
-                // 已有更新或同时戳的事件，丢弃当前
+            Some(existing) if existing.at > ev.at => {
+                // 已有更晚（严格大于）的事件，丢弃当前
             }
             _ => {
+                // 更晚或并列（at 相等）：以后到达者为准
                 map.insert(ev.path.clone(), ev);
             }
         }
@@ -180,7 +186,8 @@ async fn insert_item(
 }
 
 /// `Created` / `Modified`：文件出现在某路径。
-/// 已正式引用 → dropped；已有 pending → UPDATE；
+/// 已正式引用 → dropped；已有 pending → 文件仍在则 UPDATE，
+/// 文件已消失（改名/删除的消失侧事件在同秒去重中丢失等）→ 标记 stale；
 /// 否则新建前 stat：路径已不存在（窗口内消失的临时文件）→ dropped，存在 → INSERT。
 async fn handle_appeared(
     pool: &SqlitePool,
@@ -195,7 +202,7 @@ async fn handle_appeared(
         return Ok(());
     }
 
-    // 已有 pending inbox_item → UPDATE（注意：stale 不阻塞，允许同路径重新出现）
+    // 已有 pending inbox_item（注意：stale 不阻塞，允许同路径重新出现）
     let existing: Option<(String,)> =
         sqlx::query_as("SELECT id FROM inbox_item WHERE path = ? AND status = 'pending' LIMIT 1")
             .bind(path_str)
@@ -204,6 +211,23 @@ async fn handle_appeared(
             .map_err(AppError::from)?;
 
     if let Some((id,)) = existing {
+        // 落账前以磁盘状态裁决：文件已消失 → 该条目是改名/删除后的幽灵，
+        // 标记 stale 而非 UPDATE（否则浏览器下载的 .crdownload 临时文件条目
+        // 会永远以 pending 残留——其 Renamed 消失侧事件可能与 Created/Modified
+        // 同秒到达并在去重中丢失）。
+        if !path.exists() {
+            sqlx::query(
+                "UPDATE inbox_item SET status = 'stale', mtime = ?, event_kind = ? WHERE id = ?",
+            )
+            .bind(ev.at)
+            .bind(kind_str)
+            .bind(&id)
+            .execute(pool)
+            .await
+            .map_err(AppError::from)?;
+            result.staled += 1;
+            return Ok(());
+        }
         sqlx::query("UPDATE inbox_item SET mtime = ?, event_kind = ? WHERE id = ?")
             .bind(ev.at)
             .bind(kind_str)
@@ -694,17 +718,23 @@ mod tests {
     #[tokio::test]
     async fn pending_inbox_item_is_updated_not_created() {
         let pool = setup_pool().await;
+        // 文件落账时真实存在 → 已有 pending 应更新而非新建
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let file = tmp.path().join("p.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let p = file.to_string_lossy().to_string();
         // 预置一条 pending inbox_item
         sqlx::query(
             "INSERT INTO inbox_item \
              (id, watch_dir_id, path, event_kind, mtime, status, discovered_at) \
-             VALUES ('i1', 'wd1', '/a/p.txt', 'created', 50, 'pending', 50)",
+             VALUES ('i1', 'wd1', ?, 'created', 50, 'pending', 50)",
         )
+        .bind(&p)
         .execute(&pool)
         .await
         .expect("insert inbox");
 
-        let events = vec![ev("/a/p.txt", WatchEventKind::Modified, 200)];
+        let events = vec![ev(&p, WatchEventKind::Modified, 200)];
         let r = aggregate_batch(&pool, batch(events)).await.expect("agg");
         assert_eq!(r.created, 0, "已有 pending 不应新建");
         assert_eq!(r.updated, 1);
@@ -712,7 +742,8 @@ mod tests {
 
         // 仅一条记录，mtime/event_kind 已更新
         let rows: Vec<(String, i64, String)> =
-            sqlx::query_as("SELECT id, mtime, event_kind FROM inbox_item WHERE path = '/a/p.txt'")
+            sqlx::query_as("SELECT id, mtime, event_kind FROM inbox_item WHERE path = ?")
+                .bind(&p)
                 .fetch_all(&pool)
                 .await
                 .expect("select");
@@ -720,6 +751,55 @@ mod tests {
         assert_eq!(rows[0].0, "i1", "应更新已有行而非新建");
         assert_eq!(rows[0].1, 200);
         assert_eq!(rows[0].2, "modified");
+    }
+
+    // ---------- 已有 pending 但文件已消失 → stale（Chrome .crdownload 幽灵条目修复） ----------
+
+    #[tokio::test]
+    async fn pending_item_with_vanished_file_is_staled_not_updated() {
+        let pool = setup_pool().await;
+        // 场景：慢速下载中 .crdownload 已落账 pending；下载完成改名后，
+        // 同秒到达的 Renamed（消失侧）在去重中丢失，只剩 Created/Modified。
+        // 落账时磁盘上该路径已不存在 → 应标记 stale，而非 UPDATE 成永远残留的幽灵。
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let gone = tmp.path().join("big.zip.crdownload").to_string_lossy().to_string();
+        seed_item(&pool, "i1", &gone, "pending").await;
+
+        let r = aggregate_batch(
+            &pool,
+            batch(vec![ev(&gone, WatchEventKind::Modified, 200)]),
+        )
+        .await
+        .expect("agg");
+        assert_eq!(r.staled, 1, "文件已消失的 pending 条目应标记 stale");
+        assert_eq!(r.updated, 0);
+
+        let (_, _, status, _) = fetch_row(&pool, "i1").await;
+        assert_eq!(status, "stale");
+    }
+
+    #[tokio::test]
+    async fn dedup_same_second_tie_keeps_later_arrival() {
+        let pool = setup_pool().await;
+        // 场景：小文件秒下，Created 与 Renamed 同秒到达同一路径。
+        // 去重应保留后到达的 Renamed（消失语义），而非信息更少的 Created。
+        // from 无被跟踪条目且磁盘上已不存在 → dropped，不产生幽灵 pending。
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let gone = tmp.path().join("small.zip.crdownload").to_string_lossy().to_string();
+
+        let events = vec![
+            ev(&gone, WatchEventKind::Created, 200),
+            ev(&gone, WatchEventKind::Renamed, 200),
+        ];
+        let r = aggregate_batch(&pool, batch(events)).await.expect("agg");
+        assert_eq!(r.created, 0, "改名消失的临时文件不应落账");
+        assert_eq!(r.dropped, 2, "1 条同路径重复 + 1 条已消失文件被丢弃");
+
+        let (cnt,): (i64,) = sqlx::query_as("SELECT COUNT(1) FROM inbox_item")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(cnt, 0);
     }
 
     // ---------- 已 processed 不更新，应新建 ----------

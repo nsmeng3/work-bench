@@ -68,7 +68,12 @@ pub struct IgnoreRule {
 /// 默认规则集：
 /// - ByName: `.DS_Store` / `.git` / `.svn` / `node_modules` / `target` / `dist` / `build` / `.next` / `.cache`
 /// - ByExt: `.tmp` / `.swp` / `.log` / `.lock` / `.bak`
+/// - ByExt（浏览器下载临时文件）: `.crdownload`(Chrome/Edge) / `.download`(Safari) / `.partial`(Edge 旧版)
 /// - ByPattern: `**/*.part` / `**/~*`
+///
+/// 浏览器下载先落临时文件、完成后改名正式名。临时扩展名前置过滤，
+/// 避免临时文件进入收件箱（改名事件由 filter_events 按 new_path 改写放行，
+/// 保证正式文件不丢通知）。
 pub fn default_rules() -> Vec<IgnoreRule> {
     let mut out = Vec::new();
 
@@ -90,6 +95,15 @@ pub fn default_rules() -> Vec<IgnoreRule> {
     }
 
     for v in [".tmp", ".swp", ".log", ".lock", ".bak"] {
+        out.push(IgnoreRule {
+            kind: IgnoreKind::ByExt,
+            value: v.to_string(),
+        });
+    }
+
+    // 浏览器下载临时文件：Chrome/Edge → .crdownload，Safari → .download，
+    // Edge 旧版/IE → .partial（Firefox 的 .part 由下方 ByPattern 覆盖）
+    for v in [".crdownload", ".download", ".partial"] {
         out.push(IgnoreRule {
             kind: IgnoreKind::ByExt,
             value: v.to_string(),
@@ -214,6 +228,13 @@ pub async fn load_rules(pool: &SqlitePool) -> CmdResult<Vec<IgnoreRule>> {
 /// 规则通过 `Arc<RwLock<Vec<IgnoreRule>>>` 共享，5.4 可触发 `load_rules` 重载后写入。
 /// 读锁中毒时按"无规则"放行（避免阻塞事件流）。
 ///
+/// 改名事件的特例（浏览器下载临时文件场景）：`Renamed` 且携带 `new_path` 时，
+/// from 路径命中忽略规则（如 `.crdownload`）不代表整条事件该丢——
+/// 正式文件路径（new_path）未命中规则时，把事件改写为 `Created(new_path)` 放行，
+/// 保证「临时文件改名正式名」后正式文件仍能进收件箱（跨平台兜底：
+/// Windows ReadDirectoryChangesW 的 RenameMode::Both 只有一条事件，
+/// from 被忽略就把整条吞掉会导致正式文件永远无通知）。
+///
 /// 返回 `JoinHandle`，调用方可选择 `await` 或 detach。
 pub fn filter_events(
     mut rx: mpsc::Receiver<WatchEvent>,
@@ -221,16 +242,27 @@ pub fn filter_events(
     rules: Arc<RwLock<Vec<IgnoreRule>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            let ignored = {
+        while let Some(mut ev) = rx.recv().await {
+            let (path_ignored, new_path_ignored) = {
                 let guard = rules.read().ok();
                 match guard {
-                    Some(g) => should_ignore(&ev.path, &g),
-                    None => false, // 锁中毒：放行
+                    Some(g) => (
+                        should_ignore(&ev.path, &g),
+                        ev.new_path.as_ref().map(|p| should_ignore(p, &g)),
+                    ),
+                    None => (false, None), // 锁中毒：放行
                 }
             };
-            if ignored {
-                continue;
+            if path_ignored {
+                // from 被忽略但 to 未忽略：改写为 Created(to) 放行正式文件
+                match (ev.new_path.clone(), new_path_ignored) {
+                    (Some(to), Some(false)) => {
+                        ev.kind = crate::watch::WatchEventKind::Created;
+                        ev.path = to;
+                        ev.new_path = None;
+                    }
+                    _ => continue, // 无 new_path 或 to 也被忽略：整条丢弃
+                }
             }
             // 下游关闭则退出
             if tx.send(ev).await.is_err() {
@@ -311,6 +343,21 @@ mod tests {
         let rules = default_rules();
         assert!(should_ignore(Path::new("/a/b/~notes.txt"), &rules));
         assert!(should_ignore(Path::new("~draft"), &rules));
+    }
+
+    #[test]
+    fn default_rules_ignore_browser_download_temps() {
+        let rules = default_rules();
+        // Chrome / Edge / Brave
+        assert!(should_ignore(Path::new("/downloads/report.zip.crdownload"), &rules));
+        // Safari
+        assert!(should_ignore(Path::new("/downloads/report.zip.download"), &rules));
+        // Edge 旧版 / IE
+        assert!(should_ignore(Path::new("/downloads/report.zip.partial"), &rules));
+        // 大小写不敏感
+        assert!(should_ignore(Path::new("/downloads/report.zip.CRDOWNLOAD"), &rules));
+        // 完成后的正式文件不命中
+        assert!(!should_ignore(Path::new("/downloads/report.zip"), &rules));
     }
 
     // ---------- 用户规则：ByExt / ByName / ByDir / ByPattern 各一例 ----------
@@ -553,5 +600,88 @@ mod tests {
         while let Some(ev) = out_rx.recv().await {
             assert_ne!(ev.path, PathBuf::from("/a/y.psd"));
         }
+    }
+
+    // ---------- filter_events：改名事件 from 被忽略但 to 未忽略 → 改写 Created(to) 放行 ----------
+
+    #[tokio::test]
+    async fn filter_rename_from_ignored_to_kept_rewrites_to_created() {
+        // Chrome 下载完成改名（Windows RenameMode::Both 形态）：
+        // from=.crdownload 命中默认规则，to=正式名未命中。
+        // 若整条丢弃，正式文件永远无通知；应改写为 Created(to) 放行。
+        let (in_tx, in_rx) = mpsc::channel::<WatchEvent>(16);
+        let (out_tx, mut out_rx) = mpsc::channel::<WatchEvent>(16);
+        let rules = Arc::new(RwLock::new(default_rules()));
+
+        let _h = filter_events(in_rx, out_tx, rules);
+
+        in_tx
+            .send(WatchEvent {
+                kind: crate::watch::WatchEventKind::Renamed,
+                path: PathBuf::from("/dl/report.zip.crdownload"),
+                new_path: Some(PathBuf::from("/dl/report.zip")),
+                watch_dir_id: "wd".to_string(),
+                at: 42,
+            })
+            .await
+            .unwrap();
+        drop(in_tx);
+
+        let ev = out_rx.recv().await.expect("应放行改写后的事件");
+        assert_eq!(ev.kind, crate::watch::WatchEventKind::Created);
+        assert_eq!(ev.path, PathBuf::from("/dl/report.zip"));
+        assert_eq!(ev.new_path, None);
+        assert_eq!(ev.watch_dir_id, "wd");
+        assert_eq!(ev.at, 42, "改写保留原始时间戳");
+        assert!(out_rx.recv().await.is_none(), "只应放行 1 条");
+    }
+
+    #[tokio::test]
+    async fn filter_rename_both_paths_ignored_is_dropped() {
+        // from 和 to 都命中忽略规则（如 .crdownload → .tmp）→ 整条丢弃
+        let (in_tx, in_rx) = mpsc::channel::<WatchEvent>(16);
+        let (out_tx, mut out_rx) = mpsc::channel::<WatchEvent>(16);
+        let rules = Arc::new(RwLock::new(default_rules()));
+
+        let _h = filter_events(in_rx, out_tx, rules);
+
+        in_tx
+            .send(WatchEvent {
+                kind: crate::watch::WatchEventKind::Renamed,
+                path: PathBuf::from("/dl/a.crdownload"),
+                new_path: Some(PathBuf::from("/dl/a.tmp")),
+                watch_dir_id: "wd".to_string(),
+                at: 1,
+            })
+            .await
+            .unwrap();
+        drop(in_tx);
+
+        assert!(out_rx.recv().await.is_none(), "双侧都忽略应整条丢弃");
+    }
+
+    #[tokio::test]
+    async fn filter_rename_without_new_path_from_ignored_is_dropped() {
+        // from 命中忽略、无 new_path（Any 单侧）→ 丢弃
+        //（to 路径在 macOS FSEvents 下有自己的独立事件，不受影响）
+        let (in_tx, in_rx) = mpsc::channel::<WatchEvent>(16);
+        let (out_tx, mut out_rx) = mpsc::channel::<WatchEvent>(16);
+        let rules = Arc::new(RwLock::new(default_rules()));
+
+        let _h = filter_events(in_rx, out_tx, rules);
+
+        in_tx
+            .send(WatchEvent {
+                kind: crate::watch::WatchEventKind::Renamed,
+                path: PathBuf::from("/dl/a.crdownload"),
+                new_path: None,
+                watch_dir_id: "wd".to_string(),
+                at: 1,
+            })
+            .await
+            .unwrap();
+        drop(in_tx);
+
+        assert!(out_rx.recv().await.is_none());
     }
 }
