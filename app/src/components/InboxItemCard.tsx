@@ -67,14 +67,20 @@ export function InboxItemCard({ item, selected, onSelect }: InboxItemCardProps) 
       }}
     >
       <div style={{ width: "100%", minWidth: 0 }}>
-        <AntSpace style={{ width: "100%", justifyContent: "space-between" }} size={8}>
-          <Typography.Text strong ellipsis style={{ flex: 1, minWidth: 0 }}>
+        {/* 文件名行：AntSpace 会包一层 .ant-space-item 不定宽，ellipsis 拿不到宽度约束；
+            改用 flex div，Text 作为直接 flex 子项（minWidth:0 允许收缩），超长省略号 + 悬浮显示全名 */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+          <Typography.Text
+            strong
+            ellipsis={{ tooltip: fileName(item.path) }}
+            style={{ flex: 1, minWidth: 0 }}
+          >
             {fileName(item.path)}
           </Typography.Text>
-          <Tag color={STATUS_COLORS[item.status]} style={{ marginInlineEnd: 0 }}>
+          <Tag color={STATUS_COLORS[item.status]} style={{ marginInlineEnd: 0, flexShrink: 0 }}>
             {STATUS_LABELS[item.status]}
           </Tag>
-        </AntSpace>
+        </div>
         <AntSpace size={8} style={{ marginTop: 4, fontSize: 12 }}>
           {item.suggestedType ? (
             <Tag style={{ marginInlineEnd: 0 }}>{TYPE_LABELS[item.suggestedType]}</Tag>
