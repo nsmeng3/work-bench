@@ -207,11 +207,10 @@ export function InboxPage() {
     <Layout style={{ height: "100%", background: "transparent" }}>
       <Layout.Sider
         width={380}
+        className="inbox-sider"
         style={{
           background: "#fff",
           borderRight: "1px solid #f0f0f0",
-          display: "flex",
-          flexDirection: "column",
           overflow: "hidden",
         }}
       >

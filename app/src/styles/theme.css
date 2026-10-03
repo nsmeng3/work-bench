@@ -16,3 +16,15 @@ body {
   -webkit-font-smoothing: antialiased;
   background-color: #f6f6f6;
 }
+
+/*
+ * 收件箱左栏滚动修复：antd Layout.Sider 会把 children 再包一层
+ * .ant-layout-sider-children（普通 block div），写在 Sider 上的 flex 布局
+ * 不会穿透到这一层，导致列表区 flex:1 失效、内容被 Sider 裁切且无法滚动。
+ * 必须把 flex 列布局显式作用到该包装层。
+ */
+.inbox-sider .ant-layout-sider-children {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
