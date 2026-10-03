@@ -267,7 +267,12 @@ export function InboxPage() {
             />
           )}
         </div>
-        <div style={{ flex: 1, overflowY: "auto" }}>
+        {/*
+          minHeight: 0 是必须的：flex 列容器内 flex item 默认 min-height:auto，
+          会被内容撑高超出 Sider（overflow:hidden 裁掉），overflowY 永远不触发，
+          表现为「列表不能滚动、分页栏被顶出可视区」。与 TerminalPanel 同款处理。
+        */}
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
           <List<InboxItem>
             loading={loading}
             dataSource={items}
