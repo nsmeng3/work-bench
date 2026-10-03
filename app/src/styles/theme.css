@@ -28,3 +28,18 @@ body {
   flex-direction: column;
   height: 100%;
 }
+
+/*
+ * 资源集资源列表条目分隔：antd List split 默认边框 rgba(5,5,5,0.06) 过淡近乎不可见，
+ * 且条目被右键菜单包装 div 嵌套后 :last-child 去边框规则失效（末条多出一条线）。
+ * 显式加深分隔线，并按实际 DOM 结构（.ant-list-items > 包装 div > .ant-list-item）
+ * 去掉末条边框。
+ * 注意：必须用 .ref-list.ant-list 双类叠加提权——antd cssinjs 运行时注入的样式
+ * 在 <head> 中位置靠后，同优先级会盖掉本文件。
+ */
+.ref-list.ant-list .ant-list-item {
+  border-bottom: 1px solid #f0f0f0;
+}
+.ref-list.ant-list .ant-list-items > div:last-child .ant-list-item {
+  border-bottom: none;
+}

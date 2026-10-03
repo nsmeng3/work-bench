@@ -755,6 +755,7 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
                 />
               ) : (
                 <List<ReferenceWithHealth>
+                  className="ref-list"
                   dataSource={activeItems}
                   renderItem={(item) => (
                     <RefListItemRow
