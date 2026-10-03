@@ -248,7 +248,7 @@ pub async fn list(
 ///
 /// m5-5.5 集成：
 /// - 敏感文件（`sensitive::is_sensitive` 命中）→ `preview=None` + `sensitiveWarning=Some(..)`；
-/// - 非敏感文本文件 → 读前 [`PREVIEW_MAX_LINES`] 行作为 `preview.content`；
+/// - 非敏感文本文件 → 读前 [`PREVIEW_MAX_LINES`] 行作为 `preview.lines`（含 `truncated` 标记）；
 /// - 非敏感但读取失败 / 二进制 / 不存在 → `preview=None`。
 pub async fn get(pool: &SqlitePool, id: String) -> CmdResult<InboxItemDetail> {
     let item = fetch_inbox_item(pool, &id).await?;
@@ -296,12 +296,20 @@ fn build_detail(item: InboxItem) -> InboxItemDetail {
 
 /// 读取文本文件前 N 行作为预览。
 ///
-/// 返回 `Some(json!({ "kind": "text", "content": "..." }))`；
+/// 返回 `Some(json!({ "kind": "text", "lines": [...], "truncated": bool }))`
+/// （契约 §2.7 预览形状，与前端 `InboxPreview` 类型一致）；
+/// `truncated` 在实际行数超过 N 或文件超过字节上限被截断时为 true。
 /// 文件不存在 / 读取失败 / 非 UTF-8 文本 → `None`（不视为错误，仅无预览）。
 fn read_text_preview(path: &std::path::Path) -> Option<serde_json::Value> {
     use std::io::Read;
 
     let f = std::fs::File::open(path).ok()?;
+    // 文件长度超过字节上限 → 内容会被截断
+    let hit_byte_cap = f
+        .metadata()
+        .ok()
+        .map(|m| m.len() > PREVIEW_MAX_BYTES as u64)
+        .unwrap_or(false);
     let mut buf = Vec::with_capacity(PREVIEW_MAX_BYTES.min(4096));
     f.take(PREVIEW_MAX_BYTES as u64)
         .read_to_end(&mut buf)
@@ -313,15 +321,14 @@ fn read_text_preview(path: &std::path::Path) -> Option<serde_json::Value> {
     }
 
     let text = String::from_utf8(buf).ok()?;
-    let content: String = text
-        .lines()
-        .take(PREVIEW_MAX_LINES)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let all_lines: Vec<&str> = text.lines().collect();
+    let truncated = hit_byte_cap || all_lines.len() > PREVIEW_MAX_LINES;
+    let lines: Vec<&str> = all_lines.into_iter().take(PREVIEW_MAX_LINES).collect();
 
     Some(serde_json::json!({
         "kind": "text",
-        "content": content,
+        "lines": lines,
+        "truncated": truncated,
     }))
 }
 
@@ -1086,12 +1093,13 @@ mod tests {
         let detail = get(&pool, id.clone()).await.expect("get");
         assert_eq!(detail.item.id, id);
         assert_eq!(detail.item.status, "pending");
-        // m5-5.5：非敏感文本文件 preview 有内容
+        // m5-5.5：非敏感文本文件 preview 有内容（契约 §2.7：{ kind, lines, truncated }）
         let preview = detail.preview.expect("preview");
         assert_eq!(preview["kind"], "text");
-        let content = preview["content"].as_str().expect("content str");
-        assert!(content.contains("line1"));
-        assert!(content.contains("line3"));
+        let lines = preview["lines"].as_array().expect("lines array");
+        assert!(lines.iter().any(|l| l.as_str() == Some("line1")));
+        assert!(lines.iter().any(|l| l.as_str() == Some("line3")));
+        assert_eq!(preview["truncated"], false);
         assert!(detail.sensitive_warning.is_none());
     }
 
@@ -1156,10 +1164,30 @@ mod tests {
         let detail = get(&pool, id).await.expect("get");
         let preview = detail.preview.expect("preview");
         assert_eq!(preview["kind"], "text");
-        let content = preview["content"].as_str().expect("content");
-        assert!(content.contains("# Hello"));
-        assert!(content.contains("world"));
+        let lines = preview["lines"].as_array().expect("lines array");
+        assert_eq!(lines.first().and_then(|l| l.as_str()), Some("# Hello"));
+        assert!(lines.iter().any(|l| l.as_str() == Some("world")));
+        assert_eq!(preview["truncated"], false);
         assert!(detail.sensitive_warning.is_none());
+    }
+
+    #[tokio::test]
+    async fn inbox_get_long_text_preview_truncated() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let f = dir.path().join("long.txt");
+        // 超过 PREVIEW_MAX_LINES(50) 行：应截断且 truncated=true
+        let body: String = (1..=80).map(|i| format!("line{}\n", i)).collect();
+        std::fs::write(&f, body).expect("w");
+        let id = make_pending(&pool, &f).await;
+
+        let detail = get(&pool, id).await.expect("get");
+        let preview = detail.preview.expect("preview");
+        assert_eq!(preview["kind"], "text");
+        let lines = preview["lines"].as_array().expect("lines array");
+        assert_eq!(lines.len(), 50, "应只返回前 50 行");
+        assert_eq!(lines.first().and_then(|l| l.as_str()), Some("line1"));
+        assert_eq!(preview["truncated"], true);
     }
 
     #[tokio::test]

@@ -537,7 +537,7 @@ export interface InboxItem {
   discoveredAt: number;
 }
 
-/** 文本预览（契约 §2.7 预览形状；当前后端恒为 null，5.5 敏感识别扩展点） */
+/** 文本预览（契约 §2.7 预览形状，后端 inbox_get 已按此返回） */
 export interface InboxPreview {
   kind: "text";
   /** 前 N 行文本 */

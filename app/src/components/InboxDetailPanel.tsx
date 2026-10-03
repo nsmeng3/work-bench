@@ -293,8 +293,11 @@ export function InboxDetailPanel({
           ].filter((x): x is NonNullable<typeof x> => x !== null)}
         />
 
-        {/* 预览：敏感文件不显示 */}
-        {!detail.sensitiveWarning && detail.preview && detail.preview.kind === "text" && (
+        {/* 预览：敏感文件不显示；lines 缺防御（后端契约漂移时降级为不显示预览，不白屏） */}
+        {!detail.sensitiveWarning &&
+          detail.preview &&
+          detail.preview.kind === "text" &&
+          Array.isArray(detail.preview.lines) && (
           <div>
             <Typography.Title level={5} style={{ marginTop: 0 }}>
               预览
