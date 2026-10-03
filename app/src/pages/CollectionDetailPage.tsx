@@ -607,6 +607,10 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
                 display: "flex",
                 flexDirection: "column",
                 gap: 4,
+                background: "#fff",
+                border: "1px solid #f0f0f0",
+                borderRadius: 8,
+                padding: 8,
               }}
             >
               {TYPE_ORDER.map((type) => {
@@ -631,7 +635,16 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
             </div>
 
             {/* 右：资源列表面板 */}
-            <div style={{ flex: 1, minWidth: 0 }}>
+            <div
+              style={{
+                flex: 1,
+                minWidth: 0,
+                background: "#fff",
+                border: "1px solid #f0f0f0",
+                borderRadius: 8,
+                padding: "12px 16px",
+              }}
+            >
               <div
                 style={{
                   display: "flex",
