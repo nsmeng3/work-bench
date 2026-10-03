@@ -1,8 +1,8 @@
 //! 数据库接入与迁移框架（详细设计 §3.3）
 //!
 //! - 使用 sqlx SQLite，启动时自动执行未应用的迁移。
-//! - 数据库文件位置遵循 Tauri app data 目录约定：
-//!   `{平台用户数据目录}/resource-workbench/workbench.db`。
+//! - 数据库文件位置固定为用户 home 目录下：`~/.workbench/workbench.db`。
+//!   （历史版本位于 `{平台用户数据目录}/resource-workbench/`，启动时自动迁移。）
 //! - 迁移文件按 `0001_init.sql`、`0002_*.sql` 递增，只增不改。
 
 use std::path::{Path, PathBuf};
@@ -15,11 +15,54 @@ use crate::error::{AppError, CmdResult};
 /// 嵌入的迁移集合（编译期打包 `migrations/` 目录）。
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-/// 数据库文件名（位于 app data 目录下）。
+/// 数据库文件名（位于数据目录下）。
 pub const DB_FILE_NAME: &str = "workbench.db";
 
-/// 应用数据目录的子目录名。
-pub const APP_DATA_DIR: &str = "resource-workbench";
+/// 数据目录名（位于用户 home 目录下，即 `~/.workbench`）。
+pub const DATA_DIR_NAME: &str = ".workbench";
+
+/// 旧版数据目录（Tauri app data 目录下的子目录名），仅用于一次性迁移。
+pub const LEGACY_APP_DATA_DIR: &str = "resource-workbench";
+
+/// 若新数据目录中尚无数据库、而旧目录中存在，则将数据库文件迁移到新目录。
+///
+/// 迁移范围为主库及 WAL/SHM 伴随文件；跨设备 rename 失败时回退为复制+删除。
+/// 返回是否发生了迁移。
+pub fn migrate_legacy_data(legacy_dir: &Path, new_dir: &Path) -> CmdResult<bool> {
+    let new_db = new_dir.join(DB_FILE_NAME);
+    let old_db = legacy_dir.join(DB_FILE_NAME);
+    if new_db.exists() || !old_db.exists() {
+        return Ok(false);
+    }
+
+    std::fs::create_dir_all(new_dir)
+        .map_err(|e| AppError::io(format!("创建数据目录失败 {}: {}", new_dir.display(), e)))?;
+
+    for suffix in ["", "-wal", "-shm"] {
+        let name = format!("{}{}", DB_FILE_NAME, suffix);
+        let from = legacy_dir.join(&name);
+        if !from.exists() {
+            continue;
+        }
+        let to = new_dir.join(&name);
+        if std::fs::rename(&from, &to).is_err() {
+            // 跨设备等情况 rename 失败：复制后删除源文件
+            std::fs::copy(&from, &to).map_err(|e| {
+                AppError::io(format!(
+                    "迁移数据库文件失败 {} -> {}: {}",
+                    from.display(),
+                    to.display(),
+                    e
+                ))
+            })?;
+            std::fs::remove_file(&from).map_err(|e| {
+                AppError::io(format!("删除旧数据库文件失败 {}: {}", from.display(), e))
+            })?;
+        }
+    }
+
+    Ok(true)
+}
 
 /// 在给定目录下打开（必要时创建）SQLite 连接池并执行迁移。
 ///
@@ -172,5 +215,50 @@ mod tests {
                 .await
                 .expect("count source");
         assert_eq!(count, 1, "default storage_source seeded");
+    }
+
+    #[test]
+    fn migrate_legacy_data_moves_db_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let legacy = tmp.path().join("legacy");
+        let new = tmp.path().join("new");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("workbench.db"), b"db").unwrap();
+        std::fs::write(legacy.join("workbench.db-wal"), b"wal").unwrap();
+
+        let migrated = migrate_legacy_data(&legacy, &new).expect("migrate ok");
+        assert!(migrated, "should report migration");
+        assert_eq!(std::fs::read(new.join("workbench.db")).unwrap(), b"db");
+        assert_eq!(std::fs::read(new.join("workbench.db-wal")).unwrap(), b"wal");
+        assert!(!legacy.join("workbench.db").exists(), "old db removed");
+        assert!(!legacy.join("workbench.db-wal").exists(), "old wal removed");
+    }
+
+    #[test]
+    fn migrate_legacy_data_skips_when_new_db_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let legacy = tmp.path().join("legacy");
+        let new = tmp.path().join("new");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(legacy.join("workbench.db"), b"old").unwrap();
+        std::fs::write(new.join("workbench.db"), b"new").unwrap();
+
+        let migrated = migrate_legacy_data(&legacy, &new).expect("migrate ok");
+        assert!(!migrated, "should not migrate over existing db");
+        // 新库保持原样，旧库不被动过
+        assert_eq!(std::fs::read(new.join("workbench.db")).unwrap(), b"new");
+        assert_eq!(std::fs::read(legacy.join("workbench.db")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn migrate_legacy_data_noop_without_legacy_db() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let legacy = tmp.path().join("legacy");
+        let new = tmp.path().join("new");
+
+        let migrated = migrate_legacy_data(&legacy, &new).expect("migrate ok");
+        assert!(!migrated, "nothing to migrate");
+        assert!(!new.join("workbench.db").exists(), "no db created");
     }
 }

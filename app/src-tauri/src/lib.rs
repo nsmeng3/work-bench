@@ -3,6 +3,7 @@
 mod aggregate;
 mod collection;
 mod db;
+mod dispatch;
 mod disposition;
 mod error;
 mod fs_ops;
@@ -20,7 +21,6 @@ mod terminal;
 mod todo;
 mod types;
 mod watch;
-mod dispatch;
 
 use sqlx::sqlite::SqlitePool;
 
@@ -56,12 +56,34 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
 
-            // 数据库文件位置：{平台用户数据目录}/resource-workbench/workbench.db
+            // 数据库文件位置：~/.workbench/workbench.db（home 目录下的固定数据目录，
+            // 便于备份与同步；真实资源文件仍保持原位，见详细设计 §3.3）
             let data_dir = app
                 .path()
-                .app_data_dir()
-                .map_err(|e| format!("获取 app data 目录失败: {}", e))?
-                .join(db::APP_DATA_DIR);
+                .home_dir()
+                .map_err(|e| format!("获取 home 目录失败: {}", e))?
+                .join(db::DATA_DIR_NAME);
+
+            // 一次性迁移旧版数据目录（{平台用户数据目录}/resource-workbench）。
+            // 迁移失败则中止启动，避免静默打开一个空库。
+            if let Ok(legacy_base) = app.path().app_data_dir() {
+                let legacy_dir = legacy_base.join(db::LEGACY_APP_DATA_DIR);
+                match db::migrate_legacy_data(&legacy_dir, &data_dir) {
+                    Ok(true) => {
+                        eprintln!("[startup] 已将旧数据迁移到 {}", data_dir.display())
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        return Err(format!(
+                            "旧数据目录迁移失败: {:?}。请手动将 {} 下的文件移动到 {}",
+                            e,
+                            legacy_dir.display(),
+                            data_dir.display()
+                        )
+                        .into())
+                    }
+                }
+            }
 
             let pool = tauri::async_runtime::block_on(db::init_pool_at(&data_dir))
                 .map_err(|e| format!("初始化数据库失败: {}", e))?;
