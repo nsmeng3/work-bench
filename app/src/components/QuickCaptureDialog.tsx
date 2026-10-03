@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Input, Modal, Select, Space as AntSpace, Tag, message } from "antd";
 import type { InputRef } from "antd";
-import { spaceList, todoCreate, toApiError } from "../api";
-import type { Space, TodoPriority } from "../api";
+import { collectionList, spaceList, todoCreate, toApiError } from "../api";
+import type { Collection, Space, TodoPriority } from "../api";
 
 interface QuickCaptureDialogProps {
   open: boolean;
@@ -12,14 +12,17 @@ interface QuickCaptureDialogProps {
 /**
  * m8-8.1 · 快速记录弹窗（全局快捷键 Cmd/Ctrl+Shift+T 唤起）。
  *
- * 极简：标题（必填，回车即存）+ 空间（可选，默认全局）+ 优先级。
+ * 极简：标题（必填，回车即存）+ 空间/资源集（可选，默认全局）+ 优先级。
+ * 选中资源集时空间自动跟随（资源集本身就在空间下）。
  * 保存后立即关闭，通过 message 反馈；Esc 直接关闭。
  */
 export function QuickCaptureDialog({ open, onClose }: QuickCaptureDialogProps) {
   const [title, setTitle] = useState("");
   const [spaceId, setSpaceId] = useState<string | undefined>(undefined);
+  const [collectionId, setCollectionId] = useState<string | undefined>(undefined);
   const [priority, setPriority] = useState<TodoPriority>(0);
   const [spaces, setSpaces] = useState<Space[]>([]);
+  const [collections, setCollections] = useState<Collection[]>([]);
   const [saving, setSaving] = useState(false);
   const inputRef = useRef<InputRef>(null);
   const [messageApi, messageContextHolder] = message.useMessage();
@@ -29,9 +32,17 @@ export function QuickCaptureDialog({ open, onClose }: QuickCaptureDialogProps) {
     if (!open) return;
     setTitle("");
     setSpaceId(undefined);
+    setCollectionId(undefined);
     setPriority(0);
     spaceList({ status: "active" })
-      .then(setSpaces)
+      .then(async (list) => {
+        setSpaces(list);
+        // 全部资源集（按空间分组展示用）
+        const cols = await Promise.all(
+          list.map((s) => collectionList({ spaceId: s.id, status: "active" })),
+        );
+        setCollections(cols.flat());
+      })
       .catch(() => void 0);
     // Modal 动画结束后聚焦
     const t = setTimeout(() => inputRef.current?.focus(), 120);
@@ -46,6 +57,7 @@ export function QuickCaptureDialog({ open, onClose }: QuickCaptureDialogProps) {
       await todoCreate({
         title: trimmed,
         spaceId,
+        collectionId,
         priority: priority > 0 ? priority : undefined,
       });
       messageApi.success({ content: "已记录", duration: 1.5 });
@@ -89,14 +101,45 @@ export function QuickCaptureDialog({ open, onClose }: QuickCaptureDialogProps) {
           maxLength={200}
           disabled={saving}
         />
-        <AntSpace style={{ width: "100%" }}>
+        <AntSpace style={{ width: "100%" }} wrap>
           <Select
-            style={{ minWidth: 180 }}
+            style={{ minWidth: 150 }}
             allowClear
             placeholder="全局（不挂空间）"
             value={spaceId}
-            onChange={(v) => setSpaceId(v)}
+            onChange={(v) => {
+              setSpaceId(v);
+              // 空间变更后资源集不再匹配则清掉
+              if (collectionId) {
+                const col = collections.find((c) => c.id === collectionId);
+                if (col && col.spaceId !== v) setCollectionId(undefined);
+              }
+            }}
             options={spaces.map((s) => ({ value: s.id, label: s.name }))}
+          />
+          <Select
+            style={{ minWidth: 180 }}
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="不挂资源集"
+            value={collectionId}
+            onChange={(v) => {
+              setCollectionId(v);
+              // 选中资源集 → 空间自动跟随
+              if (v) {
+                const col = collections.find((c) => c.id === v);
+                if (col) setSpaceId(col.spaceId);
+              }
+            }}
+            options={spaces
+              .map((s) => ({
+                label: s.name,
+                options: collections
+                  .filter((c) => c.spaceId === s.id)
+                  .map((c) => ({ value: c.id, label: c.name })),
+              }))
+              .filter((g) => g.options.length > 0)}
           />
           <Select
             style={{ minWidth: 100 }}
