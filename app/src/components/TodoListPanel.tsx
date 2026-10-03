@@ -1,4 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
+import dayjs from "dayjs";
+import type { Dayjs } from "dayjs";
 import {
   Button,
   Checkbox,
@@ -126,7 +128,7 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
     spaceId?: string | null;
     collectionId?: string | null;
     priority: TodoPriority;
-    dueAt?: { unix(): number } | null;
+    dueAt?: Dayjs | null;
     status: TodoStatus;
   }>();
   /** m8-8.5 · 详情抽屉的资源集选项（随所选空间联动加载） */
@@ -260,7 +262,7 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
         spaceId: d.spaceId ?? null,
         collectionId: d.collectionId ?? null,
         priority: d.priority,
-        dueAt: d.dueAt ? ({ unix: () => d.dueAt! } as { unix(): number }) : null,
+        dueAt: d.dueAt ? dayjs.unix(d.dueAt) : null,
         status: d.status,
       });
     } catch (err) {
