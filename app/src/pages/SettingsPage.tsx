@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  Anchor,
   Button,
   Card,
+  Divider,
   Empty,
   Form,
   Input,
@@ -48,15 +50,25 @@ import { RootDirPicker } from "../components/RootDirPicker";
 import { MigrationWizard } from "../components/MigrationWizard";
 
 /**
- * 设置页 — 四分区卡片式布局（M6-6.5）。
- * 契约：详细设计说明书 §2.8。
+ * 设置页 — 左侧锚点定位菜单 + 右侧独立滚动（双栏布局）。
  *
- * 分区：
- * 1. 根目录：显示当前根目录 + 类型子目录状态
- * 2. 监控目录：复用 M6-6.3 逻辑
- * 3. 存储源：显示 LocalFsSource 信息 + 能力标签 + 名称编辑
- * 4. 默认程序：按 6 种类型配置默认打开方式
+ * 分区（按类型聚合，锚点与之一一对应）：
+ * 1. 通用：启动默认页、开机自启
+ * 2. 存储：根目录 + 存储源（数据存放相关合并）
+ * 3. 监控：监控目录
+ * 4. 打开方式：按 6 种资源类型配置默认打开方式
+ *
+ * 滚动模式与收件箱一致：右栏 flex item 由交叉轴 stretch 定界 + overflowY:auto；
+ * 左栏固定不滚。Anchor.getContainer 指向右栏，点击定位、滚动高亮跟随。
  */
+
+/** 设置分区锚点定义（id 前缀 settings-） */
+const SECTION_ANCHORS = [
+  { key: "general", href: "#settings-general", title: "通用" },
+  { key: "storage", href: "#settings-storage", title: "存储" },
+  { key: "watch", href: "#settings-watch", title: "监控" },
+  { key: "open-with", href: "#settings-open-with", title: "打开方式" },
+];
 
 const REFERENCE_TYPES: { key: ReferenceType; label: string }[] = [
   { key: "code", label: "代码" },
@@ -78,6 +90,8 @@ export function SettingsPage() {
   const [removingDir, setRemovingDir] = useState<WatchDirConfig | null>(null);
   const [addForm] = Form.useForm();
   const [submitting, setSubmitting] = useState(false);
+  /** 右侧滚动容器 ref：Anchor 的定位目标容器 */
+  const contentRef = useRef<HTMLDivElement>(null);
 
   // ---------- 根目录状态 ----------
   const [rootDirStatus, setRootDirStatus] = useState<RootDirStatus | null>(null);
@@ -345,11 +359,26 @@ export function SettingsPage() {
   // ---------- 渲染 ----------
 
   return (
-    <div style={{ maxWidth: 800, margin: "0 auto" }}>
-      <Typography.Title level={3}>设置</Typography.Title>
+    <div style={{ height: "100%", display: "flex", gap: 16 }}>
+      {/* 左侧定位菜单（固定不随内容滚动） */}
+      <div style={{ width: 140, flexShrink: 0 }}>
+        <Typography.Title level={3}>设置</Typography.Title>
+        <Anchor
+          affix={false}
+          getContainer={() => contentRef.current as HTMLElement}
+          items={SECTION_ANCHORS}
+        />
+      </div>
 
-      {/* 通用分区（M7-3 · 启动默认页） */}
-      <Card title="通用" style={{ marginBottom: 16 }} loading={defaultHomeLoading}>
+      {/* 右侧内容区（独立滚动；minWidth:0 防横向撑爆） */}
+      <div
+        ref={contentRef}
+        style={{ flex: 1, minWidth: 0, height: "100%", overflowY: "auto", paddingRight: 8 }}
+      >
+        <div style={{ maxWidth: 800 }}>
+          {/* 通用分区 */}
+          <section id="settings-general" style={{ scrollMarginTop: 4 }}>
+            <Card title="通用" style={{ marginBottom: 16 }} loading={defaultHomeLoading}>
         <Space direction="vertical" size={8} style={{ width: "100%" }}>
           <Space align="center" style={{ width: "100%", justifyContent: "space-between" }}>
             <Typography.Text>启动时打开</Typography.Text>
@@ -378,194 +407,206 @@ export function SettingsPage() {
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             开启后登录系统时自动启动并驻留菜单栏（不弹出主窗口）。
           </Typography.Text>
-        </Space>
-      </Card>
+              </Space>
+            </Card>
+          </section>
 
-      {/* 根目录分区 */}
-      <Card
-        title="根目录"
-        style={{ marginBottom: 16 }}
-        extra={
-          <Button
-            icon={<SettingOutlined />}
-            onClick={() => setMigrationWizardOpen(true)}
-            disabled={!rootDirStatus?.initialized}
-          >
-            修改根目录
-          </Button>
-        }
-        loading={rootDirLoading}
-      >
-        {rootDirStatus?.initialized && rootDirStatus.rootDir ? (
-          <Space direction="vertical" size={8} style={{ width: "100%" }}>
-            <Typography.Text strong>{rootDirStatus.rootDir}</Typography.Text>
-            <Space size={8} wrap>
-              {TYPE_SUBDIRS.map((subdir) => (
-                <Tag key={subdir} color="green">
-                  {subdir}
-                </Tag>
-              ))}
-            </Space>
-          </Space>
-        ) : (
-          <Empty description="根目录未初始化" />
-        )}
-      </Card>
-
-      {/* 监控目录分区 */}
-      <Card
-        title="监控目录"
-        style={{ marginBottom: 16 }}
-        extra={
-          <Button
-            type="primary"
-            icon={<FolderAddOutlined />}
-            onClick={() => setAddModalOpen(true)}
-          >
-            添加目录
-          </Button>
-        }
-      >
-        <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
-          监控目录中的新文件会自动进入收件箱。请使用绝对路径。
-        </Typography.Paragraph>
-
-        <List<WatchDirConfig>
-          loading={dirsLoading}
-          dataSource={dirs}
-          rowKey="path"
-          locale={{ emptyText: <Empty description="暂无监控目录" /> }}
-          renderItem={(dir) => (
-            <List.Item
-              actions={[
-                <Button
-                  key="remove"
-                  type="text"
-                  danger
-                  icon={<DeleteOutlined />}
-                  onClick={() => handleRemove(dir)}
-                >
-                  移除
-                </Button>,
-              ]}
-            >
-              <List.Item.Meta
-                title={
-                  <Space size={8}>
-                    {dir.name || dir.path}
-                    {dir.paused === 1 && (
-                      <Tag color="red" title="监听挂载失败（可能缺少完全磁盘访问权限），重新保存该目录可重试">
-                        已暂停
-                      </Tag>
-                    )}
-                  </Space>
-                }
-                description={
-                  <Space direction="vertical" size={0}>
-                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      {dir.path}
-                    </Typography.Text>
-                    {dir.description && (
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                        {dir.description}
-                      </Typography.Text>
-                    )}
-                  </Space>
-                }
-              />
-            </List.Item>
-          )}
-        />
-      </Card>
-
-      {/* 存储源分区 */}
-      <Card title="存储源" style={{ marginBottom: 16 }} loading={sourcesLoading}>
-        <List<StorageSourceInfo>
-          dataSource={sources}
-          rowKey="id"
-          locale={{ emptyText: <Empty description="暂无存储源" /> }}
-          renderItem={(source) => (
-            <List.Item
-              actions={[
-                <Button
-                  key="edit"
-                  type="text"
-                  icon={<EditOutlined />}
-                  onClick={() => handleEditSource(source)}
-                >
-                  编辑
-                </Button>,
-              ]}
-            >
-              <List.Item.Meta
-                title={source.name}
-                description={
-                  <Space direction="vertical" size={4}>
-                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      类型：{source.kind} · 状态：{source.status}
-                    </Typography.Text>
-                    <Space size={4} wrap>
-                      <Tag color={source.capabilities.archive ? "green" : "default"}>
-                        archive
-                      </Tag>
-                      <Tag color={source.capabilities.softDelete ? "green" : "default"}>
-                        softDelete
-                      </Tag>
-                      <Tag color={source.capabilities.destroy ? "green" : "default"}>
-                        destroy
-                      </Tag>
-                      <Tag color={source.capabilities.restoreFromBin ? "green" : "default"}>
-                        restoreFromBin
-                      </Tag>
-                    </Space>
-                  </Space>
-                }
-              />
-            </List.Item>
-          )}
-        />
-      </Card>
-
-      {/* 默认程序分区 */}
-      <Card title="默认程序" loading={defaultAppsLoading}>
-        <List
-          dataSource={REFERENCE_TYPES}
-          rowKey="key"
-          renderItem={({ key, label }) => {
-            const cfg = defaultApps[key];
-            const isCustom = cfg?.strategy === "app";
-            return (
-              <List.Item
-                actions={[
-                  <Button
-                    key="set"
-                    type="text"
-                    icon={<SettingOutlined />}
-                    onClick={() => handleEditApp(key)}
-                  >
-                    设置
-                  </Button>,
-                ]}
+          {/* 存储分区：根目录 + 存储源（数据存放相关合并） */}
+          <section id="settings-storage" style={{ scrollMarginTop: 4 }}>
+            <Card title="存储" style={{ marginBottom: 16 }} loading={rootDirLoading || sourcesLoading}>
+              <Space
+                align="center"
+                style={{ width: "100%", justifyContent: "space-between", marginBottom: 8 }}
               >
-                <List.Item.Meta
-                  title={label}
-                  description={
-                    isCustom ? (
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                        {cfg.appPath}
-                      </Typography.Text>
-                    ) : (
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                        系统默认
-                      </Typography.Text>
-                    )
-                  }
-                />
-              </List.Item>
-            );
-          }}
-        />
-      </Card>
+                <Typography.Text strong>根目录</Typography.Text>
+                <Button
+                  size="small"
+                  icon={<SettingOutlined />}
+                  onClick={() => setMigrationWizardOpen(true)}
+                  disabled={!rootDirStatus?.initialized}
+                >
+                  修改根目录
+                </Button>
+              </Space>
+              {rootDirStatus?.initialized && rootDirStatus.rootDir ? (
+                <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                  <Typography.Text>{rootDirStatus.rootDir}</Typography.Text>
+                  <Space size={8} wrap>
+                    {TYPE_SUBDIRS.map((subdir) => (
+                      <Tag key={subdir} color="green">
+                        {subdir}
+                      </Tag>
+                    ))}
+                  </Space>
+                </Space>
+              ) : (
+                <Empty description="根目录未初始化" />
+              )}
+
+              <Divider style={{ margin: "16px 0" }} />
+
+              <Typography.Text strong style={{ display: "block", marginBottom: 8 }}>
+                存储源
+              </Typography.Text>
+              <List<StorageSourceInfo>
+                dataSource={sources}
+                rowKey="id"
+                locale={{ emptyText: <Empty description="暂无存储源" /> }}
+                renderItem={(source) => (
+                  <List.Item
+                    actions={[
+                      <Button
+                        key="edit"
+                        type="text"
+                        icon={<EditOutlined />}
+                        onClick={() => handleEditSource(source)}
+                      >
+                        编辑
+                      </Button>,
+                    ]}
+                  >
+                    <List.Item.Meta
+                      title={source.name}
+                      description={
+                        <Space direction="vertical" size={4}>
+                          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                            类型：{source.kind} · 状态：{source.status}
+                          </Typography.Text>
+                          <Space size={4} wrap>
+                            <Tag color={source.capabilities.archive ? "green" : "default"}>
+                              archive
+                            </Tag>
+                            <Tag color={source.capabilities.softDelete ? "green" : "default"}>
+                              softDelete
+                            </Tag>
+                            <Tag color={source.capabilities.destroy ? "green" : "default"}>
+                              destroy
+                            </Tag>
+                            <Tag color={source.capabilities.restoreFromBin ? "green" : "default"}>
+                              restoreFromBin
+                            </Tag>
+                          </Space>
+                        </Space>
+                      }
+                    />
+                  </List.Item>
+                )}
+              />
+            </Card>
+          </section>
+
+          {/* 监控分区 */}
+          <section id="settings-watch" style={{ scrollMarginTop: 4 }}>
+            <Card
+              title="监控"
+              style={{ marginBottom: 16 }}
+              extra={
+                <Button
+                  type="primary"
+                  icon={<FolderAddOutlined />}
+                  onClick={() => setAddModalOpen(true)}
+                >
+                  添加目录
+                </Button>
+              }
+            >
+              <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
+                监控目录中的新文件会自动进入收件箱。请使用绝对路径。
+              </Typography.Paragraph>
+
+              <List<WatchDirConfig>
+                loading={dirsLoading}
+                dataSource={dirs}
+                rowKey="path"
+                locale={{ emptyText: <Empty description="暂无监控目录" /> }}
+                renderItem={(dir) => (
+                  <List.Item
+                    actions={[
+                      <Button
+                        key="remove"
+                        type="text"
+                        danger
+                        icon={<DeleteOutlined />}
+                        onClick={() => handleRemove(dir)}
+                      >
+                        移除
+                      </Button>,
+                    ]}
+                  >
+                    <List.Item.Meta
+                      title={
+                        <Space size={8}>
+                          {dir.name || dir.path}
+                          {dir.paused === 1 && (
+                            <Tag color="red" title="监听挂载失败（可能缺少完全磁盘访问权限），重新保存该目录可重试">
+                              已暂停
+                            </Tag>
+                          )}
+                        </Space>
+                      }
+                      description={
+                        <Space direction="vertical" size={0}>
+                          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                            {dir.path}
+                          </Typography.Text>
+                          {dir.description && (
+                            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                              {dir.description}
+                            </Typography.Text>
+                          )}
+                        </Space>
+                      }
+                    />
+                  </List.Item>
+                )}
+              />
+            </Card>
+          </section>
+
+          {/* 打开方式分区 */}
+          <section id="settings-open-with" style={{ scrollMarginTop: 4 }}>
+            <Card title="打开方式" style={{ marginBottom: 16 }} loading={defaultAppsLoading}>
+              <List
+                dataSource={REFERENCE_TYPES}
+                rowKey="key"
+                renderItem={({ key, label }) => {
+                  const cfg = defaultApps[key];
+                  const isCustom = cfg?.strategy === "app";
+                  return (
+                    <List.Item
+                      actions={[
+                        <Button
+                          key="set"
+                          type="text"
+                          icon={<SettingOutlined />}
+                          onClick={() => handleEditApp(key)}
+                        >
+                          设置
+                        </Button>,
+                      ]}
+                    >
+                      <List.Item.Meta
+                        title={label}
+                        description={
+                          isCustom ? (
+                            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                              {cfg.appPath}
+                            </Typography.Text>
+                          ) : (
+                            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                              系统默认
+                            </Typography.Text>
+                          )
+                        }
+                      />
+                    </List.Item>
+                  );
+                }}
+              />
+            </Card>
+          </section>
+        </div>
+      </div>
 
       {/* 添加目录对话框 */}
       <Modal
