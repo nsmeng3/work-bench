@@ -17,22 +17,30 @@ import {
   Typography,
   message,
 } from "antd";
+import type { MenuProps } from "antd";
 import {
   ArrowLeftOutlined,
   CodeOutlined,
   CopyOutlined,
+  DeleteOutlined,
+  DisconnectOutlined,
   DownOutlined,
   EditOutlined,
   ExportOutlined,
   FolderOpenOutlined,
+  InboxOutlined,
+  MoreOutlined,
   PlayCircleOutlined,
   PlusOutlined,
   ReloadOutlined,
   RollbackOutlined,
+  UndoOutlined,
+  WarningOutlined,
 } from "@ant-design/icons";
 import type {
   Collection,
   CollectionDetail,
+  DispCapabilities,
   Reference,
   ReferenceConfidentiality,
   ReferenceHealth,
@@ -43,6 +51,7 @@ import type {
 } from "../api";
 import {
   collectionGet,
+  dispGetCapabilities,
   refCopyPath,
   refLogAccessSafe,
   refOpen,
@@ -56,7 +65,6 @@ import {
 import { ReferenceCreateDialog } from "../components/ReferenceCreateDialog";
 import { ReferenceManagedDialog } from "../components/ReferenceManagedDialog";
 import { ReferenceTodoPanel } from "../components/ReferenceTodoPanel";
-import { DispositionButtons } from "../components/DispositionButtons";
 import type { DispositionAction } from "../components/DispositionButtons";
 import { DispositionConfirmDialog } from "../components/DispositionConfirmDialog";
 import { TodoListPanel } from "../components/TodoListPanel";
@@ -140,6 +148,184 @@ interface RefEditFormValues {
   lifecycle: ReferenceLifecycle;
   confidentiality: ReferenceConfidentiality;
   indexed: boolean;
+}
+
+
+/** 行内操作回调束（RefListItemRow 入参） */
+interface RefRowHandlers {
+  onOpen: (ref: Reference) => void;
+  onReveal: (ref: Reference) => void;
+  onOpenEmbeddedTerminal: (ref: Reference) => void;
+  onOpenInTerminal: (ref: Reference) => void;
+  onCopyPath: (ref: Reference) => void;
+  onOpenWith: (ref: Reference) => void;
+  onEdit: (ref: Reference) => void;
+  onUndo: (ref: Reference) => void;
+  onDisposition: (ref: Reference, action: DispositionAction) => void;
+}
+
+/**
+ * 资源列表行：行内按钮仅保留「打开 / 编辑 / ⋯更多」，
+ * 其余操作（访达/终端/复制路径/撤销导入/归档/解除关联/删除/销毁）
+ * 统一归拢进右键菜单，「⋯」按钮以左键点击弹出同一菜单。
+ */
+function RefListItemRow({
+  item,
+  canUndo,
+  embeddedTerminalAvailable,
+  handlers,
+}: {
+  item: ReferenceWithHealth;
+  canUndo: boolean;
+  embeddedTerminalAvailable: boolean;
+  handlers: RefRowHandlers;
+}) {
+  const { ref, health } = item;
+  const meta = HEALTH_META[health];
+  const isPathLocator = ref.locator.kind === "path";
+
+  // 处置能力（归档/删除/销毁可用性），与原 DispositionButtons 同数据源
+  const [caps, setCaps] = useState<DispCapabilities | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setCaps(null);
+    dispGetCapabilities(ref.id)
+      .then((c) => {
+        if (!cancelled) setCaps(c);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [ref.id, ref.disposition]);
+
+  const isArchived = ref.disposition === "archived";
+  const menuItems: MenuProps["items"] = [
+    { key: "open", label: "打开", icon: <PlayCircleOutlined /> },
+    { key: "reveal", label: "访达中显示", icon: <FolderOpenOutlined />, disabled: !isPathLocator },
+    {
+      key: "open_in_embedded_terminal",
+      label: "在内嵌终端打开",
+      icon: <CodeOutlined />,
+      disabled: !isPathLocator || !embeddedTerminalAvailable,
+    },
+    {
+      key: "open_in_terminal",
+      label: "在系统终端中打开",
+      icon: <CodeOutlined />,
+      disabled: !isPathLocator,
+    },
+    { key: "copy_path", label: "复制路径", icon: <CopyOutlined />, disabled: !isPathLocator },
+    { key: "open_with", label: "用其他程序打开…", icon: <ExportOutlined />, disabled: !isPathLocator },
+    { type: "divider" },
+    ...(canUndo ? [{ key: "undo", label: "撤销导入", icon: <UndoOutlined /> }] : []),
+    ...(caps
+      ? [
+          isArchived
+            ? { key: "unarchive", label: "恢复", icon: <RollbackOutlined /> }
+            : { key: "archive", label: "归档", icon: <InboxOutlined />, disabled: !caps.archive },
+          ...(caps.unlink
+            ? [{ key: "unlink", label: "解除关联", icon: <DisconnectOutlined /> }]
+            : []),
+          {
+            key: "softDelete",
+            label: "删除",
+            icon: <DeleteOutlined />,
+            disabled: !caps.softDelete,
+            danger: true,
+          },
+          {
+            key: "destroy",
+            label: "销毁",
+            icon: <WarningOutlined />,
+            disabled: !caps.destroy,
+            danger: true,
+          },
+        ]
+      : [{ key: "caps-loading", label: "处置能力加载中…", disabled: true }]),
+  ];
+
+  const handleMenuClick = ({ key }: { key: string }) => {
+    if (key === "open") handlers.onOpen(ref);
+    else if (key === "reveal") handlers.onReveal(ref);
+    else if (key === "open_in_embedded_terminal") handlers.onOpenEmbeddedTerminal(ref);
+    else if (key === "open_in_terminal") handlers.onOpenInTerminal(ref);
+    else if (key === "copy_path") handlers.onCopyPath(ref);
+    else if (key === "open_with") handlers.onOpenWith(ref);
+    else if (key === "undo") handlers.onUndo(ref);
+    else if (["archive", "unarchive", "softDelete", "destroy", "unlink"].includes(key)) {
+      handlers.onDisposition(ref, key as DispositionAction);
+    }
+  };
+
+  return (
+    <Dropdown menu={{ items: menuItems, onClick: handleMenuClick }} trigger={["contextMenu"]}>
+      <div
+        onDoubleClick={() => {
+          if (isPathLocator) handlers.onOpen(ref);
+        }}
+        style={{ cursor: isPathLocator ? "pointer" : "default" }}
+      >
+        <List.Item
+          actions={[
+            <Button
+              key="open"
+              type="text"
+              size="small"
+              icon={<PlayCircleOutlined />}
+              disabled={!isPathLocator}
+              onClick={() => handlers.onOpen(ref)}
+            >
+              打开
+            </Button>,
+            <Button
+              key="edit"
+              type="text"
+              size="small"
+              icon={<EditOutlined />}
+              onClick={() => handlers.onEdit(ref)}
+            >
+              编辑
+            </Button>,
+            <Dropdown key="more" menu={{ items: menuItems, onClick: handleMenuClick }} trigger={["click"]}>
+              <Button type="text" size="small" icon={<MoreOutlined />} />
+            </Dropdown>,
+          ]}
+        >
+          <List.Item.Meta
+            title={
+              <AntSpace size={8} wrap>
+                <span style={{ fontWeight: 600 }}>{ref.name}</span>
+                <Badge status={meta.color as "success" | "error" | "default"} text={meta.text} />
+                <Tag>{LIFECYCLE_LABEL[ref.lifecycle] ?? ref.lifecycle}</Tag>
+                <Tag color="blue">
+                  {CONFIDENTIALITY_LABEL[ref.confidentiality] ?? ref.confidentiality}
+                </Tag>
+              </AntSpace>
+            }
+            description={
+              <AntSpace direction="vertical" size={2} style={{ width: "100%" }}>
+                {ref.description && (
+                  <Text
+                    ellipsis={{ tooltip: ref.description }}
+                    style={{ fontSize: 13, maxWidth: "100%" }}
+                  >
+                    {ref.description}
+                  </Text>
+                )}
+                <Text type="secondary" style={{ fontFamily: "monospace", fontSize: 12 }}>
+                  {locatorText(ref)}
+                </Text>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  创建时间：{formatUnixSeconds(ref.createdAt)}
+                </Text>
+              </AntSpace>
+            }
+          />
+        </List.Item>
+      </div>
+    </Dropdown>
+  );
 }
 
 export function CollectionDetailPage({ space, collection, onBack, onOpenEmbeddedTerminal }: CollectionDetailPageProps) {
@@ -369,140 +555,17 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
   /** 当前选中类型的资源列表 */
   const activeItems = detail?.referencesByType[activeType] ?? [];
 
-  /** 资源列表条目渲染（右键菜单 / 双击打开 / 行内操作，与原手风琴内实现一致） */
-  const renderRefItem = ({ ref, health }: ReferenceWithHealth) => {
-              const meta = HEALTH_META[health];
-              const isPathLocator = ref.locator.kind === "path";
-              const contextMenuItems = [
-                { key: "open", label: "打开", icon: <PlayCircleOutlined /> },
-                {
-                  key: "reveal",
-                  label: "访达中显示",
-                  icon: <FolderOpenOutlined />,
-                  disabled: !isPathLocator,
-                },
-                {
-                  key: "open_in_embedded_terminal",
-                  label: "在内嵌终端打开",
-                  icon: <CodeOutlined />,
-                  disabled: !isPathLocator || !onOpenEmbeddedTerminal,
-                },
-                {
-                  key: "open_in_terminal",
-                  label: "在系统终端中打开",
-                  icon: <CodeOutlined />,
-                  disabled: !isPathLocator,
-                },
-                {
-                  key: "copy_path",
-                  label: "复制路径",
-                  icon: <CopyOutlined />,
-                  disabled: !isPathLocator,
-                },
-                { type: "divider" as const },
-                {
-                  key: "open_with",
-                  label: "用其他程序打开…",
-                  icon: <ExportOutlined />,
-                  disabled: !isPathLocator,
-                },
-              ];
-              const handleMenuClick = ({ key }: { key: string }) => {
-                if (key === "open") void handleOpen(ref);
-                else if (key === "reveal") void handleReveal(ref);
-                else if (key === "open_in_embedded_terminal") void handleOpenEmbeddedTerminal(ref);
-                else if (key === "open_in_terminal") void handleOpenInTerminal(ref);
-                else if (key === "copy_path") void handleCopyPath(ref);
-                else if (key === "open_with") void handleOpenWith(ref);
-              };
-              return (
-                <Dropdown
-                  key={ref.id}
-                  menu={{ items: contextMenuItems, onClick: handleMenuClick }}
-                  trigger={["contextMenu"]}
-                >
-                  <div
-                    onDoubleClick={() => {
-                      if (isPathLocator) void handleOpen(ref);
-                    }}
-                    style={{ cursor: isPathLocator ? "pointer" : "default" }}
-                  >
-                    <List.Item
-                      actions={[
-                        <Button
-                          key="open"
-                          type="text"
-                          size="small"
-                          icon={<PlayCircleOutlined />}
-                          disabled={!isPathLocator}
-                          onClick={() => void handleOpen(ref)}
-                        >
-                          打开
-                        </Button>,
-                        <Button
-                          key="edit"
-                          type="text"
-                          size="small"
-                          icon={<EditOutlined />}
-                          onClick={() => openEditModal(ref)}
-                        >
-                          编辑
-                        </Button>,
-                        ...(canShowUndoButton(ref)
-                          ? [
-                              <Button
-                                key="undo"
-                                type="text"
-                                size="small"
-                                icon={<RollbackOutlined />}
-                                onClick={() => openUndoDialog(ref)}
-                              >
-                                撤销导入
-                              </Button>,
-                            ]
-                          : []),
-                        <DispositionButtons
-                          key="disposition"
-                          reference={ref}
-                          size="small"
-                          onAction={(action) => openDispositionDialog(ref, action)}
-                        />,
-                      ]}
-                    >
-                      <List.Item.Meta
-                        title={
-                          <AntSpace size={8} wrap>
-                            <span style={{ fontWeight: 600 }}>{ref.name}</span>
-                            <Badge status={meta.color as "success" | "error" | "default"} text={meta.text} />
-                            <Tag>{LIFECYCLE_LABEL[ref.lifecycle] ?? ref.lifecycle}</Tag>
-                            <Tag color="blue">
-                              {CONFIDENTIALITY_LABEL[ref.confidentiality] ?? ref.confidentiality}
-                            </Tag>
-                          </AntSpace>
-                        }
-                        description={
-                          <AntSpace direction="vertical" size={2} style={{ width: "100%" }}>
-                            {ref.description && (
-                              <Text
-                                ellipsis={{ tooltip: ref.description }}
-                                style={{ fontSize: 13, maxWidth: "100%" }}
-                              >
-                                {ref.description}
-                              </Text>
-                            )}
-                            <Text type="secondary" style={{ fontFamily: "monospace", fontSize: 12 }}>
-                              {locatorText(ref)}
-                            </Text>
-                            <Text type="secondary" style={{ fontSize: 12 }}>
-                              创建时间：{formatUnixSeconds(ref.createdAt)}
-                            </Text>
-                          </AntSpace>
-                        }
-                      />
-                    </List.Item>
-                  </div>
-                </Dropdown>
-              );
+  /** 行内操作回调束（传给 RefListItemRow；行内仅 打开/编辑/⋯，其余入菜单） */
+  const rowHandlers: RefRowHandlers = {
+    onOpen: (ref) => void handleOpen(ref),
+    onReveal: (ref) => void handleReveal(ref),
+    onOpenEmbeddedTerminal: (ref) => void handleOpenEmbeddedTerminal(ref),
+    onOpenInTerminal: (ref) => void handleOpenInTerminal(ref),
+    onCopyPath: (ref) => void handleCopyPath(ref),
+    onOpenWith: (ref) => void handleOpenWith(ref),
+    onEdit: (ref) => openEditModal(ref),
+    onUndo: (ref) => openUndoDialog(ref),
+    onDisposition: (ref, action) => openDispositionDialog(ref, action),
   };
 
   return (
@@ -691,7 +754,18 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
                   style={{ padding: "16px 0" }}
                 />
               ) : (
-                <List<ReferenceWithHealth> dataSource={activeItems} renderItem={renderRefItem} />
+                <List<ReferenceWithHealth>
+                  dataSource={activeItems}
+                  renderItem={(item) => (
+                    <RefListItemRow
+                      key={item.ref.id}
+                      item={item}
+                      canUndo={canShowUndoButton(item.ref)}
+                      embeddedTerminalAvailable={!!onOpenEmbeddedTerminal}
+                      handlers={rowHandlers}
+                    />
+                  )}
+                />
               )}
             </div>
           </div>
