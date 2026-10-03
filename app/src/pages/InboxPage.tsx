@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { UIEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   Alert,
@@ -6,7 +7,6 @@ import {
   Empty,
   Layout,
   List,
-  Pagination,
   Tabs,
   Typography,
   message,
@@ -25,13 +25,18 @@ import { InboxAssignDialog } from "../components/InboxAssignDialog";
  * 收件箱页 — 任务包 m5-5.6 / m5-5.7。
  * 契约：详细设计说明书 §2.7。
  *
- * 布局：左侧列表（Tabs 状态过滤 + List + Pagination pageSize=50），
+ * 布局：左侧列表（Tabs 状态过滤 + List 无限滚动，每批 50 条），
  * 右侧详情面板（InboxDetailPanel）。
  *
  * 「处理」按钮：m5-5.7 接入 InboxAssignDialog，支持 external/managed 两种模式。
  */
 
+/** 每批加载条数（与后端 LIST_MAX_LIMIT=200 对齐：静默刷新最多一次拉回 200） */
 const PAGE_SIZE = 50;
+/** 后端 limit 上限（inbox.rs LIST_MAX_LIMIT），静默刷新时的封顶 */
+const MAX_REFRESH_LIMIT = 200;
+/** 距底部多少像素内触发加载下一批 */
+const LOAD_MORE_THRESHOLD_PX = 80;
 
 type StatusFilter = InboxStatus | "all";
 
@@ -44,11 +49,18 @@ const TAB_ITEMS: { key: StatusFilter; label: string }[] = [
 
 export function InboxPage() {
   const [status, setStatus] = useState<StatusFilter>("pending");
-  const [page, setPage] = useState(1);
   const [items, setItems] = useState<InboxItem[]>([]);
   const [loading, setLoading] = useState(false);
-  /** 是否可能还有下一页（当前页返回数量 == PAGE_SIZE 时认为有） */
+  /** 底部追加加载中（区别于首屏 loading，避免整列表闪 loading 态） */
+  const [loadingMore, setLoadingMore] = useState(false);
+  /** 是否可能还有下一批（当前批返回数量 == PAGE_SIZE 时认为有） */
   const [hasMore, setHasMore] = useState(false);
+
+  /** 列表滚动容器 ref（切 Tab 后回滚顶部） */
+  const listRef = useRef<HTMLDivElement>(null);
+  /** items 的 ref 镜像：scroll 事件闭包里读最新条数，避免 stale closure */
+  const itemsRef = useRef<InboxItem[]>([]);
+  itemsRef.current = items;
 
   /** 已失效（stale）条目数：> 0 时显示批量清理提示条 */
   const [staleCount, setStaleCount] = useState(0);
@@ -71,21 +83,27 @@ export function InboxPage() {
     }
   }, []);
 
+  /**
+   * 首屏 / 切 Tab / 静默刷新：从 offset 0 重拉（后端 SQL 级 LIMIT/OFFSET 分页）。
+   * limit 默认 PAGE_SIZE；静默刷新时传「已加载条数」（封顶 MAX_REFRESH_LIMIT），
+   * 避免已展开的列表被刷掉。
+   */
   const loadList = useCallback(
-    async (nextStatus: StatusFilter, nextPage: number, keepSelection = false) => {
+    async (nextStatus: StatusFilter, keepSelection = false, limit: number = PAGE_SIZE) => {
       setLoading(true);
       try {
         const list = await inboxList({
           status: nextStatus === "all" ? undefined : nextStatus,
-          limit: PAGE_SIZE,
-          offset: (nextPage - 1) * PAGE_SIZE,
+          limit,
+          offset: 0,
         });
         setItems(list);
-        setHasMore(list.length === PAGE_SIZE);
+        setHasMore(list.length === limit);
         if (!keepSelection) {
-          // 切换状态/分页时清空选中
+          // 切换状态时清空选中并回滚列表到顶部
           setSelectedId(null);
           setDetail(null);
+          listRef.current?.scrollTo({ top: 0 });
         }
         void refreshStaleCount();
       } catch (err) {
@@ -97,6 +115,26 @@ export function InboxPage() {
     },
     [refreshStaleCount],
   );
+
+  /** 无限滚动：按 offset=已加载条数 向后端拉下一批，追加到列表尾部 */
+  const loadMore = useCallback(async () => {
+    if (loading || loadingMore || !hasMore) return;
+    setLoadingMore(true);
+    try {
+      const list = await inboxList({
+        status: status === "all" ? undefined : status,
+        limit: PAGE_SIZE,
+        offset: itemsRef.current.length,
+      });
+      setItems((prev) => [...prev, ...list]);
+      setHasMore(list.length === PAGE_SIZE);
+    } catch (err) {
+      const apiErr = toApiError(err);
+      message.error(`加载更多失败：${apiErr.message}`);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [status, loading, loadingMore, hasMore]);
 
   const loadDetail = useCallback(async (id: string) => {
     setDetailLoading(true);
@@ -113,16 +151,22 @@ export function InboxPage() {
   }, []);
 
   useEffect(() => {
-    void loadList(status, page);
-  }, [status, page, loadList]);
+    void loadList(status);
+  }, [status, loadList]);
 
   /**
    * 事件驱动的即时刷新：后端聚合窗口有实际写入时 emit "inbox-changed"，
-   * 本页监听后静默重载当前列表（keepSelection=true，不打断用户正在查看的详情）。
-   * 用 ref 持有最新刷新闭包，避免 status/page 变化时反复解绑/重绑监听。
+   * 本页监听后静默重载当前列表（keepSelection=true，不打断用户正在查看的详情；
+   * limit 取已加载条数，保住无限滚动已展开的列表）。
+   * 用 ref 持有最新刷新闭包，避免 status 变化时反复解绑/重绑监听。
    */
   const silentRefreshRef = useRef<() => void>(() => {});
-  silentRefreshRef.current = () => void loadList(status, page, true);
+  silentRefreshRef.current = () =>
+    void loadList(
+      status,
+      true,
+      Math.min(Math.max(itemsRef.current.length, PAGE_SIZE), MAX_REFRESH_LIMIT),
+    );
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -144,7 +188,14 @@ export function InboxPage() {
 
   function handleTabChange(key: string) {
     setStatus(key as StatusFilter);
-    setPage(1);
+  }
+
+  /** 滚动到底部阈值内时加载下一批（并发/越界由 loadMore 内部守卫） */
+  function handleListScroll(e: UIEvent<HTMLDivElement>) {
+    const el = e.currentTarget;
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - LOAD_MORE_THRESHOLD_PX) {
+      void loadMore();
+    }
   }
 
   /** snooze/ignore 成功后：刷新列表 + 详情 */
@@ -172,7 +223,7 @@ export function InboxPage() {
     setAssignItem(null);
     setSelectedId(null);
     setDetail(null);
-    void loadList(status, page);
+    void loadList(status);
   }
 
   /** 「全部清理」：把所有 stale 条目批量置为已处理 */
@@ -185,9 +236,8 @@ export function InboxPage() {
       // 若当前正在 stale 视图，清理后切回待处理
       if (status === "stale") {
         setStatus("pending");
-        setPage(1);
       } else {
-        void loadList(status, page, true);
+        void loadList(status, true);
       }
     } catch (err) {
       const apiErr = toApiError(err);
@@ -266,12 +316,11 @@ export function InboxPage() {
             />
           )}
         </div>
-        {/*
-          minHeight: 0 是必须的：flex 列容器内 flex item 默认 min-height:auto，
-          会被内容撑高超出 Sider（overflow:hidden 裁掉），overflowY 永远不触发，
-          表现为「列表不能滚动、分页栏被顶出可视区」。与 TerminalPanel 同款处理。
-        */}
-        <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+        <div
+          ref={listRef}
+          onScroll={handleListScroll}
+          style={{ flex: 1, minHeight: 0, overflowY: "auto" }}
+        >
           <List<InboxItem>
             loading={loading}
             dataSource={items}
@@ -286,24 +335,25 @@ export function InboxPage() {
             )}
           />
         </div>
-        <div
-          style={{
-            padding: 12,
-            borderTop: "1px solid #f0f0f0",
-            display: "flex",
-            justifyContent: "flex-end",
-            background: "#fff",
-          }}
-        >
-          <Pagination
-            current={page}
-            pageSize={PAGE_SIZE}
-            total={hasMore ? page * PAGE_SIZE + 1 : (page - 1) * PAGE_SIZE + items.length}
-            onChange={(p) => setPage(p)}
-            showSizeChanger={false}
-            size="small"
-          />
-        </div>
+        {/* 底部加载状态条（取代原分页器）：无限滚动加载提示 */}
+        {items.length > 0 && (
+          <div
+            style={{
+              padding: "8px 12px",
+              borderTop: "1px solid #f0f0f0",
+              textAlign: "center",
+              fontSize: 12,
+              color: "#999",
+              background: "#fff",
+            }}
+          >
+            {loadingMore
+              ? "加载中…"
+              : hasMore
+                ? "滚动到底自动加载更多"
+                : `共 ${items.length} 条，已全部加载`}
+          </div>
+        )}
       </Layout.Sider>
       <Layout.Content style={{ overflowY: "auto", background: "#fff" }}>
         <InboxDetailPanel
