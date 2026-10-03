@@ -9,7 +9,6 @@
     "core:default",
     "opener:default",
     "dialog:default",
-    "global-shortcut:default",
-    "notification:default"
+    "global-shortcut:default"
   ]
 }

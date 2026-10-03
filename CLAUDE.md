@@ -41,3 +41,26 @@ This project is indexed by GitNexus as **workbench** (3747 symbols, 8542 relatio
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+# 项目约定
+
+## 桌面通知统一走悬浮窗
+
+应用内所有「需要主动提醒用户」的桌面通知，**统一使用悬浮窗通道**，不要再引入系统级通知（tauri-plugin-notification / osascript 等）。
+
+用法（前端）：
+
+```ts
+import { invoke } from "@tauri-apps/api/core";
+
+await invoke("float_notify", {
+  title: "通知标题",
+  body: "通知正文（单行，超长自动省略）",
+  action: "go-inbox", // 可选：点击卡片后向主窗口 emit 的事件名；不传则点击仅唤起主窗口
+});
+```
+
+- 实现：Rust [app/src-tauri/src/float.rs](app/src-tauri/src/float.rs) + 前端 [app/src/float/FloatApp.tsx](app/src/float/FloatApp.tsx)。
+- 主窗口通过 `listen(action)` 响应点击跳转（参考 App.tsx 的 `go-inbox`）。
+- 高频事件先在业务侧做合并/去抖再调 `float_notify`（参考 InboxNotification 的 5s 合并窗口），避免悬浮窗刷屏。
+- 应用内即时反馈仍可用 antd message/notification；悬浮窗只用于「用户可能不在看应用」的场景。

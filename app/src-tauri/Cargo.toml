@@ -53,8 +53,6 @@ portable-pty = "0.8"
 # m7-7.4 · 内嵌终端：默认 cwd 回退（dirs::home_dir）
 dirs = "5"
 tauri-plugin-global-shortcut = "2.4.0"
-# 收件箱合并通知 → 系统桌面通知（macOS 通知中心 / Windows 操作中心 / Linux 通知守护进程）
-tauri-plugin-notification = "2"
 
 [dev-dependencies]
 tempfile = "3"
