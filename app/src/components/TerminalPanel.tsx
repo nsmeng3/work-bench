@@ -38,6 +38,9 @@ interface SpaceCache {
   activeKey?: string;
   /** 创建中标记：防 React StrictMode 双挂载/快速连点导致重复创建 */
   creating?: boolean;
+  /** 已消费的 openRequest nonce：App 侧请求发出后不清空，
+   *  面板每次重挂载 effect 都会再跑一次；用 nonce 去重防止重复新建会话 */
+  lastRequestNonce?: number;
   /** 面板挂载期间用于触发 React 重渲染；卸载时置空 */
   onChange?: () => void;
 }
@@ -246,9 +249,13 @@ export function TerminalPanel({ groupKey, spaceId, spaceName, openRequest }: Ter
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cache, sync]);
 
-  /** 外部打开请求：nonce 变化 → 新建会话（可带 cwd） */
+  /** 外部打开请求：nonce 变化 → 新建会话（可带 cwd）。
+   *  已消费的 nonce 记入缓存，重挂载（切换菜单来回）不会重复消费同一请求。 */
   useEffect(() => {
-    if (openRequest) void createSession(openRequest.cwd);
+    if (openRequest && cache.lastRequestNonce !== openRequest.nonce) {
+      cache.lastRequestNonce = openRequest.nonce;
+      void createSession(openRequest.cwd);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openRequest?.nonce]);
 
