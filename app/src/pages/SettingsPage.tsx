@@ -10,6 +10,7 @@ import {
   Radio,
   Select,
   Space,
+  Switch,
   Tag,
   Typography,
   message,
@@ -39,6 +40,8 @@ import {
   settingsSetDefaultApp,
   settingsGetDefaultHome,
   settingsSetDefaultHome,
+  settingsGetLaunchAtLogin,
+  settingsSetLaunchAtLogin,
   toApiError,
 } from "../api";
 import { RootDirPicker } from "../components/RootDirPicker";
@@ -99,6 +102,10 @@ export function SettingsPage() {
   const [defaultHome, setDefaultHome] = useState<DefaultHome>("dashboard");
   const [defaultHomeLoading, setDefaultHomeLoading] = useState(false);
   const [defaultHomeSaving, setDefaultHomeSaving] = useState(false);
+
+  // ---------- 通用（开机自启）状态 ----------
+  const [launchAtLogin, setLaunchAtLogin] = useState(true);
+  const [launchAtLoginSaving, setLaunchAtLoginSaving] = useState(false);
 
   // ---------- 加载数据 ----------
 
@@ -164,9 +171,11 @@ export function SettingsPage() {
     try {
       const cfg = await settingsGetDefaultHome();
       setDefaultHome(cfg.home);
+      const loginCfg = await settingsGetLaunchAtLogin();
+      setLaunchAtLogin(loginCfg.enabled);
     } catch (err) {
       const apiErr = toApiError(err);
-      message.error(`加载启动默认页失败：${apiErr.message}`);
+      message.error(`加载通用设置失败：${apiErr.message}`);
     } finally {
       setDefaultHomeLoading(false);
     }
@@ -294,6 +303,20 @@ export function SettingsPage() {
     }
   }
 
+  async function handleLaunchAtLoginChange(checked: boolean) {
+    setLaunchAtLoginSaving(true);
+    try {
+      const cfg = await settingsSetLaunchAtLogin(checked);
+      setLaunchAtLogin(cfg.enabled);
+      message.success(cfg.enabled ? "已开启开机自动启动" : "已关闭开机自动启动");
+    } catch (err) {
+      const apiErr = toApiError(err);
+      message.error(`设置失败：${apiErr.message}`);
+    } finally {
+      setLaunchAtLoginSaving(false);
+    }
+  }
+
   async function handleAppSubmit() {
     try {
       const values = await appForm.validateFields();
@@ -343,6 +366,17 @@ export function SettingsPage() {
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             应用启动后默认展示的页面；修改后下次启动生效。
+          </Typography.Text>
+          <Space align="center" style={{ width: "100%", justifyContent: "space-between" }}>
+            <Typography.Text>开机自动启动</Typography.Text>
+            <Switch
+              checked={launchAtLogin}
+              loading={launchAtLoginSaving}
+              onChange={(v) => void handleLaunchAtLoginChange(v)}
+            />
+          </Space>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            开启后登录系统时自动启动并驻留菜单栏（不弹出主窗口）。
           </Typography.Text>
         </Space>
       </Card>

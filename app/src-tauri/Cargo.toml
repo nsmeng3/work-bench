@@ -18,7 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
@@ -53,6 +53,10 @@ portable-pty = "0.8"
 # m7-7.4 · 内嵌终端：默认 cwd 回退（dirs::home_dir）
 dirs = "5"
 tauri-plugin-global-shortcut = "2.4.0"
+# 开机自启：macOS LaunchAgent / Windows 注册表 Run / Linux autostart desktop
+tauri-plugin-autostart = "2"
+# 单实例：后台驻留模式下二次启动唤起已有实例，防双开抢 SQLite
+tauri-plugin-single-instance = "2"
 
 [dev-dependencies]
 tempfile = "3"

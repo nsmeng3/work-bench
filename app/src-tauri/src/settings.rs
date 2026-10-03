@@ -1049,6 +1049,81 @@ pub async fn settings_set_default_home(
 }
 
 // ============================================================
+// 开机自启（launch_at_login）：settings KV + tauri-plugin-autostart
+// ============================================================
+
+/// `settings` 表中开机自启开关键名。
+const LAUNCH_AT_LOGIN_KEY: &str = "launch_at_login";
+
+/// `settings_get/set_launch_at_login` 出参。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchAtLoginConfig {
+    /// 是否开机自启；未设置时默认 true（功能默认开启，用户可在设置页关闭）。
+    pub enabled: bool,
+}
+
+/// 读取开关；未设置 / 非法 JSON / 非布尔值均回退默认 true。
+pub async fn get_launch_at_login(pool: &SqlitePool) -> CmdResult<LaunchAtLoginConfig> {
+    let raw = sqlx::query_scalar::<_, String>("SELECT value_json FROM settings WHERE key = ?")
+        .bind(LAUNCH_AT_LOGIN_KEY)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::from)?;
+    let enabled = raw
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    Ok(LaunchAtLoginConfig { enabled })
+}
+
+/// 写入开关（仅落库；系统注册状态由命令层对齐）。
+pub async fn set_launch_at_login(pool: &SqlitePool, enabled: bool) -> CmdResult<LaunchAtLoginConfig> {
+    let value_json = serde_json::to_string(&serde_json::Value::Bool(enabled))
+        .map_err(|e| AppError::db(format!("settings.{} 序列化失败: {}", LAUNCH_AT_LOGIN_KEY, e)))?;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    sqlx::query(
+        "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+    )
+    .bind(LAUNCH_AT_LOGIN_KEY)
+    .bind(&value_json)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(AppError::from)?;
+    Ok(LaunchAtLoginConfig { enabled })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn settings_get_launch_at_login(
+    state: tauri::State<'_, crate::AppState>,
+) -> CmdResult<LaunchAtLoginConfig> {
+    get_launch_at_login(&state.pool).await
+}
+
+/// 写入开关并对齐系统自启注册（macOS LaunchAgent）。
+/// 注册失败不阻塞：设置已落库，下次启动时 setup 会重新对齐。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn settings_set_launch_at_login(
+    state: tauri::State<'_, crate::AppState>,
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> CmdResult<LaunchAtLoginConfig> {
+    let cfg = set_launch_at_login(&state.pool, enabled).await?;
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    if let Err(e) = (if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    }) {
+        eprintln!("[settings] 对齐开机自启注册失败 (enabled={}): {}", enabled, e);
+    }
+    Ok(cfg)
+}
+
+// ============================================================
 // m7-7.3 · settings_get_user_name（Dashboard 问候语）
 // ============================================================
 //

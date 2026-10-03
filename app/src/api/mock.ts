@@ -52,6 +52,7 @@ import type {
   DefaultHome,
   DefaultHomeConfig,
   UserNameConfig,
+  LaunchAtLoginConfig,
   SettingsChangeRootDirInput,
   ChangeRootResult,
   MigrationPlan,
@@ -613,7 +614,8 @@ const mockDefaultApps: Record<string, DefaultAppConfig> = {};
 
 /** mock 启动默认页：内存存储；缺省 "dashboard"（与后端一致） */
 let mockDefaultHome: DefaultHome = "dashboard";
-
+/** mock 开机自启开关（默认 true，与后端契约一致） */
+let mockLaunchAtLogin = true;
 /** mock 用户名：内存存储；缺省 undefined（前端显示"朋友"） */
 let mockUserName: string | undefined = undefined;
 
@@ -746,6 +748,17 @@ export const mockSettingsApi = {
 
   settings_get_user_name(): UserNameConfig {
     return mockUserName ? { userName: mockUserName } : {};
+  },
+
+  /* ---------------- 开机自启 ---------------- */
+
+  settings_get_launch_at_login(): LaunchAtLoginConfig {
+    return { enabled: mockLaunchAtLogin };
+  },
+
+  settings_set_launch_at_login(enabled: boolean): LaunchAtLoginConfig {
+    mockLaunchAtLogin = enabled;
+    return { enabled: mockLaunchAtLogin };
   },
 
   /** 测试辅助：手动设置 mock 用户名（不暴露给后端契约） */

@@ -10,6 +10,7 @@ import type {
   DefaultHomeConfig,
   DefaultHome,
   UserNameConfig,
+  LaunchAtLoginConfig,
   SettingsChangeRootDirInput,
   ChangeRootResult,
 } from "./types";
@@ -118,4 +119,19 @@ export async function settingsSetDefaultHome(home: DefaultHome): Promise<Default
 export async function settingsGetUserName(): Promise<UserNameConfig> {
   if (MOCK) return mockSettingsApi.settings_get_user_name();
   return invoke<UserNameConfig>("settings_get_user_name");
+}
+
+/** `settings_get_launch_at_login ()` → `{ enabled }`（未设置时后端默认 true） */
+export async function settingsGetLaunchAtLogin(): Promise<LaunchAtLoginConfig> {
+  if (MOCK) return mockSettingsApi.settings_get_launch_at_login();
+  return invoke<LaunchAtLoginConfig>("settings_get_launch_at_login");
+}
+
+/**
+ * `settings_set_launch_at_login { enabled }` → `{ enabled }`。
+ * 后端落库并对齐系统自启注册（macOS LaunchAgent）。
+ */
+export async function settingsSetLaunchAtLogin(enabled: boolean): Promise<LaunchAtLoginConfig> {
+  if (MOCK) return mockSettingsApi.settings_set_launch_at_login(enabled);
+  return invoke<LaunchAtLoginConfig>("settings_set_launch_at_login", { enabled });
 }

@@ -788,6 +788,12 @@ export interface UserNameConfig {
   userName?: string;
 }
 
+/** `settings_get/set_launch_at_login` 出参（开机自启开关） */
+export interface LaunchAtLoginConfig {
+  /** 是否开机自启；未设置时后端默认 true */
+  enabled: boolean;
+}
+
 /* ---------------- 导入撤销（m4-4.9 · ref_undo_import） ---------------- */
 
 /**

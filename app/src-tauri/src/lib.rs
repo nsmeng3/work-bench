@@ -20,6 +20,7 @@ mod stats;
 mod tag;
 mod terminal;
 mod todo;
+mod tray;
 mod types;
 mod watch;
 
@@ -33,6 +34,15 @@ pub struct AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 单实例需尽早注册：后台驻留模式下二次启动唤起已有实例主窗口，防双开抢 SQLite
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_main_window(app);
+        }))
+        // 开机自启（macOS LaunchAgent）；--minimized 标记自启拉起，启动后保持主窗口隐藏
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized".into()]),
+        ))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         // m8-8.1 · 全局快捷键（快速记录 todo）
@@ -56,6 +66,15 @@ pub fn run() {
         )
         .setup(|app| {
             use tauri::Manager;
+
+            // 纯菜单栏应用：隐藏 Dock 图标与 Cmd+Tab 入口（窗口显隐走托盘）。
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // 状态栏驻留：托盘图标 + 精简菜单（显示主窗口 / 退出），失败降级为「无托盘」。
+            if let Err(e) = tray::setup_tray(app) {
+                eprintln!("[startup] 创建系统托盘失败: {}", e);
+            }
 
             // 收件箱悬浮通知窗：启动时创建（隐藏），失败降级为「无悬浮窗」，不影响主功能。
             if let Err(e) = float::setup_float_window(app) {
@@ -106,6 +125,29 @@ pub fn run() {
             }
 
             app.manage(AppState { pool });
+
+            // 开机自启：按 settings.launch_at_login（默认开启）对齐系统注册状态。
+            // 失败仅记录日志，不阻塞启动。
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let pool_for_autostart = app.state::<AppState>().pool.clone();
+                let desired =
+                    tauri::async_runtime::block_on(settings::get_launch_at_login(&pool_for_autostart))
+                        .map(|c| c.enabled)
+                        .unwrap_or(true);
+                let manager = app.autolaunch();
+                let current = manager.is_enabled().unwrap_or(false);
+                let align = if desired && !current {
+                    manager.enable()
+                } else if !desired && current {
+                    manager.disable()
+                } else {
+                    Ok(())
+                };
+                if let Err(e) = align {
+                    eprintln!("[startup] 对齐开机自启注册失败 (desired={}): {}", desired, e);
+                }
+            }
 
             // m7-7.4 · 内嵌终端：全局 PTY 会话表
             app.manage(terminal::TerminalState::new());
@@ -217,6 +259,8 @@ pub fn run() {
             settings::settings_get_default_home,
             settings::settings_set_default_home,
             settings::settings_get_user_name,
+            settings::settings_get_launch_at_login,
+            settings::settings_set_launch_at_login,
             disposition::disp_get_capabilities,
             settings::settings_change_root_dir,
             disposition::disp_archive,
@@ -259,15 +303,36 @@ pub fn run() {
             terminal::terminal_close,
             terminal::terminal_list,
         ])
+        // 后台运行：主窗口关闭请求仅隐藏，应用驻留托盘；退出只走托盘菜单（触发 ExitRequested 清理）
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // m7-7.4 · 应用退出时回收所有 PTY 子进程
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                use tauri::Manager;
-                if let Some(state) = app_handle.try_state::<terminal::TerminalState>() {
-                    terminal::kill_all(state.inner());
+            match event {
+                // 自启拉起（--minimized）：保持主窗口隐藏，静默驻留托盘
+                tauri::RunEvent::Ready => {
+                    use tauri::Manager;
+                    if std::env::args().any(|a| a == "--minimized") {
+                        if let Some(w) = app_handle.get_webview_window("main") {
+                            let _ = w.hide();
+                        }
+                    }
                 }
+                // m7-7.4 · 应用退出时回收所有 PTY 子进程
+                tauri::RunEvent::ExitRequested { .. } => {
+                    use tauri::Manager;
+                    if let Some(state) = app_handle.try_state::<terminal::TerminalState>() {
+                        terminal::kill_all(state.inner());
+                    }
+                }
+                _ => {}
             }
         });
 }
