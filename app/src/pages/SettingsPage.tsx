@@ -186,14 +186,23 @@ export function SettingsPage() {
     try {
       const values = await addForm.validateFields();
       setSubmitting(true);
-      await inboxSetWatchDir({
+      const saved = await inboxSetWatchDir({
         id: crypto.randomUUID(),
         path: values.path,
         name: values.name || values.path.split("/").pop() || "未命名",
         description: values.description,
       });
-      message.success("监控目录添加成功");
+      if (saved.paused === 1) {
+        // 配置已保存但 watcher 挂载失败（典型：macOS 完全磁盘访问权限未授予）
+        message.warning(
+          "目录已保存，但启动监听失败：请在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」中授权本应用后，重新保存该目录重试",
+          8,
+        );
+      } else {
+        message.success("监控目录添加成功，已即时开始监听");
+      }
       setAddModalOpen(false);
+      addForm.resetFields();
       void loadDirs();
     } catch (err) {
       if (err && typeof err === "object" && "errorFields" in err) {
@@ -407,7 +416,16 @@ export function SettingsPage() {
               ]}
             >
               <List.Item.Meta
-                title={dir.name || dir.path}
+                title={
+                  <Space size={8}>
+                    {dir.name || dir.path}
+                    {dir.paused === 1 && (
+                      <Tag color="red" title="监听挂载失败（可能缺少完全磁盘访问权限），重新保存该目录可重试">
+                        已暂停
+                      </Tag>
+                    )}
+                  </Space>
+                }
                 description={
                   <Space direction="vertical" size={0}>
                     <Typography.Text type="secondary" style={{ fontSize: 12 }}>
@@ -520,7 +538,10 @@ export function SettingsPage() {
         title="添加监控目录"
         open={addModalOpen}
         onOk={handleAddSubmit}
-        onCancel={() => setAddModalOpen(false)}
+        onCancel={() => {
+          setAddModalOpen(false);
+          addForm.resetFields();
+        }}
         confirmLoading={submitting}
         okText="添加"
         cancelText="取消"

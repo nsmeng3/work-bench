@@ -561,6 +561,8 @@ export interface InboxItemDetail extends InboxItem {
 export interface InboxStats {
   pending: number;
   snoozed: number;
+  /** 源文件已不存在的失效条目数（改名/删除自动标记） */
+  stale: number;
   lastEventAt?: number | null;
 }
 
@@ -632,6 +634,8 @@ export interface WatchDirConfig {
   path: string;
   name: string;
   description?: string;
+  /** 监听是否已暂停（1=挂载失败被暂停，0/缺省=正常）；仅出参有意义 */
+  paused?: number | null;
 }
 
 /** 监控事件 — M6 声明契约 */

@@ -497,6 +497,7 @@ mod tests {
         let mk = |p: &str| WatchEvent {
             kind: crate::watch::WatchEventKind::Created,
             path: PathBuf::from(p),
+            new_path: None,
             watch_dir_id: "wd".to_string(),
             at: 0,
         };
@@ -528,6 +529,7 @@ mod tests {
         let mk = |p: &str| WatchEvent {
             kind: crate::watch::WatchEventKind::Created,
             path: PathBuf::from(p),
+            new_path: None,
             watch_dir_id: "wd".to_string(),
             at: 0,
         };

@@ -142,9 +142,8 @@ pub fn run() {
                                     Vec::new()
                                 }
                             };
-                            let shared_rules = std::sync::Arc::new(
-                                std::sync::RwLock::new(initial_rules),
-                            );
+                            let shared_rules =
+                                std::sync::Arc::new(std::sync::RwLock::new(initial_rules));
                             // manage 到 State，供 5.4 inbox_ignore 触发规则重载时写入。
                             app_handle.manage(shared_rules.clone());
 
@@ -156,10 +155,12 @@ pub fn run() {
                             // _filter_handle 在后台持续运行；应用退出时随 runtime 关闭。
 
                             // m5-5.3 · 聚合窗口：消费 5.2 过滤后的事件流，
-                            // 按 5 秒窗口缓冲合并写入 inbox_item。
+                            // 按 5 秒窗口缓冲合并写入 inbox_item；
+                            // 有写入时 emit inbox-changed 驱动前端列表即时刷新。
                             let _aggregator_handle = aggregate::start_aggregator(
                                 pool_for_watch.clone(),
                                 filtered_rx,
+                                app_handle.clone(),
                             );
                             // _aggregator_handle 在后台持续运行；应用退出时随 runtime 关闭。
                         }
@@ -227,6 +228,7 @@ pub fn run() {
             inbox::inbox_snooze,
             inbox::inbox_ignore,
             inbox::inbox_dismiss_stale,
+            inbox::inbox_dismiss_all_stale,
             inbox::inbox_stats,
             inbox::watch_dir_get,
             inbox::watch_dir_set,

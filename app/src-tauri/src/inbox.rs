@@ -140,6 +140,8 @@ pub struct IgnoreRuleInput {
 pub struct InboxStats {
     pub pending: i64,
     pub snoozed: i64,
+    /// 源文件已不存在的失效条目数（改名/删除自动标记，前端用于批量清理入口）。
+    pub stale: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event_at: Option<i64>,
 }
@@ -211,8 +213,12 @@ pub async fn list(
                 remind_at, discovered_at \
          FROM inbox_item",
     );
+    // status 缺省（前端「全部」Tab）时排除 stale：失效条目默认隐藏，
+    // 仅通过显式 status='stale' 或批量清理入口触达。
     if status.is_some() {
         sql.push_str(" WHERE status = ?");
+    } else {
+        sql.push_str(" WHERE status != 'stale'");
     }
     sql.push_str(" ORDER BY discovered_at DESC, id ASC LIMIT ? OFFSET ?");
 
@@ -297,7 +303,9 @@ fn read_text_preview(path: &std::path::Path) -> Option<serde_json::Value> {
 
     let f = std::fs::File::open(path).ok()?;
     let mut buf = Vec::with_capacity(PREVIEW_MAX_BYTES.min(4096));
-    f.take(PREVIEW_MAX_BYTES as u64).read_to_end(&mut buf).ok()?;
+    f.take(PREVIEW_MAX_BYTES as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
 
     // 拒绝明显二进制（含 NUL 字节）
     if buf.contains(&0) {
@@ -354,10 +362,7 @@ async fn ensure_collection_in_space(
 /// - managed confirmed=false：仅返回 plan，不写库。
 /// - managed confirmed=true：调 `reference::create_managed`（内部事务）+ 更新 inbox_item。
 #[allow(clippy::too_many_arguments)]
-pub async fn assign(
-    pool: &SqlitePool,
-    input: AssignInput,
-) -> CmdResult<AssignResult> {
+pub async fn assign(pool: &SqlitePool, input: AssignInput) -> CmdResult<AssignResult> {
     // ---------- 1. 入参校验 ----------
     if !ASSIGN_MODES.contains(&input.mode.as_str()) {
         return Err(AppError::invalid_param(format!(
@@ -555,9 +560,10 @@ pub async fn ignore_item(
             )));
         }
         if r.kind != "once" {
-            let value = r.value.clone().ok_or_else(|| {
-                AppError::invalid_param("rule.kind != 'once' 时 rule.value 必填")
-            })?;
+            let value = r
+                .value
+                .clone()
+                .ok_or_else(|| AppError::invalid_param("rule.kind != 'once' 时 rule.value 必填"))?;
             if value.trim().is_empty() {
                 return Err(AppError::invalid_param("rule.value 不能为空白"));
             }
@@ -633,10 +639,26 @@ pub async fn dismiss_stale(pool: &SqlitePool, id: String) -> CmdResult<()> {
 }
 
 // ============================================================
+// inbox_dismiss_all_stale
+// ============================================================
+
+/// `inbox_dismiss_all_stale {}` → `{ dismissed }`。
+///
+/// 批量清理：把所有 `stale` 条目（改名/删除后源文件已不在、由聚合层自动标记）
+/// 一次性置为 `processed`。返回清理条数。
+pub async fn dismiss_all_stale(pool: &SqlitePool) -> CmdResult<i64> {
+    let res = sqlx::query("UPDATE inbox_item SET status = 'processed' WHERE status = 'stale'")
+        .execute(pool)
+        .await
+        .map_err(AppError::from)?;
+    Ok(res.rows_affected() as i64)
+}
+
+// ============================================================
 // inbox_stats
 // ============================================================
 
-/// `inbox_stats ()` → `{ pending, snoozed, lastEventAt }`。
+/// `inbox_stats ()` → `{ pending, snoozed, stale, lastEventAt }`。
 pub async fn stats(pool: &SqlitePool) -> CmdResult<InboxStats> {
     let (pending,): (i64,) =
         sqlx::query_as("SELECT COUNT(1) FROM inbox_item WHERE status = 'pending'")
@@ -648,6 +670,10 @@ pub async fn stats(pool: &SqlitePool) -> CmdResult<InboxStats> {
             .fetch_one(pool)
             .await
             .map_err(AppError::from)?;
+    let (stale,): (i64,) = sqlx::query_as("SELECT COUNT(1) FROM inbox_item WHERE status = 'stale'")
+        .fetch_one(pool)
+        .await
+        .map_err(AppError::from)?;
     let last_event_at: Option<i64> =
         sqlx::query_scalar("SELECT MAX(discovered_at) FROM inbox_item")
             .fetch_one(pool)
@@ -656,6 +682,7 @@ pub async fn stats(pool: &SqlitePool) -> CmdResult<InboxStats> {
     Ok(InboxStats {
         pending,
         snoozed,
+        stale,
         last_event_at,
     })
 }
@@ -738,6 +765,11 @@ pub async fn inbox_dismiss_stale(
 }
 
 #[tauri::command]
+pub async fn inbox_dismiss_all_stale(state: tauri::State<'_, crate::AppState>) -> CmdResult<i64> {
+    dismiss_all_stale(&state.pool).await
+}
+
+#[tauri::command]
 pub async fn inbox_stats(state: tauri::State<'_, crate::AppState>) -> CmdResult<InboxStats> {
     stats(&state.pool).await
 }
@@ -752,13 +784,16 @@ fn row_to_watch_dir(row: &sqlx::sqlite::SqliteRow) -> Result<WatchDirConfig, sql
         path: row.try_get("path")?,
         name: row.try_get("name")?,
         description: row.try_get("description")?,
+        paused: row.try_get("paused")?,
     })
 }
 
 #[tauri::command]
-pub async fn watch_dir_get(state: tauri::State<'_, crate::AppState>) -> CmdResult<Vec<WatchDirConfig>> {
+pub async fn watch_dir_get(
+    state: tauri::State<'_, crate::AppState>,
+) -> CmdResult<Vec<WatchDirConfig>> {
     let rows = sqlx::query(
-        "SELECT id, path, name, description \
+        "SELECT id, path, name, description, paused \
          FROM watch_dir \
          ORDER BY path ASC",
     )
@@ -774,9 +809,12 @@ pub async fn watch_dir_get(state: tauri::State<'_, crate::AppState>) -> CmdResul
 
 #[tauri::command]
 pub async fn watch_dir_set(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     input: WatchDirConfig,
 ) -> CmdResult<WatchDirConfig> {
+    use tauri::Manager;
+
     // 路径校验：必须为绝对路径
     if !input.path.starts_with('/') {
         return Err(AppError::invalid_param(format!(
@@ -796,21 +834,19 @@ pub async fn watch_dir_set(
         .map_err(AppError::from)?;
 
     let now = now_unix();
-    match existing {
+    let mut saved = match existing {
         Some((existing_id,)) => {
-            sqlx::query(
-                "UPDATE watch_dir SET name = ?, description = ? WHERE id = ?",
-            )
-            .bind(&input.name)
-            .bind(&input.description)
-            .bind(&existing_id)
-            .execute(&state.pool)
-            .await
-            .map_err(AppError::from)?;
-            Ok(WatchDirConfig {
+            sqlx::query("UPDATE watch_dir SET name = ?, description = ? WHERE id = ?")
+                .bind(&input.name)
+                .bind(&input.description)
+                .bind(&existing_id)
+                .execute(&state.pool)
+                .await
+                .map_err(AppError::from)?;
+            WatchDirConfig {
                 id: existing_id,
                 ..input
-            })
+            }
         }
         None => {
             sqlx::query(
@@ -825,25 +861,72 @@ pub async fn watch_dir_set(
             .execute(&state.pool)
             .await
             .map_err(AppError::from)?;
-            Ok(input)
+            input
+        }
+    };
+
+    // 增量订阅（免重启根治）：保存成功后即时挂载/重挂 watcher。
+    // - 同 id 已存在 → add_watch 幂等重建；
+    // - 挂载失败（如 macOS TCC 拦截其他应用容器目录）→ 标记 paused=1，
+    //   配置仍保留，启动时 start_watchers 会跳过；
+    // - 挂载成功 → 清除 paused（启动失败后的重试路径）。
+    if let Some(handle) = app
+        .try_state::<crate::watch::WatcherHandle>()
+        .map(|s| s.inner().clone())
+    {
+        let recursive: i64 = sqlx::query_scalar("SELECT recursive FROM watch_dir WHERE id = ?")
+            .bind(&saved.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(1);
+        match crate::watch::add_watch(
+            &handle,
+            saved.id.clone(),
+            std::path::PathBuf::from(&saved.path),
+            recursive != 0,
+        )
+        .await
+        {
+            Ok(()) => {
+                let _ = sqlx::query("UPDATE watch_dir SET paused = 0 WHERE id = ?")
+                    .bind(&saved.id)
+                    .execute(&state.pool)
+                    .await;
+                saved.paused = Some(0);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[watch_dir_set] 即时挂载 watcher 失败 ({}): {}",
+                    saved.path, e
+                );
+                let _ = sqlx::query("UPDATE watch_dir SET paused = 1 WHERE id = ?")
+                    .bind(&saved.id)
+                    .execute(&state.pool)
+                    .await;
+                // 配置保留、 paused=1 随出参返回，前端据此提示（如完全磁盘访问权限）
+                saved.paused = Some(1);
+            }
         }
     }
+
+    Ok(saved)
 }
 
 #[tauri::command]
 pub async fn watch_dir_unset(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     path: String,
 ) -> CmdResult<WatchDirConfig> {
+    use tauri::Manager;
+
     // 先查出再删，保证返回值携带被删配置
-    let row = sqlx::query(
-        "SELECT id, path, name, description FROM watch_dir WHERE path = ?",
-    )
-    .bind(&path)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(AppError::from)?
-    .ok_or_else(|| AppError::not_found(format!("监控目录不存在: {}", path)))?;
+    let row = sqlx::query("SELECT id, path, name, description, paused FROM watch_dir WHERE path = ?")
+        .bind(&path)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found(format!("监控目录不存在: {}", path)))?;
     let cfg = row_to_watch_dir(&row).map_err(AppError::from)?;
 
     sqlx::query("DELETE FROM watch_dir WHERE path = ?")
@@ -851,6 +934,17 @@ pub async fn watch_dir_unset(
         .execute(&state.pool)
         .await
         .map_err(AppError::from)?;
+
+    // 增量退订（免重启根治）：即时摘除 watcher。失败仅记日志
+    //（应用退出阶段 handle 可能已被清理，静默即可）。
+    if let Some(handle) = app
+        .try_state::<crate::watch::WatcherHandle>()
+        .map(|s| s.inner().clone())
+    {
+        if let Err(e) = crate::watch::remove_watch(&handle, &cfg.id).await {
+            eprintln!("[watch_dir_unset] 移除 watcher 失败 (id={}): {}", cfg.id, e);
+        }
+    }
 
     Ok(cfg)
 }
@@ -964,7 +1058,9 @@ mod tests {
         std::fs::write(&f2, b"x").expect("w");
         let id1 = make_pending(&pool, &f1).await;
         let _id2 = make_pending(&pool, &f2).await;
-        snooze(&pool, id1.clone(), None, None).await.expect("snooze");
+        snooze(&pool, id1.clone(), None, None)
+            .await
+            .expect("snooze");
 
         let pending = list(&pool, Some("pending".into()), None, None)
             .await
@@ -1109,7 +1205,11 @@ mod tests {
         assert!(detail.preview.is_none(), "敏感目录下文件不应有预览");
         let warning = detail.sensitive_warning.expect("sensitiveWarning");
         assert!(warning.contains("deny"), "提示应包含目录名: {}", warning);
-        assert!(warning.contains("normal.txt"), "提示应包含文件名: {}", warning);
+        assert!(
+            warning.contains("normal.txt"),
+            "提示应包含文件名: {}",
+            warning
+        );
     }
 
     #[tokio::test]
@@ -1190,13 +1290,11 @@ mod tests {
             root.to_string_lossy().to_string(),
         ))
         .expect("ser");
-        sqlx::query(
-            "INSERT INTO settings (key, value_json, updated_at) VALUES ('root_dir', ?, 0)",
-        )
-        .bind(&value_json)
-        .execute(&pool)
-        .await
-        .expect("insert root_dir");
+        sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES ('root_dir', ?, 0)")
+            .bind(&value_json)
+            .execute(&pool)
+            .await
+            .expect("insert root_dir");
 
         let input = AssignInput {
             id: id.clone(),
@@ -1232,13 +1330,11 @@ mod tests {
             root.to_string_lossy().to_string(),
         ))
         .expect("ser");
-        sqlx::query(
-            "INSERT INTO settings (key, value_json, updated_at) VALUES ('root_dir', ?, 0)",
-        )
-        .bind(&value_json)
-        .execute(&pool)
-        .await
-        .expect("insert root_dir");
+        sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES ('root_dir', ?, 0)")
+            .bind(&value_json)
+            .execute(&pool)
+            .await
+            .expect("insert root_dir");
 
         let input = AssignInput {
             id: id.clone(),
@@ -1416,5 +1512,89 @@ mod tests {
         assert_eq!(s.pending, 0);
         assert_eq!(s.snoozed, 0);
         assert!(s.last_event_at.is_none());
+    }
+
+    // ---------- stale：列表排除 / 统计 / 批量清理 ----------
+
+    /// 插入一条 stale inbox_item，返回 id。
+    async fn make_stale(pool: &SqlitePool, path: &std::path::Path) -> String {
+        let id = make_pending(pool, path).await;
+        sqlx::query("UPDATE inbox_item SET status = 'stale' WHERE id = ?")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .expect("mark stale");
+        id
+    }
+
+    #[tokio::test]
+    async fn inbox_list_excludes_stale_by_default() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let f1 = dir.path().join("keep.txt");
+        let f2 = dir.path().join("gone.txt");
+        std::fs::write(&f1, b"x").expect("w");
+        std::fs::write(&f2, b"x").expect("w");
+        let pending_id = make_pending(&pool, &f1).await;
+        let stale_id = make_stale(&pool, &f2).await;
+
+        // status 缺省（前端「全部」Tab）：stale 默认隐藏
+        let all = list(&pool, None, None, None).await.expect("list all");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, pending_id);
+
+        // 显式 status='stale'：可触达失效条目
+        let stale = list(&pool, Some("stale".into()), None, None)
+            .await
+            .expect("list stale");
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, stale_id);
+    }
+
+    #[tokio::test]
+    async fn inbox_stats_counts_stale() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        std::fs::write(&f1, b"x").expect("w");
+        std::fs::write(&f2, b"x").expect("w");
+        make_pending(&pool, &f1).await;
+        make_stale(&pool, &f2).await;
+
+        let s = stats(&pool).await.expect("stats");
+        assert_eq!(s.pending, 1);
+        assert_eq!(s.snoozed, 0);
+        assert_eq!(s.stale, 1);
+    }
+
+    #[tokio::test]
+    async fn inbox_dismiss_all_stale_ok() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        let f3 = dir.path().join("c.txt");
+        std::fs::write(&f1, b"x").expect("w");
+        std::fs::write(&f2, b"x").expect("w");
+        std::fs::write(&f3, b"x").expect("w");
+        let pending_id = make_pending(&pool, &f1).await;
+        make_stale(&pool, &f2).await;
+        make_stale(&pool, &f3).await;
+
+        let dismissed = dismiss_all_stale(&pool).await.expect("dismiss all");
+        assert_eq!(dismissed, 2, "应清理 2 条 stale");
+
+        let s = stats(&pool).await.expect("stats");
+        assert_eq!(s.stale, 0);
+        assert_eq!(s.pending, 1, "pending 条目不受影响");
+
+        // 被清理的条目变为 processed
+        let item = fetch_inbox_item(&pool, &pending_id).await.expect("fetch");
+        assert_eq!(item.status, "pending");
+
+        // 幂等：再次清理返回 0
+        let again = dismiss_all_stale(&pool).await.expect("dismiss again");
+        assert_eq!(again, 0);
     }
 }

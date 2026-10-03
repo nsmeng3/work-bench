@@ -1620,7 +1620,9 @@ function toInboxDetail(item: InboxItem): InboxItemDetail {
 export const mockInboxApi = {
   inbox_list(input: InboxListInput): InboxItem[] {
     let items = inboxStore.slice();
+    // 与后端对齐：status 缺省时排除 stale（失效条目默认隐藏）
     if (input.status) items = items.filter((i) => i.status === input.status);
+    else items = items.filter((i) => i.status !== "stale");
     // 与后端 ORDER BY discovered_at DESC 对齐
     items.sort((a, b) => b.discoveredAt - a.discoveredAt);
     const offset = Math.max(0, input.offset ?? 0);
@@ -1673,11 +1675,12 @@ export const mockInboxApi = {
   inbox_stats(): InboxStats {
     const pending = inboxStore.filter((i) => i.status === "pending").length;
     const snoozed = inboxStore.filter((i) => i.status === "snoozed").length;
+    const stale = inboxStore.filter((i) => i.status === "stale").length;
     const lastEventAt =
       inboxStore.length > 0
         ? Math.max(...inboxStore.map((i) => i.discoveredAt))
         : null;
-    return { pending, snoozed, lastEventAt };
+    return { pending, snoozed, stale, lastEventAt };
   },
 
   /**
@@ -1865,14 +1868,26 @@ export const mockInboxApi = {
     return updated;
   },
 
+  /**
+   * §2.7 inbox_dismiss_all_stale mock：批量把 stale 条目置为 processed，
+   * 返回清理条数。
+   */
+  inbox_dismiss_all_stale(): number {
+    const staleCount = inboxStore.filter((i) => i.status === "stale").length;
+    inboxStore = inboxStore.map((i) =>
+      i.status === "stale" ? { ...i, status: "processed" } : i,
+    );
+    return staleCount;
+  },
+
   /** 监控目录 mock — M6-6.1 声明契约 */
   inbox_get_watch_dirs(): WatchDirConfig[] {
     // mock 返回空数组，由后端 6.2 实现真实 watch 逻辑
     return [];
   },
   inbox_set_watch_dir(_input: WatchDirConfig): WatchDirConfig {
-    // mock 不做持久化，返回输入（路径校验留待后端）
-    return { ..._input };
+    // mock 不做持久化，返回输入（路径校验留待后端）；paused=0 表示挂载正常
+    return { ..._input, paused: 0 };
   },
   inbox_unset_watch_dir(_input: { path: string }): WatchDirConfig {
     // mock 不做清理，直接返回

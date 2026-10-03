@@ -12,6 +12,10 @@ pub struct WatchDirConfig {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// 监听是否已暂停（1=挂载失败被暂停，0/None=正常）。
+    /// 仅出参有意义；作为 `watch_dir_set` 入参时忽略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<i64>,
 }
 
 /// 监控事件：created / modified / renamed / removed。

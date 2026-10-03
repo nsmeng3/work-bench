@@ -1,5 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
+  Alert,
+  Button,
   Empty,
   Layout,
   List,
@@ -13,7 +16,7 @@ import type {
   InboxItemDetail,
   InboxStatus,
 } from "../api";
-import { inboxGet, inboxList, toApiError } from "../api";
+import { inboxDismissAllStale, inboxGet, inboxList, inboxStats, toApiError } from "../api";
 import { InboxItemCard } from "../components/InboxItemCard";
 import { InboxDetailPanel } from "../components/InboxDetailPanel";
 import { InboxAssignDialog } from "../components/InboxAssignDialog";
@@ -47,6 +50,10 @@ export function InboxPage() {
   /** 是否可能还有下一页（当前页返回数量 == PAGE_SIZE 时认为有） */
   const [hasMore, setHasMore] = useState(false);
 
+  /** 已失效（stale）条目数：> 0 时显示批量清理提示条 */
+  const [staleCount, setStaleCount] = useState(0);
+  const [cleaningStale, setCleaningStale] = useState(false);
+
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<InboxItemDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -54,6 +61,15 @@ export function InboxPage() {
   // m5-5.7 处理对话框
   const [assignOpen, setAssignOpen] = useState(false);
   const [assignItem, setAssignItem] = useState<InboxItem | null>(null);
+
+  const refreshStaleCount = useCallback(async () => {
+    try {
+      const s = await inboxStats();
+      setStaleCount(s.stale);
+    } catch {
+      // 统计失败不阻塞列表；保持旧值
+    }
+  }, []);
 
   const loadList = useCallback(
     async (nextStatus: StatusFilter, nextPage: number, keepSelection = false) => {
@@ -71,6 +87,7 @@ export function InboxPage() {
           setSelectedId(null);
           setDetail(null);
         }
+        void refreshStaleCount();
       } catch (err) {
         const apiErr = toApiError(err);
         message.error(`加载收件箱失败：${apiErr.message}`);
@@ -78,7 +95,7 @@ export function InboxPage() {
         setLoading(false);
       }
     },
-    [],
+    [refreshStaleCount],
   );
 
   const loadDetail = useCallback(async (id: string) => {
@@ -98,6 +115,27 @@ export function InboxPage() {
   useEffect(() => {
     void loadList(status, page);
   }, [status, page, loadList]);
+
+  /**
+   * 事件驱动的即时刷新：后端聚合窗口有实际写入时 emit "inbox-changed"，
+   * 本页监听后静默重载当前列表（keepSelection=true，不打断用户正在查看的详情）。
+   * 用 ref 持有最新刷新闭包，避免 status/page 变化时反复解绑/重绑监听。
+   */
+  const silentRefreshRef = useRef<() => void>(() => {});
+  silentRefreshRef.current = () => void loadList(status, page, true);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen("inbox-changed", () => silentRefreshRef.current()).then((u) => {
+      if (disposed) u();
+      else unlisten = u;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   function handleSelect(item: InboxItem) {
     setSelectedId(item.id);
@@ -137,6 +175,34 @@ export function InboxPage() {
     void loadList(status, page);
   }
 
+  /** 「全部清理」：把所有 stale 条目批量置为已处理 */
+  async function handleCleanupStale() {
+    setCleaningStale(true);
+    try {
+      const dismissed = await inboxDismissAllStale();
+      message.success(`已清理 ${dismissed} 条失效条目`);
+      setStaleCount(0);
+      // 若当前正在 stale 视图，清理后切回待处理
+      if (status === "stale") {
+        setStatus("pending");
+        setPage(1);
+      } else {
+        void loadList(status, page, true);
+      }
+    } catch (err) {
+      const apiErr = toApiError(err);
+      message.error(`清理失效条目失败：${apiErr.message}`);
+    } finally {
+      setCleaningStale(false);
+    }
+  }
+
+  /** staleCount > 0 时追加「已失效」Tab（默认隐藏，仅通过提示条/统计触达） */
+  const tabItems =
+    staleCount > 0
+      ? [...TAB_ITEMS, { key: "stale" as StatusFilter, label: `已失效(${staleCount})` }]
+      : TAB_ITEMS;
+
   return (
     <Layout style={{ height: "100%", background: "transparent" }}>
       <Layout.Sider
@@ -155,10 +221,51 @@ export function InboxPage() {
           </Typography.Title>
           <Tabs
             activeKey={status}
-            items={TAB_ITEMS}
+            items={tabItems}
             onChange={handleTabChange}
             size="small"
           />
+          {staleCount > 0 && status !== "stale" && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 8 }}
+              message={`有 ${staleCount} 条已失效条目（源文件已不在）`}
+              action={
+                <>
+                  <Button size="small" type="link" onClick={() => handleTabChange("stale")}>
+                    查看
+                  </Button>
+                  <Button
+                    size="small"
+                    type="link"
+                    loading={cleaningStale}
+                    onClick={handleCleanupStale}
+                  >
+                    全部清理
+                  </Button>
+                </>
+              }
+            />
+          )}
+          {status === "stale" && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 8 }}
+              message="以下为已失效条目（源文件已不在），可批量清理为已处理"
+              action={
+                <Button
+                  size="small"
+                  type="link"
+                  loading={cleaningStale}
+                  onClick={handleCleanupStale}
+                >
+                  全部清理
+                </Button>
+              }
+            />
+          )}
         </div>
         <div style={{ flex: 1, overflowY: "auto" }}>
           <List<InboxItem>

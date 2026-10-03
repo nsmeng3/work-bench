@@ -75,6 +75,15 @@ export async function inboxDismissStale(input: InboxDismissStaleInput): Promise<
 }
 
 /**
+ * `inbox_dismiss_all_stale {}` → `number`（清理条数）。
+ * 批量把所有 stale 条目（改名/删除后源文件已不在、聚合层自动标记）置为 processed。
+ */
+export async function inboxDismissAllStale(): Promise<number> {
+  if (MOCK) return mockInboxApi.inbox_dismiss_all_stale();
+  return invoke<number>("inbox_dismiss_all_stale");
+}
+
+/**
  * 监控目录命令 — M6-6.1 声明契约
  */
 /** `watch_dir_get ()` → `WatchDirConfig[]`（按 path 升序） */

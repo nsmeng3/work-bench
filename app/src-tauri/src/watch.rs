@@ -8,6 +8,15 @@
 //! 平台事件统一标准化为 `Created / Modified / Renamed / Removed` 四种，
 //! 通过 `tokio::sync::mpsc::Sender<WatchEvent>` 发给上层（5.2 忽略规则、5.3 聚合窗口）。
 //!
+//! 重命名事件按信息量分三路标准化（改名重复待处理修复）：
+//! - `RenameMode::Both`（from/to 均知）→ `Renamed{ path: from, new_path: Some(to) }`，
+//!   聚合层执行"改名跟随"（旧条目 path 直接改为新路径，不新建）；
+//! - `RenameMode::From` 单侧（macOS FSEvents 常见拆分）→ `Removed(from)`，
+//!   语义上文件确实从该路径消失，聚合层走 stale 兜底；
+//! - `RenameMode::To` 单侧 → `Created(to)`，聚合层正常新建。
+//! 由此无论平台给的是配对的 Both 还是分裂的 From+To（乃至编辑器的
+//! remove+create 安全保存），改名后收件箱都只保留 1 条 pending。
+//!
 //! 单个 watcher 启动失败不影响其他；失败记录日志并把对应 `watch_dir.paused = 1`。
 
 use std::collections::HashMap;
@@ -15,10 +24,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use notify::{
-    Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
-};
 use notify::event::ModifyKind;
+use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use sqlx::sqlite::SqlitePool;
 use tokio::sync::mpsc;
 
@@ -42,6 +49,9 @@ pub enum WatchEventKind {
 pub struct WatchEvent {
     pub kind: WatchEventKind,
     pub path: PathBuf,
+    /// 仅 `Renamed` 且平台一次性给出 from+to（`RenameMode::Both`）时有值：
+    /// 重命名的目标路径。其余情况恒为 `None`。
+    pub new_path: Option<PathBuf>,
     /// 来自 `watch_dir` 表的 id。
     pub watch_dir_id: String,
     /// Unix 秒。
@@ -49,18 +59,27 @@ pub struct WatchEvent {
 }
 
 // ============================================================
-// 事件标准化（§5.2 冻结映射）
+// 事件标准化（§5.2 映射 + 改名重复待处理修复）
 // ============================================================
 //
 // notify 8.x 中重命名归类为 `EventKind::Modify(ModifyKind::Name(RenameMode))`：
-// - `RenameMode::From` / `RenameMode::To` / `RenameMode::Both` / `RenameMode::Any`
-//   均映射为 `Renamed`。
+// - `RenameMode::Both` → `Renamed`（携带 from + to，聚合层改名跟随）。
+// - `RenameMode::From` → `Removed`（文件从该路径消失，聚合层 stale 兜底）。
+// - `RenameMode::To`   → `Created`（文件出现在该路径，聚合层正常新建）。
+// - `RenameMode::Any` / 其他 → `Renamed`（信息不足，new_path=None，
+//   由聚合层 stat 裁决走跟随还是兜底）。
 // - 其他 `ModifyKind`（Data / Metadata / Any / Other）→ `Modified`。
 fn classify_event_kind(kind: &EventKind) -> Option<WatchEventKind> {
     match kind {
         EventKind::Create(_) => Some(WatchEventKind::Created),
         EventKind::Remove(_) => Some(WatchEventKind::Removed),
-        EventKind::Modify(ModifyKind::Name(_)) => Some(WatchEventKind::Renamed),
+        EventKind::Modify(ModifyKind::Name(mode)) => match mode {
+            notify::event::RenameMode::Both => Some(WatchEventKind::Renamed),
+            notify::event::RenameMode::From => Some(WatchEventKind::Removed),
+            notify::event::RenameMode::To => Some(WatchEventKind::Created),
+            // Any / Other / 未来新增变体：保守归为 Renamed（new_path=None）
+            _ => Some(WatchEventKind::Renamed),
+        },
         EventKind::Modify(_) => Some(WatchEventKind::Modified),
         // Access / Any / Other 不上报
         _ => None,
@@ -70,34 +89,39 @@ fn classify_event_kind(kind: &EventKind) -> Option<WatchEventKind> {
 /// 把一条 notify 事件展开为 0..N 条标准化事件。
 ///
 /// - 不能分类的 kind（Access / Any / Other）→ 空 vec。
-/// - 重命名事件取 from 路径（`paths[0]`，notify 契约：rename from 在前）。
+/// - `RenameMode::Both` 且路径 ≥2 → 单条 `Renamed`，path=from、new_path=Some(to)
+///   （notify 契约：rename from 在前）。
+/// - 其他 `Renamed`（Any 等）→ 单条，取 from 路径（`paths[0]`），new_path=None。
 /// - 其他事件对每个 path 各发一条。
-fn normalize_event(
-    ev: &NotifyEvent,
-    watch_dir_id: &str,
-    at: i64,
-) -> Vec<WatchEvent> {
+fn normalize_event(ev: &NotifyEvent, watch_dir_id: &str, at: i64) -> Vec<WatchEvent> {
     let kind = match classify_event_kind(&ev.kind) {
         Some(k) => k,
         None => return Vec::new(),
     };
 
-    let paths: &[PathBuf] = if kind == WatchEventKind::Renamed {
-        // 重命名只取 from 路径（§5.2 冻结：from 路径）
-        ev.paths.first().map(std::slice::from_ref).unwrap_or(&[])
-    } else {
-        ev.paths.as_slice()
+    let mk = |path: PathBuf, new_path: Option<PathBuf>| WatchEvent {
+        kind,
+        path,
+        new_path,
+        watch_dir_id: watch_dir_id.to_string(),
+        at,
     };
 
-    paths
-        .iter()
-        .map(|p| WatchEvent {
-            kind,
-            path: p.clone(),
-            watch_dir_id: watch_dir_id.to_string(),
-            at,
-        })
-        .collect()
+    if kind == WatchEventKind::Renamed {
+        // Both：from + to 同时可得 → 改名跟随所需的完整信息
+        if let EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)) = &ev.kind {
+            if ev.paths.len() >= 2 {
+                return vec![mk(ev.paths[0].clone(), Some(ev.paths[1].clone()))];
+            }
+        }
+        // 其余 rename（Any 或路径不足）：只取 from 路径
+        return match ev.paths.first() {
+            Some(p) => vec![mk(p.clone(), None)],
+            None => Vec::new(),
+        };
+    }
+
+    ev.paths.iter().map(|p| mk(p.clone(), None)).collect()
 }
 
 fn now_unix_secs() -> i64 {
@@ -154,24 +178,25 @@ fn build_watcher(
     let id_for_cb = watch_dir_id.to_string();
     let tx_for_cb = tx.clone();
 
-    let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
-        match res {
-            Ok(ev) => {
-                let at = now_unix_secs();
-                for we in normalize_event(&ev, &id_for_cb, at) {
-                    // 用 blocking_send 不行（回调在 notify 内部线程，不在 tokio runtime），
-                    // 用 try_send 避免阻塞；mpsc 满则丢弃并记日志。
-                    if let Err(e) = tx_for_cb.try_send(we) {
-                        eprintln!("[watch] 事件通道已满或已关闭，丢弃事件: {}", e);
+    let mut watcher: RecommendedWatcher =
+        notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
+            match res {
+                Ok(ev) => {
+                    let at = now_unix_secs();
+                    for we in normalize_event(&ev, &id_for_cb, at) {
+                        // 用 blocking_send 不行（回调在 notify 内部线程，不在 tokio runtime），
+                        // 用 try_send 避免阻塞；mpsc 满则丢弃并记日志。
+                        if let Err(e) = tx_for_cb.try_send(we) {
+                            eprintln!("[watch] 事件通道已满或已关闭，丢弃事件: {}", e);
+                        }
                     }
                 }
+                Err(e) => {
+                    eprintln!("[watch] notify 错误 (watch_dir={}): {}", id_for_cb, e);
+                }
             }
-            Err(e) => {
-                eprintln!("[watch] notify 错误 (watch_dir={}): {}", id_for_cb, e);
-            }
-        }
-    })
-    .map_err(|e| AppError::io(format!("创建 watcher 失败 ({}): {}", path.display(), e)))?;
+        })
+        .map_err(|e| AppError::io(format!("创建 watcher 失败 ({}): {}", path.display(), e)))?;
 
     let mode = if recursive {
         RecursiveMode::Recursive
@@ -216,12 +241,11 @@ pub async fn start_watchers(
     pool: SqlitePool,
     tx: mpsc::Sender<WatchEvent>,
 ) -> CmdResult<WatcherHandle> {
-    let rows: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT id, path, recursive FROM watch_dir WHERE paused = 0",
-    )
-    .fetch_all(&pool)
-    .await
-    .map_err(AppError::from)?;
+    let rows: Vec<(String, String, i64)> =
+        sqlx::query_as("SELECT id, path, recursive FROM watch_dir WHERE paused = 0")
+            .fetch_all(&pool)
+            .await
+            .map_err(AppError::from)?;
 
     let handle = WatcherHandle::new(tx);
 
@@ -266,10 +290,9 @@ pub async fn stop_watchers(handle: WatcherHandle) -> CmdResult<()> {
     Ok(())
 }
 
-/// 增量订阅：5.4 `settings_add_watch_dir` 时调用。
+/// 增量订阅：`watch_dir_set` 保存配置后即时调用（免重启）。
 ///
 /// 若同一 `watch_dir_id` 已存在，先 unwatch 再重建（幂等）。
-#[allow(dead_code)] // 5.4 接入
 pub async fn add_watch(
     handle: &WatcherHandle,
     watch_dir_id: String,
@@ -285,10 +308,9 @@ pub async fn add_watch(
     Ok(())
 }
 
-/// 增量退订：5.4 `settings_remove_watch_dir` 时调用。
+/// 增量退订：`watch_dir_unset` 删除配置后即时调用（免重启）。
 ///
 /// 不存在时静默成功（幂等）。
-#[allow(dead_code)] // 5.4 接入
 pub async fn remove_watch(handle: &WatcherHandle, watch_dir_id: &str) -> CmdResult<()> {
     let mut map = handle
         .inner
@@ -361,29 +383,61 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rename_uses_from_path_only() {
+    fn normalize_rename_both_carries_from_and_to() {
         let ev = make_event(
             EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
-            vec![
-                PathBuf::from("/tmp/old.txt"),
-                PathBuf::from("/tmp/new.txt"),
-            ],
+            vec![PathBuf::from("/tmp/old.txt"), PathBuf::from("/tmp/new.txt")],
         );
         let out = normalize_event(&ev, "wd1", 1);
-        assert_eq!(out.len(), 1, "rename 只发一条 (from 路径)");
+        assert_eq!(out.len(), 1, "rename Both 只发一条");
         assert_eq!(out[0].kind, WatchEventKind::Renamed);
-        assert_eq!(out[0].path, PathBuf::from("/tmp/old.txt"));
+        assert_eq!(out[0].path, PathBuf::from("/tmp/old.txt"), "path = from");
+        assert_eq!(
+            out[0].new_path,
+            Some(PathBuf::from("/tmp/new.txt")),
+            "new_path = to（聚合层改名跟随用）"
+        );
     }
 
     #[test]
-    fn normalize_rename_from_variant() {
+    fn normalize_rename_from_maps_to_removed() {
+        // 单侧 From（macOS FSEvents 常见拆分）：文件从该路径消失 → Removed
         let ev = make_event(
             EventKind::Modify(ModifyKind::Name(RenameMode::From)),
             vec![PathBuf::from("/tmp/x.txt")],
         );
         let out = normalize_event(&ev, "wd1", 1);
         assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, WatchEventKind::Removed);
+        assert_eq!(out[0].path, PathBuf::from("/tmp/x.txt"));
+        assert_eq!(out[0].new_path, None);
+    }
+
+    #[test]
+    fn normalize_rename_to_maps_to_created() {
+        // 单侧 To：文件出现在该路径 → Created（聚合层正常新建）
+        let ev = make_event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            vec![PathBuf::from("/tmp/y.txt")],
+        );
+        let out = normalize_event(&ev, "wd1", 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, WatchEventKind::Created);
+        assert_eq!(out[0].path, PathBuf::from("/tmp/y.txt"));
+        assert_eq!(out[0].new_path, None);
+    }
+
+    #[test]
+    fn normalize_rename_any_is_renamed_without_new_path() {
+        // Any：信息不足，保持 Renamed + new_path=None，由聚合层 stat 裁决
+        let ev = make_event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            vec![PathBuf::from("/tmp/z.txt")],
+        );
+        let out = normalize_event(&ev, "wd1", 1);
+        assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, WatchEventKind::Renamed);
+        assert_eq!(out[0].new_path, None);
     }
 
     #[test]
@@ -483,7 +537,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         fs::write(&file, b"world").expect("rewrite");
         tokio::time::sleep(Duration::from_millis(500)).await;
-        fs::remove_file(&file).expect("remove");
+        // 改名：观察平台投递 Both 还是 From+To 分裂
+        let renamed = root.join("renamed.txt");
+        fs::rename(&file, &renamed).expect("rename");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        fs::remove_file(&renamed).expect("remove");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while std::time::Instant::now() < deadline {
@@ -496,8 +554,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "仅在 macOS 本机验证；CI 上 inotify 行为类似但时序不同")]
-    async fn watcher_emits_create_modify_remove_on_tempdir() {        let tmp = TempDir::new().expect("tempdir");
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "仅在 macOS 本机验证；CI 上 inotify 行为类似但时序不同"
+    )]
+    async fn watcher_emits_create_modify_remove_on_tempdir() {
+        let tmp = TempDir::new().expect("tempdir");
         let root = tmp.path().to_path_buf();
         let file = root.join("hello.txt");
 
@@ -513,22 +575,37 @@ mod tests {
 
         // 1) 创建
         fs::write(&file, b"hello").expect("write");
-        let ev = recv_kind_within(&mut rx, WatchEventKind::Created, &file, Duration::from_secs(5))
-            .await
-            .expect("应收到 Created 事件");
+        let ev = recv_kind_within(
+            &mut rx,
+            WatchEventKind::Created,
+            &file,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("应收到 Created 事件");
         assert_eq!(ev.watch_dir_id, "wd_test");
         // 2) 修改
         fs::write(&file, b"hello world, modified").expect("rewrite");
-        let ev = recv_kind_within(&mut rx, WatchEventKind::Modified, &file, Duration::from_secs(5))
-            .await
-            .expect("应收到 Modified 事件");
+        let ev = recv_kind_within(
+            &mut rx,
+            WatchEventKind::Modified,
+            &file,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("应收到 Modified 事件");
         assert_eq!(ev.watch_dir_id, "wd_test");
 
         // 3) 删除
         fs::remove_file(&file).expect("remove");
-        let ev = recv_kind_within(&mut rx, WatchEventKind::Removed, &file, Duration::from_secs(5))
-            .await
-            .expect("应收到 Removed 事件");
+        let ev = recv_kind_within(
+            &mut rx,
+            WatchEventKind::Removed,
+            &file,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("应收到 Removed 事件");
         assert_eq!(ev.watch_dir_id, "wd_test");
 
         // 4) 停止后不再收
@@ -628,7 +705,9 @@ mod tests {
             .expect("insert bad");
 
         let (tx, _rx) = mpsc::channel::<WatchEvent>(8);
-        let handle = start_watchers(pool.clone(), tx).await.expect("start_watchers");
+        let handle = start_watchers(pool.clone(), tx)
+            .await
+            .expect("start_watchers");
         // 失败的 watcher 不应进入 map
         assert_eq!(handle.len(), 0);
 
