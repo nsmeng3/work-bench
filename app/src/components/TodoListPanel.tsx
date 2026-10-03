@@ -303,22 +303,22 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
     }
   }
 
-  /* ---------------- m8-8.5 · 详情抽屉资源集联动 ---------------- */
+  /* ---------------- m8-8.5 · 详情抽屉资源集选择 ---------------- */
 
-  /** 表单中当前选中的空间（详情抽屉打开时生效） */
-  const formSpaceId = Form.useWatch("spaceId", detailForm);
-
+  /**
+   * 抽屉打开时加载全部空间的资源集（按空间分组展示）。
+   * 资源集本身就在空间下：选中资源集即自动带出所属空间，
+   * 无需先选空间。
+   */
   useEffect(() => {
     if (!detailId) return;
-    if (!formSpaceId) {
-      setCollectionOptions([]);
-      return;
-    }
     let cancelled = false;
     (async () => {
       try {
-        const list = await collectionList({ spaceId: formSpaceId, status: "active" });
-        if (!cancelled) setCollectionOptions(list);
+        const lists = await Promise.all(
+          spaces.map((s) => collectionList({ spaceId: s.id, status: "active" })),
+        );
+        if (!cancelled) setCollectionOptions(lists.flat());
       } catch (err) {
         console.warn("加载资源集列表失败：", err);
       }
@@ -326,7 +326,14 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
     return () => {
       cancelled = true;
     };
-  }, [formSpaceId, detailId]);
+  }, [detailId, spaces]);
+
+  /** 资源集 → 所属空间 id 的映射（选中资源集时回填空间） */
+  const collectionSpaceById = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const c of collectionOptions) m.set(c.id, c.spaceId);
+    return m;
+  }, [collectionOptions]);
 
   /* ---------------- 挂载 / 卸载引用 ---------------- */
 
@@ -590,9 +597,24 @@ export function TodoListPanel({ spaceId, collectionId, collectionName, spaces: s
               <Form.Item name="collectionId" label="所属资源集">
                 <Select
                   allowClear
-                  placeholder={formSpaceId ? "不挂资源集" : "先选择空间"}
-                  disabled={!formSpaceId}
-                  options={collectionOptions.map((c) => ({ value: c.id, label: c.name }))}
+                  showSearch
+                  optionFilterProp="label"
+                  placeholder="不挂资源集"
+                  options={spaces
+                    .map((s) => ({
+                      label: s.name,
+                      options: collectionOptions
+                        .filter((c) => c.spaceId === s.id)
+                        .map((c) => ({ value: c.id, label: c.name })),
+                    }))
+                    .filter((g) => g.options.length > 0)}
+                  onChange={(v) => {
+                    // 选中资源集 → 空间自动跟随（资源集本身就在空间下）
+                    if (v) {
+                      const sid = collectionSpaceById.get(v);
+                      if (sid) detailForm.setFieldValue("spaceId", sid);
+                    }
+                  }}
                 />
               </Form.Item>
               <Form.Item name="dueAt" label="截止时间">

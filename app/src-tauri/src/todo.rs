@@ -264,15 +264,15 @@ async fn ensure_space_exists(pool: &SqlitePool, space_id: &str) -> CmdResult<()>
     Ok(())
 }
 
-/// m8-8.5 · 校验资源集存在。
-async fn ensure_collection_exists(pool: &SqlitePool, collection_id: &str) -> CmdResult<()> {
-    sqlx::query("SELECT id FROM collection WHERE id = ?")
+/// m8-8.5 · 校验资源集存在并返回其所属空间 id。
+async fn fetch_collection_space_id(pool: &SqlitePool, collection_id: &str) -> CmdResult<String> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT space_id FROM collection WHERE id = ?")
         .bind(collection_id)
         .fetch_optional(pool)
         .await
-        .map_err(AppError::from)?
-        .ok_or_else(|| AppError::not_found(format!("资源集不存在: {}", collection_id)))?;
-    Ok(())
+        .map_err(AppError::from)?;
+    row.map(|(sid,)| sid)
+        .ok_or_else(|| AppError::not_found(format!("资源集不存在: {}", collection_id)))
 }
 
 /// 校验引用存在。
@@ -378,9 +378,12 @@ pub async fn create(pool: &SqlitePool, input: TodoCreateInput) -> CmdResult<Todo
     if let Some(ref sid) = input.space_id {
         ensure_space_exists(pool, sid).await?;
     }
-    if let Some(ref cid) = input.collection_id {
-        ensure_collection_exists(pool, cid).await?;
-    }
+    // 资源集本身就在空间下：挂资源集时 space_id 自动跟随，无需调用方传
+    let resolved_space_id = if let Some(ref cid) = input.collection_id {
+        Some(fetch_collection_space_id(pool, cid).await?)
+    } else {
+        input.space_id.clone()
+    };
 
     let id = Uuid::new_v4().to_string();
     let now = now_unix();
@@ -392,7 +395,7 @@ pub async fn create(pool: &SqlitePool, input: TodoCreateInput) -> CmdResult<Todo
     .bind(&id)
     .bind(input.title.trim())
     .bind(&input.note)
-    .bind(&input.space_id)
+    .bind(&resolved_space_id)
     .bind(&input.collection_id)
     .bind(input.priority.unwrap_or(0))
     .bind(input.due_at)
@@ -417,9 +420,11 @@ pub async fn update(pool: &SqlitePool, id: String, patch: TodoPatch) -> CmdResul
     if let Some(Some(ref sid)) = patch.space_id {
         ensure_space_exists(pool, sid).await?;
     }
-    if let Some(Some(ref cid)) = patch.collection_id {
-        ensure_collection_exists(pool, cid).await?;
-    }
+    // 挂/换资源集时 space_id 跟随资源集所属空间；解除挂载时保留原 space_id
+    let derived_space_id: Option<Option<String>> = match &patch.collection_id {
+        Some(Some(cid)) => Some(Some(fetch_collection_space_id(pool, cid).await?)),
+        _ => None,
+    };
 
     let new_title = patch
         .title
@@ -431,9 +436,10 @@ pub async fn update(pool: &SqlitePool, id: String, patch: TodoPatch) -> CmdResul
         None => existing.note.clone(),
         Some(inner) => inner.clone(),
     };
-    let new_space_id = match &patch.space_id {
-        None => existing.space_id.clone(),
-        Some(inner) => inner.clone(),
+    let new_space_id = match (&derived_space_id, &patch.space_id) {
+        (Some(derived), _) => derived.clone(),
+        (None, None) => existing.space_id.clone(),
+        (None, Some(inner)) => inner.clone(),
     };
     let new_collection_id = match &patch.collection_id {
         None => existing.collection_id.clone(),
@@ -1380,6 +1386,42 @@ mod tests {
         })
         .await;
         assert!(err.is_err());
+    }
+
+    /// m8-8.5 · 挂资源集时 space_id 自动跟随资源集所属空间，无需调用方传。
+    #[tokio::test]
+    async fn todo_collection_derives_space() {
+        let pool = setup().await;
+        // insert_collection 挂在 PRESET_SPACE 下
+        insert_collection(&pool, "c1").await;
+
+        // 创建：只传 collection_id → space_id 派生为 PRESET_SPACE
+        let t = create(&pool, TodoCreateInput {
+            title: "col todo".into(),
+            note: None,
+            space_id: None,
+            collection_id: Some("c1".into()),
+            priority: None,
+            due_at: None,
+        })
+        .await
+        .expect("create");
+        assert_eq!(t.space_id.as_deref(), Some(PRESET_SPACE));
+        assert_eq!(t.collection_id.as_deref(), Some("c1"));
+
+        // 更新：显式把 space 改到别处 + 同时挂资源集 → 资源集胜出
+        let t = update(
+            &pool,
+            t.id,
+            TodoPatch {
+                space_id: Some(None),
+                collection_id: Some(Some("c1".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update");
+        assert_eq!(t.space_id.as_deref(), Some(PRESET_SPACE));
     }
 
     /// m8-8.5 · 资源集删除时 todo.collection_id 置空（ON DELETE SET NULL）。
