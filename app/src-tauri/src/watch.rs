@@ -676,11 +676,209 @@ mod tests {
         }
     }
 
+    // ---------- 端到端诊断：真实 FSEvents → 过滤 → 聚合 → inbox_item ----------
+    //
+    // 诊断目标：「有时能收到通知有时就没有」。
+    // 用真实文件操作驱动完整管道（watcher → filter_events → aggregate_batch），
+    // 断言「操作结束后监控目录里存在的文件，必须有 pending 收件箱条目」。
+
+    /// 建内存 DB：aggregate_batch 需要的最小表（resource_reference / inbox_item）。
+    async fn setup_e2e_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.expect("pool");
+        sqlx::query(
+            "CREATE TABLE resource_reference (
+                id TEXT PRIMARY KEY,
+                collection_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                hosting TEXT NOT NULL,
+                locator_json TEXT NOT NULL,
+                description TEXT,
+                lifecycle TEXT NOT NULL DEFAULT 'active',
+                confidentiality TEXT NOT NULL DEFAULT 'internal',
+                indexed INTEGER NOT NULL DEFAULT 1,
+                disposition TEXT NOT NULL DEFAULT 'none',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create resource_reference");
+        sqlx::query(
+            "CREATE TABLE inbox_item (
+                id TEXT PRIMARY KEY,
+                watch_dir_id TEXT,
+                path TEXT NOT NULL,
+                event_kind TEXT CHECK (event_kind IN ('created','modified','renamed','removed')),
+                size_bytes INTEGER,
+                mtime INTEGER,
+                ext TEXT,
+                suggested_type TEXT,
+                status TEXT CHECK (status IN ('pending','snoozed','processed','ignored','stale')),
+                assign_json TEXT,
+                ignore_rule_id TEXT,
+                snooze_note TEXT,
+                remind_at INTEGER,
+                discovered_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create inbox_item");
+        pool
+    }
+
+    /// 收集事件直到安静 `quiet` 或总时长超过 `cap`。
+    async fn drain_events(rx: &mut mpsc::Receiver<WatchEvent>, quiet: Duration, cap: Duration) -> Vec<WatchEvent> {
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + cap;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let step = quiet.min(deadline - now);
+            match timeout(step, rx.recv()).await {
+                Ok(Some(ev)) => out.push(ev),
+                Ok(None) => break,   // 通道关闭
+                Err(_) => break,     // 安静期到
+            }
+        }
+        out
+    }
+
+    /// 查询某路径的 pending 条目数。
+    async fn pending_count_at(pool: &SqlitePool, path: &std::path::Path) -> i64 {
+        let (cnt,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(1) FROM inbox_item WHERE path = ? AND status = 'pending'",
+        )
+        .bind(path.to_string_lossy().to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count");
+        cnt
+    }
+
+    /// 打印一批事件（诊断观察用）。
+    fn dump_events(label: &str, events: &[WatchEvent]) {
+        eprintln!("[e2e] --- {} ({} events) ---", label, events.len());
+        for ev in events {
+            eprintln!(
+                "[e2e]   {:?} path={} new_path={:?}",
+                ev.kind,
+                ev.path.display(),
+                ev.new_path.as_ref().map(|p| p.display().to_string())
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "FSEvents 行为仅 macOS 本机可验")]
+    async fn e2e_real_world_ops_reach_inbox() {
+        use crate::aggregate::{aggregate_batch, EventBatch};
+
+        let pool = setup_e2e_pool().await;
+        let watched = TempDir::new().expect("watched tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        // FSEvents 上报的是解析 symlink 后的路径（macOS /var → /private/var），
+        // watch 与断言统一用 canonicalize 后的路径。
+        let root = watched.path().canonicalize().expect("canonical root");
+        let outside_root = outside.path().canonicalize().expect("canonical outside");
+
+        // 管道：watcher → filter_events（空规则）→ 收集
+        let (tx, rx) = mpsc::channel::<WatchEvent>(256);
+        let handle = WatcherHandle::new(tx);
+        add_watch(&handle, "wd_e2e".to_string(), root.clone(), true)
+            .await
+            .expect("add_watch");
+        let (ftx, mut frx) = mpsc::channel::<WatchEvent>(256);
+        let rules = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
+        let _filter = crate::ignore::filter_events(rx, ftx, rules);
+
+        // 等 FSEvents 流就绪
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let quiet = Duration::from_millis(800);
+        let cap = Duration::from_secs(8);
+        // 记录每个操作的最终落账结果，最后一并断言（先观察全量行为）
+        let mut misses: Vec<String> = Vec::new();
+
+        // ===== 操作 A：直接新建（基线，契约内行为） =====
+        let file_a = root.join("a_direct.txt");
+        fs::write(&file_a, b"hello").expect("write A");
+        let evs = drain_events(&mut frx, quiet, cap).await;
+        dump_events("A 直接新建", &evs);
+        let r = aggregate_batch(&pool, EventBatch { window_start: 0, window_end: 0, events: evs })
+            .await
+            .expect("agg A");
+        eprintln!("[e2e] A 聚合结果: {:?}", r);
+        if pending_count_at(&pool, &file_a).await != 1 { misses.push("A 直接新建".into()); }
+
+        // ===== 操作 B：从监控目录外移入（Finder 拖入 / mv 等价物） =====
+        let outside_file = outside_root.join("b_moved.txt");
+        fs::write(&outside_file, b"moved in").expect("write outside");
+        let file_b = root.join("b_moved.txt");
+        fs::rename(&outside_file, &file_b).expect("rename into watched");
+        let evs = drain_events(&mut frx, quiet, cap).await;
+        dump_events("B 外部移入", &evs);
+        let r = aggregate_batch(&pool, EventBatch { window_start: 0, window_end: 0, events: evs })
+            .await
+            .expect("agg B");
+        eprintln!("[e2e] B 聚合结果: {:?}", r);
+        if pending_count_at(&pool, &file_b).await != 1 { misses.push("B 外部移入".into()); }
+
+        // ===== 操作 C：原子保存（写临时文件 + rename 覆盖目标，编辑器/App 保存语义） =====
+        let file_c = root.join("c_atomic.txt");
+        fs::write(&file_c, b"v1").expect("write C v1");
+        let evs = drain_events(&mut frx, quiet, cap).await;
+        let r = aggregate_batch(&pool, EventBatch { window_start: 0, window_end: 0, events: evs })
+            .await
+            .expect("agg C1");
+        eprintln!("[e2e] C1 聚合结果: {:?}", r);
+        if pending_count_at(&pool, &file_c).await != 1 { misses.push("C 初始创建".into()); }
+
+        let tmp_c = root.join(".c_atomic_tmp");
+        fs::write(&tmp_c, b"v2").expect("write C tmp");
+        fs::rename(&tmp_c, &file_c).expect("atomic rename over");
+        let evs = drain_events(&mut frx, quiet, cap).await;
+        dump_events("C 原子保存", &evs);
+        let r = aggregate_batch(&pool, EventBatch { window_start: 0, window_end: 0, events: evs })
+            .await
+            .expect("agg C2");
+        eprintln!("[e2e] C2 聚合结果: {:?}", r);
+        if pending_count_at(&pool, &file_c).await != 1 { misses.push("C 原子保存".into()); }
+
+        // ===== 操作 D：rename 替换一个从未进过收件箱的目标（移动覆盖） =====
+        let file_d = root.join("d_replaced.txt");
+        fs::write(&file_d, b"old").expect("write D old");
+        // 旧文件先落账（模拟它已被收件箱跟踪）
+        let evs = drain_events(&mut frx, quiet, cap).await;
+        let _ = aggregate_batch(&pool, EventBatch { window_start: 0, window_end: 0, events: evs })
+            .await
+            .expect("agg D1");
+        // 从外部移入同名文件覆盖（ Finder 拖入同名文件选择「替换」的语义）
+        let outside_d = outside_root.join("d_new.txt");
+        fs::write(&outside_d, b"new").expect("write D new");
+        fs::rename(&outside_d, &file_d).expect("rename replace D");
+        let evs = drain_events(&mut frx, quiet, cap).await;
+        dump_events("D 移入覆盖", &evs);
+        let r = aggregate_batch(&pool, EventBatch { window_start: 0, window_end: 0, events: evs })
+            .await
+            .expect("agg D2");
+        eprintln!("[e2e] D 聚合结果: {:?}", r);
+        if pending_count_at(&pool, &file_d).await != 1 { misses.push("D 移入覆盖".into()); }
+
+        stop_watchers(handle).await.expect("stop");
+        eprintln!("[e2e] ===== 丢条目汇总: {:?} =====", misses);
+        assert!(misses.is_empty(), "以下操作丢条目: {:?}", misses);
+    }
+
     // ---------- start_watchers 故障隔离（单 watcher 失败不影响其他） ----------
 
     #[tokio::test]
     async fn start_watchers_marks_failed_dir_paused() {
-        // 用 in-memory sqlite 建最小 watch_dir 表
         let pool = SqlitePool::connect(":memory:").await.expect("pool");
         sqlx::query(
             "CREATE TABLE watch_dir (

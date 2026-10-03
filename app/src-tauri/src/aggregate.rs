@@ -7,9 +7,12 @@
 //!   from 有 pending/snoozed 条目则直接把 path 改为新路径，不新建
 //! - `Removed` / `Renamed`（无 new_path）：pending/snoozed 条目且磁盘上
 //!   路径已不存在 → 标记 `stale`（改名重复待处理修复的跨平台兜底）；
-//!   无已有条目 → 丢弃（不为已消失的文件新建待处理）
+//!   无已有条目且路径已不存在 → 丢弃（不为已消失的文件新建待处理）；
+//!   无已有条目但路径实际存在 → 按「出现」处理（FSEvents 把移入监控目录
+//!   报成无目标路径的 Renamed/Any，路径是目标路径，以磁盘状态裁决）
 //! - `Created` / `Modified`：同路径已有未处理 `inbox_item`（`status='pending'`）
-//!   → UPDATE mtime/event_kind，不新建；否则 → 新建 `inbox_item`
+//!   → UPDATE mtime/event_kind，不新建；否则新建前 stat：路径已不存在
+//!   （窗口内消失的临时文件）→ 丢弃，存在 → 新建 `inbox_item`
 //!
 //! 聚合窗口为纯函数（除 DB / stat IO 外），单测覆盖（§6 性能要求）。
 
@@ -177,7 +180,8 @@ async fn insert_item(
 }
 
 /// `Created` / `Modified`：文件出现在某路径。
-/// 已正式引用 → dropped；已有 pending → UPDATE；否则 → INSERT。
+/// 已正式引用 → dropped；已有 pending → UPDATE；
+/// 否则新建前 stat：路径已不存在（窗口内消失的临时文件）→ dropped，存在 → INSERT。
 async fn handle_appeared(
     pool: &SqlitePool,
     ev: &WatchEvent,
@@ -211,6 +215,13 @@ async fn handle_appeared(
         return Ok(());
     }
 
+    // 新建前 stat：文件在聚合窗口内已消失（编辑器临时文件、下载缓冲等）
+    // → 丢弃，不新建「源文件已不在」的幽灵 pending 条目。
+    if !path.exists() {
+        result.dropped += 1;
+        return Ok(());
+    }
+
     insert_item(pool, ev, path_str, path, kind_str).await?;
     result.created += 1;
     Ok(())
@@ -219,7 +230,12 @@ async fn handle_appeared(
 /// `Removed` / `Renamed`（无 new_path，Any 等）：文件从某路径消失。
 /// - 有 pending/snoozed 条目：磁盘上路径已不存在 → 标记 `stale`；
 ///   路径仍在（事件误报 / 快速重建）→ 仅更新 mtime/event_kind。
-/// - 无已有条目 → dropped（不为已消失的文件新建待处理）。
+/// - 无已有条目：路径已不存在 → dropped（不为已消失的文件新建待处理）；
+///   路径实际存在 → 按「出现」处理（新建 pending）。
+///   关键场景：macOS FSEvents 把「从监控目录外移入文件」报成
+///   `Modify(Name(RenameMode::Any))`，标准化为 Renamed + new_path=None，
+///   路径是**目标**路径；若以「消失」语义丢弃，移入的文件永远进不了收件箱
+///   （目录监控时灵时不灵的根因）。聚合层以磁盘状态裁决。
 async fn handle_vanished(
     pool: &SqlitePool,
     ev: &WatchEvent,
@@ -228,6 +244,11 @@ async fn handle_vanished(
     result: &mut AggregateResult,
 ) -> CmdResult<()> {
     let Some(id) = find_open_item_at(pool, path_str).await? else {
+        if ev.path.exists() {
+            // 路径存在但未跟踪：实际是文件「出现」在该路径
+            // （FSEvents 移入报 Any / 删除后同窗口快速重建等），按出现处理。
+            return handle_appeared(pool, ev, &ev.path, path_str, kind_str, result).await;
+        }
         result.dropped += 1;
         return Ok(());
     };
@@ -587,10 +608,15 @@ mod tests {
     #[tokio::test]
     async fn same_path_three_events_creates_one() {
         let pool = setup_pool().await;
+        // 真实文件：新建路径在落账时必须存在于磁盘
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let file = tmp.path().join("x.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let p = file.to_string_lossy().to_string();
         let events = vec![
-            ev("/a/x.txt", WatchEventKind::Created, 100),
-            ev("/a/x.txt", WatchEventKind::Modified, 101),
-            ev("/a/x.txt", WatchEventKind::Modified, 102),
+            ev(&p, WatchEventKind::Created, 100),
+            ev(&p, WatchEventKind::Modified, 101),
+            ev(&p, WatchEventKind::Modified, 102),
         ];
         let r = aggregate_batch(&pool, batch(events)).await.expect("agg");
         assert_eq!(r.created, 1, "同路径去重后只新建 1 条");
@@ -599,8 +625,9 @@ mod tests {
 
         // 数据库里只有 1 条，且 mtime/event_kind 取最新（at=102, modified）
         let rows: Vec<(String, i64, String)> = sqlx::query_as(
-            "SELECT path, mtime, event_kind FROM inbox_item WHERE path = '/a/x.txt'",
+            "SELECT path, mtime, event_kind FROM inbox_item WHERE path = ?",
         )
+        .bind(&p)
         .fetch_all(&pool)
         .await
         .expect("select");
@@ -614,11 +641,13 @@ mod tests {
     #[tokio::test]
     async fn different_paths_create_three() {
         let pool = setup_pool().await;
-        let events = vec![
-            ev("/a/1.txt", WatchEventKind::Created, 100),
-            ev("/a/2.txt", WatchEventKind::Created, 100),
-            ev("/a/3.txt", WatchEventKind::Created, 100),
-        ];
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut events = Vec::new();
+        for name in ["1.txt", "2.txt", "3.txt"] {
+            let f = tmp.path().join(name);
+            std::fs::write(&f, b"x").expect("write");
+            events.push(ev(&f.to_string_lossy(), WatchEventKind::Created, 100));
+        }
         let r = aggregate_batch(&pool, batch(events)).await.expect("agg");
         assert_eq!(r.created, 3);
         assert_eq!(r.updated, 0);
@@ -698,22 +727,28 @@ mod tests {
     #[tokio::test]
     async fn processed_inbox_item_does_not_block_new_insert() {
         let pool = setup_pool().await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let file = tmp.path().join("q.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let p = file.to_string_lossy().to_string();
         sqlx::query(
             "INSERT INTO inbox_item \
              (id, watch_dir_id, path, event_kind, mtime, status, discovered_at) \
-             VALUES ('i_old', 'wd1', '/a/q.txt', 'created', 50, 'processed', 50)",
+             VALUES ('i_old', 'wd1', ?, 'created', 50, 'processed', 50)",
         )
+        .bind(&p)
         .execute(&pool)
         .await
         .expect("insert");
 
-        let events = vec![ev("/a/q.txt", WatchEventKind::Created, 300)];
+        let events = vec![ev(&p, WatchEventKind::Created, 300)];
         let r = aggregate_batch(&pool, batch(events)).await.expect("agg");
         assert_eq!(r.created, 1, "已 processed 不阻塞新建");
         assert_eq!(r.updated, 0);
 
         let (cnt,): (i64,) =
-            sqlx::query_as("SELECT COUNT(1) FROM inbox_item WHERE path = '/a/q.txt'")
+            sqlx::query_as("SELECT COUNT(1) FROM inbox_item WHERE path = ?")
+                .bind(&p)
                 .fetch_one(&pool)
                 .await
                 .expect("count");
@@ -795,9 +830,16 @@ mod tests {
     async fn rename_follow_without_from_item_creates_at_to() {
         let pool = setup_pool().await;
         // from 无被跟踪条目（例如从监听目录外改名进来）→ 等价于新文件出现在 to
+        // to 路径落账时必须真实存在（新建前 stat）
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let to = tmp.path().join("in.txt");
+        std::fs::write(&to, b"x").expect("write");
+        let to_str = to.to_string_lossy().to_string();
+        let from_str = tmp.path().join("out.txt").to_string_lossy().to_string();
+
         let r = aggregate_batch(
             &pool,
-            batch(vec![ev_rename("/a/out.txt", "/a/in.txt", 200)]),
+            batch(vec![ev_rename(&from_str, &to_str, 200)]),
         )
         .await
         .expect("agg");
@@ -810,7 +852,7 @@ mod tests {
                 .await
                 .expect("select");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, "/a/in.txt");
+        assert_eq!(rows[0].0, to_str);
         assert_eq!(rows[0].1.as_deref(), Some("renamed"));
     }
 
@@ -841,12 +883,18 @@ mod tests {
     #[tokio::test]
     async fn rename_split_from_to_yields_one_stale_one_pending() {
         let pool = setup_pool().await;
-        seed_item(&pool, "i1", "/a/old.txt", "pending").await;
+        // old 不存在（已改名消失）；new 必须真实存在（新建前 stat）
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let new_file = tmp.path().join("new.txt");
+        std::fs::write(&new_file, b"x").expect("write");
+        let new_str = new_file.to_string_lossy().to_string();
+        let old_str = tmp.path().join("old.txt").to_string_lossy().to_string();
+        seed_item(&pool, "i1", &old_str, "pending").await;
 
         // watch 层标准化结果：From → Removed(old)，To → Created(new)
         let events = vec![
-            ev("/a/old.txt", WatchEventKind::Removed, 200),
-            ev("/a/new.txt", WatchEventKind::Created, 200),
+            ev(&old_str, WatchEventKind::Removed, 200),
+            ev(&new_str, WatchEventKind::Created, 200),
         ];
         let r = aggregate_batch(&pool, batch(events)).await.expect("agg");
         assert_eq!(r.staled, 1, "旧路径条目应标记 stale");
@@ -944,16 +992,143 @@ mod tests {
         assert_eq!(cnt, 0);
     }
 
+    // ---------- Removed / 无 new_path 的 Renamed：路径存在但未跟踪 → 按出现处理 ----------
+    //
+    // 背景：macOS FSEvents 把「从监控目录外移入文件」报成 Modify(Name(RenameMode::Any))，
+    // watch 层标准化为 Renamed + new_path=None，路径是**目标**路径。
+    // 旧逻辑走 handle_vanished 且无已有条目 → dropped，文件在目录里却永远进不了收件箱
+    // （用户感知：目录监控时灵时不灵）。聚合层以磁盘状态裁决：路径存在 → 按出现处理。
+
+    #[tokio::test]
+    async fn renamed_any_untracked_existing_file_creates_pending() {
+        let pool = setup_pool().await;
+        // 真实文件：模拟移入监控目录后落在磁盘上的目标文件
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let file = tmp.path().join("moved-in.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let path_str = file.to_string_lossy().to_string();
+
+        let r = aggregate_batch(
+            &pool,
+            batch(vec![ev(&path_str, WatchEventKind::Renamed, 200)]),
+        )
+        .await
+        .expect("agg");
+        assert_eq!(r.created, 1, "路径存在但未跟踪的 Renamed(Any) 应新建 pending 条目");
+        assert_eq!(r.dropped, 0);
+
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, event_kind FROM inbox_item WHERE path = ?")
+                .bind(&path_str)
+                .fetch_all(&pool)
+                .await
+                .expect("select");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "pending");
+        assert_eq!(rows[0].1.as_deref(), Some("renamed"));
+    }
+
+    #[tokio::test]
+    async fn renamed_any_nonexistent_path_still_dropped() {
+        let pool = setup_pool().await;
+        // 路径不存在且无已有条目：维持旧行为（不为已消失的文件新建待处理）
+        let r = aggregate_batch(
+            &pool,
+            batch(vec![ev("/a/ghost.txt", WatchEventKind::Renamed, 200)]),
+        )
+        .await
+        .expect("agg");
+        assert_eq!(r.created, 0);
+        assert_eq!(r.dropped, 1);
+
+        let (cnt,): (i64,) = sqlx::query_as("SELECT COUNT(1) FROM inbox_item")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(cnt, 0);
+    }
+
+    #[tokio::test]
+    async fn removed_untracked_existing_file_creates_pending() {
+        let pool = setup_pool().await;
+        // 删除后同窗口快速重建：dedup 可能只保留 Removed，但文件实际在 → 按出现处理
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let file = tmp.path().join("recreated.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let path_str = file.to_string_lossy().to_string();
+
+        let r = aggregate_batch(
+            &pool,
+            batch(vec![ev(&path_str, WatchEventKind::Removed, 200)]),
+        )
+        .await
+        .expect("agg");
+        assert_eq!(r.created, 1, "路径存在但未跟踪的 Removed（快速重建）应新建 pending 条目");
+
+        let (status,): (String,) =
+            sqlx::query_as("SELECT status FROM inbox_item WHERE path = ?")
+                .bind(&path_str)
+                .fetch_one(&pool)
+                .await
+                .expect("select");
+        assert_eq!(status, "pending");
+    }
+
+    // ---------- 窗口内已消失的文件不新建幽灵条目 ----------
+
+    #[tokio::test]
+    async fn created_for_vanished_file_is_dropped() {
+        let pool = setup_pool().await;
+        // 文件在聚合窗口内出现又消失（编辑器临时文件、下载缓冲等）：
+        // 落账时磁盘上已不存在 → 不新建幽灵 pending 条目。
+        let r = aggregate_batch(
+            &pool,
+            batch(vec![ev("/a/ghost-tmp.txt", WatchEventKind::Created, 200)]),
+        )
+        .await
+        .expect("agg");
+        assert_eq!(r.created, 0, "落账时文件已不存在，不应新建");
+        assert_eq!(r.dropped, 1);
+
+        let (cnt,): (i64,) = sqlx::query_as("SELECT COUNT(1) FROM inbox_item")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(cnt, 0);
+    }
+
+    #[tokio::test]
+    async fn modified_for_existing_file_still_creates() {
+        let pool = setup_pool().await;
+        // 对照：文件落账时真实存在 → 正常新建
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let file = tmp.path().join("real.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let path_str = file.to_string_lossy().to_string();
+
+        let r = aggregate_batch(
+            &pool,
+            batch(vec![ev(&path_str, WatchEventKind::Modified, 200)]),
+        )
+        .await
+        .expect("agg");
+        assert_eq!(r.created, 1);
+    }
+
     // ---------- stale 不阻塞同路径重新出现 ----------
 
     #[tokio::test]
     async fn stale_item_does_not_block_recreated_file() {
         let pool = setup_pool().await;
-        seed_item(&pool, "i_old", "/a/back.txt", "stale").await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let file = tmp.path().join("back.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let p = file.to_string_lossy().to_string();
+        seed_item(&pool, "i_old", &p, "stale").await;
 
         let r = aggregate_batch(
             &pool,
-            batch(vec![ev("/a/back.txt", WatchEventKind::Created, 300)]),
+            batch(vec![ev(&p, WatchEventKind::Created, 300)]),
         )
         .await
         .expect("agg");
@@ -961,7 +1136,8 @@ mod tests {
         assert_eq!(r.updated, 0);
 
         let (cnt,): (i64,) =
-            sqlx::query_as("SELECT COUNT(1) FROM inbox_item WHERE path = '/a/back.txt'")
+            sqlx::query_as("SELECT COUNT(1) FROM inbox_item WHERE path = ?")
+                .bind(&p)
                 .fetch_one(&pool)
                 .await
                 .expect("count");
