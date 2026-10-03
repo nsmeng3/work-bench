@@ -34,6 +34,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // 系统桌面通知：收件箱合并通知（InboxNotification）同步弹 OS 级通知
+        .plugin(tauri_plugin_notification::init())
         // m8-8.1 · 全局快捷键（快速记录 todo）
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()

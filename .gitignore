@@ -27,3 +27,6 @@ Thumbs.db
 *.bak
 *.tmp
 *~
+
+# pnpm 本地存储（node_modules 硬链接源，勿提交）
+.pnpm-store/

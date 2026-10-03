@@ -1,5 +1,10 @@
 import { useEffect, useRef } from "react";
 import { App, Button, notification } from "antd";
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
 
 /**
  * 收件箱合并通知 — m5-5.8
@@ -51,6 +56,25 @@ export function InboxNotification({ pending, prevPending, onGoInbox }: InboxNoti
   }, []);
 
   useEffect(() => {
+    /** 弹 OS 级系统通知（macOS 通知中心等）。复用合并窗口的 total，避免刷屏。
+     *  浏览器 / MOCK 模式或权限被拒时静默跳过（应用内 antd 通知仍生效）。 */
+    const showSystemNotification = async (total: number) => {
+      try {
+        let granted = await isPermissionGranted();
+        if (!granted) {
+          granted = (await requestPermission()) === "granted";
+        }
+        if (granted) {
+          sendNotification({
+            title: "目录监控",
+            body: `收件箱新增 ${total} 条待处理`,
+          });
+        }
+      } catch (err) {
+        console.warn("[InboxNotification] 系统通知不可用（非 Tauri 环境或权限被拒）", err);
+      }
+    };
+
     /** 弹出合并通知：清掉待执行的兜底 flush，重置累计增量 */
     const show = (total: number) => {
       if (flushTimerRef.current !== null) {
@@ -59,6 +83,8 @@ export function InboxNotification({ pending, prevPending, onGoInbox }: InboxNoti
       }
       pendingDeltaRef.current = 0;
       lastShownAtRef.current = Date.now();
+
+      void showSystemNotification(total);
 
       api.info({
         key: NOTIFICATION_KEY,

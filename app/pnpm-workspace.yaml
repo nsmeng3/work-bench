@@ -1,0 +1,5 @@
+# esbuild 通过 optionalDependencies 提供平台二进制（@esbuild/darwin-arm64 等），
+# 其 postinstall 仅为校验/兜底，不执行也能正常工作（vite build 已验证）。
+# 显式置 false：声明「忽略其构建脚本」是有意决定，消除 pnpm 的 approve-builds 提示。
+allowBuilds:
+  esbuild: false
