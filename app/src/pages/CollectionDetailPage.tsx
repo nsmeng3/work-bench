@@ -489,6 +489,14 @@ export function CollectionDetailPage({ space, collection, onBack, onOpenEmbedded
                         }
                         description={
                           <AntSpace direction="vertical" size={2} style={{ width: "100%" }}>
+                            {ref.description && (
+                              <Text
+                                ellipsis={{ tooltip: ref.description }}
+                                style={{ fontSize: 13, maxWidth: "100%" }}
+                              >
+                                {ref.description}
+                              </Text>
+                            )}
                             <Text type="secondary" style={{ fontFamily: "monospace", fontSize: 12 }}>
                               {locatorText(ref)}
                             </Text>
