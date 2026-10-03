@@ -10,6 +10,7 @@ import type {
   CollectionIdInput,
   CollectionListInput,
   CollectionDetail,
+  RecentCollection,
   ManagedPlan,
   OpenResult,
   RecentRef,
@@ -265,6 +266,11 @@ export const mockCollectionApi = {
       ...c,
       referencesByType: buildReferencesByType(c.id),
     };
+  },
+
+  /** 最近访问的资源集：mock 无真实 access_log，返回空数组（卡片显示空态） */
+  collection_recent_access(_limit?: number): RecentCollection[] {
+    return [];
   },
 };
 

@@ -491,6 +491,75 @@ pub async fn collection_list(
 }
 
 // ============================================================
+// 最近访问的资源集（Dashboard 卡片）
+// ============================================================
+//
+// 数据源：ref_access_log —— 打开/访问过某资源，即视为访问了其所属资源集。
+// 进入资源集详情页但不打开资源不计入（与「最近资源」同一埋点口径，
+// 零新增表/零埋点成本；后续如有需要再补 collection 级埋点）。
+
+/// `collection_recent_access` 出参条目。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentCollection {
+    pub id: String,
+    pub space_id: String,
+    pub space_name: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// 资源集内 active 资源数（卡片副信息）。
+    pub ref_count: i64,
+    /// Unix 秒：集内资源最近一次被访问的时间。
+    pub last_at: i64,
+}
+
+/// 按「集内资源最近一次访问时间」倒序返回 active 资源集。
+pub async fn recent_access(pool: &SqlitePool, limit: i64) -> CmdResult<Vec<RecentCollection>> {
+    let rows = sqlx::query(
+        "SELECT c.id, c.space_id, s.name AS space_name, c.name, c.summary, \
+                MAX(l.at) AS last_at, \
+                (SELECT COUNT(*) FROM resource_reference rc \
+                  WHERE rc.collection_id = c.id AND rc.lifecycle = 'active' \
+                    AND rc.disposition = 'none') AS ref_count \
+         FROM ref_access_log l \
+         JOIN resource_reference r ON r.id = l.ref_id \
+         JOIN collection c ON c.id = r.collection_id \
+         JOIN space s ON s.id = c.space_id \
+         WHERE c.status = 'active' AND s.status = 'active' \
+         GROUP BY c.id \
+         ORDER BY last_at DESC \
+         LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::from)?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(RecentCollection {
+            id: row.try_get("id").map_err(AppError::from)?,
+            space_id: row.try_get("space_id").map_err(AppError::from)?,
+            space_name: row.try_get("space_name").map_err(AppError::from)?,
+            name: row.try_get("name").map_err(AppError::from)?,
+            summary: row.try_get("summary").map_err(AppError::from)?,
+            ref_count: row.try_get("ref_count").map_err(AppError::from)?,
+            last_at: row.try_get("last_at").map_err(AppError::from)?,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn collection_recent_access(
+    state: tauri::State<'_, crate::AppState>,
+    limit: Option<i64>,
+) -> CmdResult<Vec<RecentCollection>> {
+    recent_access(&state.pool, limit.unwrap_or(8).clamp(1, 50)).await
+}
+
+// ============================================================
 // 单元测试
 // ============================================================
 
@@ -505,6 +574,74 @@ mod tests {
 
     /// 预置空间 id（来自 0002 迁移）。
     const PRESET_SPACE: &str = "preset_space_work";
+
+    // ---------- collection_recent_access ----------
+
+    /// 直接插入一条最小 resource_reference（active/none）。
+    async fn insert_ref(pool: &SqlitePool, id: &str, collection_id: &str) {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        sqlx::query(
+            "INSERT INTO resource_reference \
+             (id, collection_id, source_id, name, type, hosting, locator_json, \
+              lifecycle, confidentiality, indexed, disposition, created_at, updated_at) \
+             VALUES (?, ?, 'src_local_fs_default', ?, 'code', 'external', \
+                     '{\"kind\":\"path\",\"path\":\"/tmp/x\"}', \
+                     'active', 'internal', 1, 'none', ?, ?)",
+        )
+        .bind(id)
+        .bind(collection_id)
+        .bind(id)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert ref");
+    }
+
+    /// 直接插入一条 ref_access_log（控制 at 时间戳）。
+    async fn insert_access(pool: &SqlitePool, ref_id: &str, at: i64) {
+        sqlx::query("INSERT INTO ref_access_log (id, ref_id, action, at) VALUES (?, ?, 'open', ?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(ref_id)
+            .bind(at)
+            .execute(pool)
+            .await
+            .expect("insert access log");
+    }
+
+    #[tokio::test]
+    async fn collection_recent_access_orders_by_last_at_desc() {
+        let pool = setup().await;
+        let c1 = create(&pool, PRESET_SPACE.into(), "甲".into(), None, None)
+            .await
+            .expect("c1");
+        let c2 = create(&pool, PRESET_SPACE.into(), "乙".into(), None, None)
+            .await
+            .expect("c2");
+        let _c3 = create(&pool, PRESET_SPACE.into(), "丙（无访问）".into(), None, None)
+            .await
+            .expect("c3");
+        insert_ref(&pool, "r1", &c1.id).await;
+        insert_ref(&pool, "r2", &c2.id).await;
+        insert_access(&pool, "r1", 1000).await;
+        insert_access(&pool, "r2", 1500).await;
+        insert_access(&pool, "r2", 2000).await;
+
+        let list = recent_access(&pool, 8).await.expect("recent");
+        assert_eq!(list.len(), 2, "无访问记录的资源集不出现");
+        assert_eq!(list[0].id, c2.id, "按集内最近访问倒序");
+        assert_eq!(list[0].last_at, 2000, "取集内 MAX(at)");
+        assert_eq!(list[0].ref_count, 1);
+        assert!(!list[0].space_name.is_empty());
+        assert_eq!(list[1].id, c1.id);
+    }
+
+    #[tokio::test]
+    async fn collection_recent_access_empty_when_no_log() {
+        let pool = setup().await;
+        let list = recent_access(&pool, 8).await.expect("recent");
+        assert!(list.is_empty());
+    }
 
     // ---------- collection_create ----------
 

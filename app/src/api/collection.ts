@@ -6,6 +6,7 @@ import type {
   CollectionIdInput,
   CollectionListInput,
   CollectionDetail,
+  RecentCollection,
 } from "./types";
 import { mockCollectionApi } from "./mock";
 
@@ -44,4 +45,13 @@ export async function collectionRestore(input: CollectionIdInput): Promise<Colle
 export async function collectionGet(input: CollectionIdInput): Promise<CollectionDetail> {
   if (MOCK) return mockCollectionApi.collection_get(input);
   return invoke<CollectionDetail>("collection_get", { ...input });
+}
+
+/**
+ * `collection_recent_access { limit? }` → `RecentCollection[]`。
+ * 由 ref_access_log 聚合：打开过资源即算访问了其所属资源集，按最近访问倒序。
+ */
+export async function collectionRecentAccess(limit?: number): Promise<RecentCollection[]> {
+  if (MOCK) return mockCollectionApi.collection_recent_access(limit);
+  return invoke<RecentCollection[]>("collection_recent_access", { limit });
 }

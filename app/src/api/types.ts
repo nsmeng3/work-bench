@@ -65,6 +65,19 @@ export interface Collection {
   updatedAt: number;
 }
 
+/** `collection_recent_access` 出参条目（Dashboard「最近资源集」卡片） */
+export interface RecentCollection {
+  id: string;
+  spaceId: string;
+  spaceName: string;
+  name: string;
+  summary?: string;
+  /** 资源集内 active 资源数 */
+  refCount: number;
+  /** Unix 秒：集内资源最近一次被访问的时间 */
+  lastAt: number;
+}
+
 /** collection_create 入参 */
 export interface CollectionCreateInput {
   spaceId: string;

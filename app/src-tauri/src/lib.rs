@@ -229,6 +229,7 @@ pub fn run() {
             collection::collection_restore,
             collection::collection_get,
             collection::collection_list,
+            collection::collection_recent_access,
             reference::ref_create_external,
             reference::ref_create_managed,
             reference::ref_update,

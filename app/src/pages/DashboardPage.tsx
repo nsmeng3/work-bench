@@ -24,9 +24,10 @@ import {
   RightOutlined,
   RocketOutlined,
 } from "@ant-design/icons";
-import type { Collection, RecentRef, Space, Todo } from "../api";
+import type { Collection, RecentCollection, RecentRef, Space, Todo } from "../api";
 import {
   collectionList,
+  collectionRecentAccess,
   inboxStats,
   refOpen,
   refRecentAccess,
@@ -103,6 +104,8 @@ export interface DashboardPageProps {
   onGoInbox: () => void;
   /** 点击空间卡片下钻 */
   onEnterSpace: (space: Space) => void;
+  /** 点击最近资源集卡片直接下钻到资源集详情 */
+  onEnterCollection: (space: Space, collection: Collection) => void;
 }
 
 /**
@@ -112,15 +115,18 @@ export interface DashboardPageProps {
  * - 顶部问候条（按小时切换 + 用户名 + 日期）
  * - 左：今日待办（todo_today，最多 5 条 + 查看全部）
  * - 右：最近资源（ref_recent_access，最多 8 条，点击调 refOpen）
+ * - 中：最近资源集（collection_recent_access，卡片网格，点击下钻资源集详情）
  * - 下：我的空间（active 空间卡片网格，点击下钻）
  * - 底：收件箱提示（pending ≥ 1 时显示）
  */
-export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace }: DashboardPageProps) {
+export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace, onEnterCollection }: DashboardPageProps) {
   const [userName, setUserName] = useState<string | null>(null);
   const [todos, setTodos] = useState<Todo[]>([]);
   const [todosLoading, setTodosLoading] = useState(true);
   const [recents, setRecents] = useState<RecentRef[]>([]);
   const [recentsLoading, setRecentsLoading] = useState(true);
+  const [recentCollections, setRecentCollections] = useState<RecentCollection[]>([]);
+  const [recentCollectionsLoading, setRecentCollectionsLoading] = useState(true);
   const [spaces, setSpaces] = useState<Space[]>([]);
   const [spacesLoading, setSpacesLoading] = useState(true);
   const [collectionCountBySpace, setCollectionCountBySpace] = useState<Record<string, number>>({});
@@ -209,6 +215,20 @@ export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace }: DashboardPa
     }
   }, [messageApi]);
 
+  // 加载最近访问的资源集
+  const fetchRecentCollections = useCallback(async () => {
+    setRecentCollectionsLoading(true);
+    try {
+      const list = await collectionRecentAccess(8);
+      setRecentCollections(list);
+    } catch (err) {
+      const apiErr = toApiError(err);
+      messageApi.error({ content: `加载最近资源集失败：${apiErr.message}`, duration: 3 });
+    } finally {
+      setRecentCollectionsLoading(false);
+    }
+  }, [messageApi]);
+
   // 加载收件箱统计（一次性；角标轮询由 App.tsx 的 useInboxStats 负责）
   const fetchInboxStats = useCallback(async () => {
     try {
@@ -223,8 +243,32 @@ export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace }: DashboardPa
     void fetchTodos();
     void fetchRecents();
     void fetchSpaces();
+    void fetchRecentCollections();
     void fetchInboxStats();
-  }, [fetchTodos, fetchRecents, fetchSpaces, fetchInboxStats]);
+  }, [fetchTodos, fetchRecents, fetchSpaces, fetchRecentCollections, fetchInboxStats]);
+
+  /**
+   * 点击最近资源集：下钻到资源集详情。
+   * space 从已加载的空间列表取（后端只返回 active 空间，必命中）；
+   * Collection 对象由 RecentCollection 字段拼装，详情页会按 id 重新拉取。
+   */
+  function handleEnterRecentCollection(item: RecentCollection) {
+    const space = spaces.find((s) => s.id === item.spaceId);
+    if (!space) {
+      messageApi.warning({ content: "所属空间已归档或不存在", duration: 3 });
+      return;
+    }
+    const collection: Collection = {
+      id: item.id,
+      spaceId: item.spaceId,
+      name: item.name,
+      summary: item.summary,
+      status: "active",
+      createdAt: item.lastAt,
+      updatedAt: item.lastAt,
+    };
+    onEnterCollection(space, collection);
+  }
 
   /** 点击最近资源：调 refOpen 打开（M7-1 API） */
   async function handleOpenRecent(item: RecentRef) {
@@ -407,7 +451,63 @@ export function DashboardPage({ onGoTodo, onGoInbox, onEnterSpace }: DashboardPa
         </Col>
       </Row>
 
-      {/* 中排：我的空间 */}
+      {/* 中排：最近资源集 */}
+      <Card
+        title={
+          <AntSpace>
+            <FolderOutlined />
+            <span>最近资源集</span>
+          </AntSpace>
+        }
+        style={{ marginTop: 16 }}
+        loading={recentCollectionsLoading && recentCollections.length === 0}
+      >
+        {recentCollections.length === 0 ? (
+          <Empty
+            description="暂无最近访问的资源集，打开几个资源试试"
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+          />
+        ) : (
+          <Row gutter={[12, 12]}>
+            {recentCollections.map((item) => (
+              <Col xs={24} sm={12} md={8} lg={6} key={item.id}>
+                <Card
+                  size="small"
+                  hoverable
+                  onClick={() => handleEnterRecentCollection(item)}
+                  style={{ height: "100%" }}
+                >
+                  <AntSpace direction="vertical" size={4} style={{ width: "100%" }}>
+                    <AntSpace>
+                      <FolderOutlined style={{ color: "#4a90d9" }} />
+                      <Text strong>{item.name}</Text>
+                    </AntSpace>
+                    {item.summary && (
+                      <Text
+                        type="secondary"
+                        style={{
+                          fontSize: 12,
+                          display: "-webkit-box",
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: "vertical",
+                          overflow: "hidden",
+                        }}
+                      >
+                        {item.summary}
+                      </Text>
+                    )}
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      {item.spaceName} · {item.refCount} 个资源 · {formatRelativeTime(item.lastAt)}
+                    </Text>
+                  </AntSpace>
+                </Card>
+              </Col>
+            ))}
+          </Row>
+        )}
+      </Card>
+
+      {/* 中下排：我的空间 */}
       <Card
         title={
           <AntSpace>

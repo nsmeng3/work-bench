@@ -250,6 +250,7 @@ function App() {
                 onGoTodo={() => handleNavChange("todo")}
                 onGoInbox={() => handleNavChange("inbox")}
                 onEnterSpace={handleEnterSpace}
+                onEnterCollection={handleJumpToCollection}
               />
             )}
             {activeNav === "spaces" &&
