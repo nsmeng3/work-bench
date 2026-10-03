@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { App, Button, notification } from "antd";
+import { invoke } from "@tauri-apps/api/core";
 import {
   isPermissionGranted,
   requestPermission,
@@ -85,6 +86,11 @@ export function InboxNotification({ pending, prevPending, onGoInbox }: InboxNoti
       lastShownAtRef.current = Date.now();
 
       void showSystemNotification(total);
+
+      // 悬浮通知窗：复用合并窗口的 total，失败静默（MOCK/浏览器环境无 Tauri）
+      void invoke("float_notify", { total }).catch((err) => {
+        console.warn("[InboxNotification] 悬浮窗通知不可用（非 Tauri 环境）", err);
+      });
 
       api.info({
         key: NOTIFICATION_KEY,

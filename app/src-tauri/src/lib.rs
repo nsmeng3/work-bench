@@ -6,6 +6,7 @@ mod db;
 mod dispatch;
 mod disposition;
 mod error;
+mod float;
 mod fs_ops;
 mod ignore;
 mod inbox;
@@ -57,6 +58,11 @@ pub fn run() {
         )
         .setup(|app| {
             use tauri::Manager;
+
+            // 收件箱悬浮通知窗：启动时创建（隐藏），失败降级为「无悬浮窗」，不影响主功能。
+            if let Err(e) = float::setup_float_window(app) {
+                eprintln!("[startup] 创建悬浮通知窗失败: {}", e);
+            }
 
             // 数据库文件位置：~/.workbench/workbench.db（home 目录下的固定数据目录，
             // 便于备份与同步；真实资源文件仍保持原位，见详细设计 §3.3）
@@ -236,6 +242,9 @@ pub fn run() {
             inbox::watch_dir_set,
             inbox::watch_dir_unset,
             dispatch::watch_dir_event,
+            float::float_notify,
+            float::float_hide,
+            float::float_open_inbox,
             todo::todo_list,
             todo::todo_get,
             todo::todo_create,

@@ -101,6 +101,18 @@ function App() {
     };
   }, []);
 
+  // 悬浮通知窗点击 → 跳转收件箱（float_open_inbox 已负责唤起并聚焦主窗口）
+  useEffect(() => {
+    const unlisten = listen("go-inbox", () => {
+      setActiveNav("inbox");
+      setCurrentSpace(null);
+      setCurrentCollection(null);
+    });
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
