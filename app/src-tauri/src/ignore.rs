@@ -67,13 +67,18 @@ pub struct IgnoreRule {
 
 /// 默认规则集：
 /// - ByName: `.DS_Store` / `.git` / `.svn` / `node_modules` / `target` / `dist` / `build` / `.next` / `.cache`
+/// - ByName（Chromium 系下载临时文件，`.<bundle id>.<随机串>` 隐藏文件）:
+///   `.com.google.Chrome.*` / `.com.microsoft.edgemac.*` / `.org.chromium.Chromium.*` /
+///   `.com.brave.Browser.*` / `.com.vivaldi.Vivaldi.*` / `.com.operasoftware.Opera.*`
 /// - ByExt: `.tmp` / `.swp` / `.log` / `.lock` / `.bak`
 /// - ByExt（浏览器下载临时文件）: `.crdownload`(Chrome/Edge) / `.download`(Safari) / `.partial`(Edge 旧版)
 /// - ByPattern: `**/*.part` / `**/~*`
 ///
 /// 浏览器下载先落临时文件、完成后改名正式名。临时扩展名前置过滤，
 /// 避免临时文件进入收件箱（改名事件由 filter_events 按 new_path 改写放行，
-/// 保证正式文件不丢通知）。
+/// 保证正式文件不丢通知）。注意 macOS 上 Chromium 系浏览器下载中的临时文件
+/// 是 `.<bundle id>.<随机串>` 形式的隐藏文件（如 `.com.google.Chrome.qXESF8`），
+/// 不带 `.crdownload` 扩展名，必须按文件名 glob 拦截。
 pub fn default_rules() -> Vec<IgnoreRule> {
     let mut out = Vec::new();
 
@@ -106,6 +111,23 @@ pub fn default_rules() -> Vec<IgnoreRule> {
     for v in [".crdownload", ".download", ".partial"] {
         out.push(IgnoreRule {
             kind: IgnoreKind::ByExt,
+            value: v.to_string(),
+        });
+    }
+
+    // Chromium 系浏览器下载中的临时文件（macOS）：`.<bundle id>.<随机串>` 隐藏文件，
+    // 如 `.com.google.Chrome.qXESF8`，不带 .crdownload 扩展名，按文件名 glob 拦截。
+    // bundle id 对应：Chrome / Edge / Chromium / Brave / Vivaldi / Opera
+    for v in [
+        ".com.google.Chrome.*",
+        ".com.microsoft.edgemac.*",
+        ".org.chromium.Chromium.*",
+        ".com.brave.Browser.*",
+        ".com.vivaldi.Vivaldi.*",
+        ".com.operasoftware.Opera.*",
+    ] {
+        out.push(IgnoreRule {
+            kind: IgnoreKind::ByName,
             value: v.to_string(),
         });
     }
@@ -358,6 +380,24 @@ mod tests {
         assert!(should_ignore(Path::new("/downloads/report.zip.CRDOWNLOAD"), &rules));
         // 完成后的正式文件不命中
         assert!(!should_ignore(Path::new("/downloads/report.zip"), &rules));
+    }
+
+    #[test]
+    fn default_rules_ignore_chromium_hidden_download_temps() {
+        let rules = default_rules();
+        // 用户实测：macOS Chrome 下载中的临时文件
+        assert!(should_ignore(
+            Path::new("/Users/x/Downloads/.com.google.Chrome.qXESF8"),
+            &rules
+        ));
+        // 其他 Chromium 系浏览器同形态
+        assert!(should_ignore(Path::new("/dl/.com.microsoft.edgemac.Ab12Cd"), &rules));
+        assert!(should_ignore(Path::new("/dl/.org.chromium.Chromium.Zz"), &rules));
+        assert!(should_ignore(Path::new("/dl/.com.brave.Browser.12345"), &rules));
+        // 不误伤：无随机后缀的同名目录/文件、正常隐藏文件、正常文件
+        assert!(!should_ignore(Path::new("/dl/.com.google.Chrome"), &rules));
+        assert!(!should_ignore(Path::new("/dl/.gitignore"), &rules));
+        assert!(!should_ignore(Path::new("/dl/report.zip"), &rules));
     }
 
     // ---------- 用户规则：ByExt / ByName / ByDir / ByPattern 各一例 ----------

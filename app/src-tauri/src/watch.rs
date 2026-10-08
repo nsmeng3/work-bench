@@ -875,13 +875,15 @@ mod tests {
         assert!(misses.is_empty(), "以下操作丢条目: {:?}", misses);
     }
 
-    /// 回归：Chrome 下载（先建 `.crdownload` 临时文件，完成后改名正式名）。
+    /// 回归：Chrome 下载（先建临时文件，完成后改名正式名）。
     ///
     /// 历史 bug：慢速下载时 `.crdownload` 先入收件箱，改名后其 pending 条目
     /// 残留成幽灵（消失侧事件与 Created/Modified 同秒到达被去重丢弃）；
     /// 且临时文件本体不该出现在收件箱/通知里。
+    /// macOS 上 Chromium 系还有第二种临时文件形态：`.com.google.Chrome.<随机串>`
+    /// 隐藏文件（无 .crdownload 扩展名），同样覆盖。
     ///
-    /// 断言：两种下载节奏下，正式文件恰好 1 条 pending，`.crdownload` 0 条。
+    /// 断言：三种下载形态下，正式文件恰好 1 条 pending，临时文件 0 条。
     #[tokio::test]
     #[cfg_attr(not(target_os = "macos"), ignore = "FSEvents 行为仅 macOS 本机可验")]
     async fn e2e_chrome_download_reaches_inbox() {
@@ -948,13 +950,41 @@ mod tests {
             "大文件慢下：正式文件应进收件箱"
         );
 
-        // .crdownload 临时文件：任何状态都不应残留收件箱
-        let (tmp_cnt,): (i64,) =
-            sqlx::query_as("SELECT COUNT(1) FROM inbox_item WHERE path LIKE '%.crdownload'")
-                .fetch_one(&pool)
-                .await
-                .expect("count tmp");
-        assert_eq!(tmp_cnt, 0, ".crdownload 临时文件不应出现在收件箱");
+        // ===== 场景 3：macOS Chromium 隐藏临时文件（.com.google.Chrome.<随机串>） =====
+        // 用户实测形态：/Users/x/Downloads/.com.google.Chrome.qXESF8
+        let hidden_tmp = root.join(".com.google.Chrome.qXESF8");
+        let hidden_final = root.join("photo.png");
+        fs::write(&hidden_tmp, b"png-bytes").expect("write hidden tmp");
+        // 窗口 1：下载中（临时文件应被忽略规则拦截，不进收件箱）
+        let evs = drain_events(&mut frx, quiet, cap).await;
+        dump_events("Chrome 隐藏临时文件·窗口1(下载中)", &evs);
+        let r = aggregate_batch(&pool, EventBatch { window_start: 0, window_end: 0, events: evs })
+            .await
+            .expect("agg hidden w1");
+        eprintln!("[chrome] 隐藏临时文件窗口1 聚合: {:?}", r);
+        // 窗口 2：下载完成，改名正式名
+        fs::rename(&hidden_tmp, &hidden_final).expect("rename hidden");
+        let evs = drain_events(&mut frx, quiet, cap).await;
+        dump_events("Chrome 隐藏临时文件·窗口2(完成改名)", &evs);
+        let r = aggregate_batch(&pool, EventBatch { window_start: 0, window_end: 0, events: evs })
+            .await
+            .expect("agg hidden w2");
+        eprintln!("[chrome] 隐藏临时文件窗口2 聚合: {:?}", r);
+        assert_eq!(
+            pending_count_at(&pool, &hidden_final).await,
+            1,
+            "隐藏临时文件改名后：正式文件应进收件箱"
+        );
+
+        // .crdownload / Chromium 隐藏临时文件：任何状态都不应残留收件箱
+        let (tmp_cnt,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(1) FROM inbox_item \
+             WHERE path LIKE '%.crdownload' OR path LIKE '%/.com.google.Chrome.%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count tmp");
+        assert_eq!(tmp_cnt, 0, "浏览器下载临时文件不应出现在收件箱");
 
         stop_watchers(handle).await.expect("stop");
     }
